@@ -121,7 +121,8 @@ The sync comment at `stabilization/mod.rs:102` currently lists only three files 
 
 **LUT delivery** differs by shader family because the available resources differ:
 
-- *Core backends* (wgpu, OpenCL, rust-gpu, CPU): append the LUT to the existing `coeffs` buffer. It is currently a fixed 488-float const uploaded immutably (`gpu/wgpu.rs:306`); it becomes a sized `COPY_DST` buffer of `488 + size³ × 3` floats, rewritten only when the LUT changes. No backend needs a new binding — `coeffs` is already plumbed through every one.
+- *Core backends* (wgpu, rust-gpu, CPU): append the LUT to the existing `coeffs` buffer. It is currently a fixed 488-float const uploaded immutably (`gpu/wgpu.rs:306`); it becomes a sized `COPY_DST` buffer of `488 + size³ × 3` floats, rewritten only when the LUT changes. These three need no new binding — `coeffs` is already plumbed through them (wgpu bind group entry 2; rust-gpu `stabilize_spirv/src/lib.rs:46` storage buffer binding 2; CPU path passes the slice directly).
+- *OpenCL* is the exception, discovered during implementation and corrected here: it has **no `coeffs` buffer at all**. The interpolation tables are `__constant` literals compiled into `opencl_undistort.cl`, never uploaded at runtime, and `undistort_image` (`opencl_undistort.cl:582`) takes no `coeffs` argument. OpenCL therefore needs a genuinely new kernel argument plus host-side upload, which is done in the same task that adds its colour stage rather than alongside the other backends' buffer work.
 - *Qt RHI preview*: `undistort.frag` has no storage buffers, only `sampler2D`s (`undistort.frag:61-63`). The LUT arrives as a new `texLut` with the 3D grid tiled into 2D, read with `texelFetch`.
 
 **Trilinear interpolation is manual in all five implementations**, never hardware sampler filtering, which differs between vendors and would not match the CPU path. Eight fetches and seven lerps, identical arithmetic everywhere.
