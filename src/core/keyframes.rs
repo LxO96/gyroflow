@@ -53,6 +53,13 @@ define_keyframes! {
     SmoothingParamYaw,           "#88c451", "Yaw smoothness",                   |v| format!("{:.2}", v),
 
     VideoSpeed,                  "#f6e926", "Video speed",                      |v| format!("{:.1}%", v * 100.0),
+
+    ColorExposure,               "#f2a65a", "Exposure",                         |v| format!("{:+.2} EV", v),
+    ColorContrast,               "#f2c14e", "Contrast",                         |v| format!("{:+.0}", v * 100.0),
+    ColorSaturation,             "#e8845a", "Saturation",                       |v| format!("{:+.0}", v * 100.0),
+    ColorTemperature,            "#5ab0f2", "Color temperature",                |v| format!("{:.0} K", v),
+    ColorTint,                   "#c45af2", "Tint",                             |v| format!("{:+.0}", v * 100.0),
+    ColorLutStrength,            "#5af2c4", "LUT strength",                     |v| format!("{:.0}%", v * 100.0),
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, ::serde::Serialize, ::serde::Deserialize)]

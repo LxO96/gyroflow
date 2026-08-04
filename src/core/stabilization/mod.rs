@@ -95,11 +95,14 @@ bitflags::bitflags! {
         const HAS_MESH_DATA        = 1 << 9; // 512
         const HAS_FPD_DATA         = 1 << 10; // 1024
         const ANY_UNDERWATER       = 1 << 11; // 2048
+        const COLOR_ENABLED        = 1 << 12; // 4096
+        const HAS_LUT              = 1 << 13; // 8192
     }
 }
 
 // Each parameter must be aligned to 4 bytes and whole struct to 16 bytes
-// Must be kept in sync with: opencl_undistort.cl, wgpu_undistort.wgsl and qt_gpu/undistort.frag
+// Must be kept in sync with: opencl_undistort.cl, wgpu_undistort.wgsl,
+// qt_gpu/undistort.frag and gpu/stabilize_spirv/src/types.rs
 #[repr(C, packed(4))]
 #[derive(Default, Copy, Clone)]
 pub struct KernelParams {
@@ -145,6 +148,9 @@ pub struct KernelParams {
     pub reserved2:                f32, // 16
     pub ewa_coeffs_p:             [f32; 4], // 16
     pub ewa_coeffs_q:             [f32; 4], // 16
+    pub color_params_1:           [f32; 4], // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
+    pub color_params_2:           [f32; 4], // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
+    pub color_params_3:           [f32; 4], // 16 - lut_domain_min, lut_domain_max, unused, unused
 }
 unsafe impl bytemuck::Zeroable for KernelParams {}
 unsafe impl bytemuck::Pod for KernelParams {}
