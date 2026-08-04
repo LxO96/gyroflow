@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright © 2026 Adrian <adrian.eddy at gmail>
+
+pub mod lut;
+
+pub use lut::{ Lut3D, LutError, parse_cube, sample_trilinear };
