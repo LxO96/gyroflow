@@ -2,5 +2,7 @@
 // Copyright © 2026 Adrian <adrian.eddy at gmail>
 
 pub mod lut;
+pub mod source_metadata;
 
 pub use lut::{ Lut3D, LutError, parse_cube, sample_trilinear };
+pub use source_metadata::SourceExposure;
