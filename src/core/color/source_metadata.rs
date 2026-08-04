@@ -30,7 +30,7 @@ pub fn parse_shutter(s: &str) -> Option<f64> {
         let n = parse_leading_number(num)?;
         let d = parse_leading_number(den)?;
         if d.abs() < f64::EPSILON { return None; }
-        return Some(n / d);
+        return Some(n / d).filter(|v| *v > 0.0);
     }
     parse_leading_number(s).filter(|v| *v > 0.0)
 }
@@ -74,6 +74,7 @@ mod tests {
         assert_eq!(parse_leading_number("Auto"),    None);
         assert_eq!(parse_leading_number(""),        None);
         assert_eq!(parse_leading_number("---"),     None);
+        assert_eq!(parse_leading_number("🎥5500"),   Some(5500.0)); // non-ASCII prefix, digit follows
     }
 
     #[test]
@@ -81,6 +82,7 @@ mod tests {
         assert_eq!(parse_shutter("1/50"), Some(0.02));
         assert_eq!(parse_shutter("0.02"), Some(0.02));
         assert_eq!(parse_shutter("Auto"), None);
+        assert_eq!(parse_shutter("1/-50"), None); // negative denominator yields non-physical result
     }
 
     #[test]
