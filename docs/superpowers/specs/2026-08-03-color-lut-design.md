@@ -256,9 +256,9 @@ Performance: measure a 4K render before and after with baking on, so the documen
 
 ## Open questions
 
-**OQ1 — packed float format.** Whether the linked ffmpeg 8.1 exposes a packed 32-bit float format (`RGBAF32LE`) for the OpenEXR / CinemaDNG path. Resolve early in implementation.
-- If available: float sources convert to it and bake normally.
-- If not: baking is refused for 32-bit float sources with an explicit message, rather than dropping to 16-bit and clipping HDR range.
+**OQ1 — packed float format.** Resolved: unavailable; baking is refused for `GBRPF32LE`/`GBRAPF32LE` sources with the message 'Colour baking is not supported for 32-bit float sources'.
+
+Investigation found that while FFmpeg 8.1's libavutil defines `AV_PIX_FMT_RGBAF32LE` and `AV_PIX_FMT_RGBF32LE`, the ffmpeg-sys-next Rust bindings used by this project do not expose these formats. A repository search confirms no RGBF32 variants are defined in ffmpeg-sys-next.
 
 ## Out of scope
 
