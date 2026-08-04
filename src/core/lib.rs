@@ -84,6 +84,7 @@ pub struct StabilizationManager {
     pub gyro: Arc<RwLock<GyroSource>>,
     pub lens: Arc<RwLock<LensProfile>>,
     pub smoothing: Arc<RwLock<Smoothing>>,
+    pub color: Arc<RwLock<color::ColorAdjustments>>,
 
     pub stabilization: Arc<RwLock<Stabilization>>,
 
@@ -117,6 +118,7 @@ impl Default for StabilizationManager {
         util::init_telemetry_parser();
         Self {
             smoothing: Arc::new(RwLock::new(Smoothing::default())),
+            color: Arc::new(RwLock::new(color::ColorAdjustments::default())),
 
             params: Arc::new(RwLock::new(StabilizationParams::default())),
 
@@ -2127,6 +2129,9 @@ pub enum GyroflowCoreError {
 
     #[error("Invalid data")]
     InvalidData,
+
+    #[error("LUT error: {0}")]
+    Lut(#[from] crate::color::LutError),
 
     #[error("JSON error {0:?}")]
     JSONError(#[from] serde_json::Error),

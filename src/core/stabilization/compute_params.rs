@@ -17,6 +17,7 @@ pub struct ComputeParams {
     pub minimal_fovs: Vec<f64>,
     pub keyframes: KeyframeManager,
     pub lens: LensProfile,
+    pub color: crate::color::ColorAdjustments,
     pub camera_diagonal_fovs: Vec<f64>,
 
     pub frame_count: usize,
@@ -81,6 +82,7 @@ impl ComputeParams {
         Self {
             gyro: mgr.gyro.clone(),
             lens,
+            color: mgr.color.read().clone(),
             camera_diagonal_fovs: Vec::new(),
 
             smoothing_fov_limit_per_frame: Vec::new(),
