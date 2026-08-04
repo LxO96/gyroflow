@@ -21,6 +21,20 @@ pub use compute_params::ComputeParams;
 pub use frame_transform::FrameTransform;
 pub use cpu_undistort::*;
 
+/// The LUT is appended to the coeffs buffer after the fixed interpolation
+/// coefficients, so no backend needs an extra binding.
+pub const LUT_DATA_OFFSET: usize = 64 + 128 + 256 + 9 * 4 + 4; // = 488, must equal COEFFS.len()
+
+/// `COEFFS` followed by the LUT table, which is what every backend uploads as
+/// the `coeffs` buffer. Returns just `COEFFS` when there is no LUT.
+pub fn build_coeffs_buffer(lut: Option<&crate::color::Lut3D>) -> Vec<f32> {
+    let mut out = Vec::with_capacity(LUT_DATA_OFFSET + lut.map(|l| l.data.len()).unwrap_or(0));
+    out.extend_from_slice(&COEFFS);
+    debug_assert_eq!(out.len(), LUT_DATA_OFFSET);
+    if let Some(lut) = lut { out.extend_from_slice(&lut.data); }
+    out
+}
+
 #[derive(Default, Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Interpolation {
     #[default]
@@ -362,7 +376,7 @@ impl Stabilization {
         let mut flags = self.get_kernel_flags(0, buffers);
         flags.set(KernelParamsFlags::FILL_WITH_BACKGROUND, false);
         format!(
-            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}",
+            "{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{}",
             buffers.get_checksum(),
             self.compute_params.distortion_model.id(),
             self.compute_params.digital_lens.as_ref().map(|x| x.id()).unwrap_or_default(),
@@ -372,6 +386,10 @@ impl Stabilization {
             self.output_size,
             self.interpolation,
             std::thread::current().id(),
+            // A LUT change alters the size of the coeffs buffer every backend uploads, so it
+            // must be part of the cache key: otherwise a differently-sized LUT could reuse a
+            // cached GPU instance and write past the end of its (smaller) coeffs buffer.
+            self.compute_params.color.lut.as_ref().map(|l| l.checksum).unwrap_or(0),
         )
     }
     pub fn get_current_checksum(&self, buffers: &Buffers) -> u32 {
@@ -534,8 +552,9 @@ impl Stabilization {
                     let params = transform.kernel_params;
                     let distortion_model = self.compute_params.distortion_model.clone();
                     let digital_lens = self.compute_params.digital_lens.clone();
+                    let lut = self.compute_params.color.lut.clone();
                     let wgpu = std::panic::catch_unwind(|| {
-                        wgpu::WgpuWrapper::new(&params, T::wgpu_format().unwrap(), distortion_model, digital_lens, buffers, canvas_len)
+                        wgpu::WgpuWrapper::new(&params, T::wgpu_format().unwrap(), distortion_model, digital_lens, buffers, canvas_len, lut)
                     });
                     match wgpu {
                         Ok(Ok(wgpu)) => {
@@ -731,4 +750,28 @@ impl Stabilization {
 }
 
 unsafe impl Send for Stabilization { }
+
+#[cfg(test)]
+mod coeffs_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn offset_matches_coeffs_length() {
+        assert_eq!(LUT_DATA_OFFSET, COEFFS.len());
+    }
+
+    #[test]
+    fn buffer_without_lut_is_just_coeffs() {
+        assert_eq!(build_coeffs_buffer(None).len(), COEFFS.len());
+    }
+
+    #[test]
+    fn lut_data_starts_at_the_offset() {
+        let lut = crate::color::Lut3D { size: 2, domain_min: 0.0, domain_max: 1.0, data: (0..24).map(|i| i as f32).collect(), checksum: 0 };
+        let buf = build_coeffs_buffer(Some(&lut));
+        assert_eq!(buf.len(), LUT_DATA_OFFSET + 24);
+        assert_eq!(buf[LUT_DATA_OFFSET], 0.0);
+        assert_eq!(buf[LUT_DATA_OFFSET + 23], 23.0);
+    }
+}
 unsafe impl Sync for Stabilization { }

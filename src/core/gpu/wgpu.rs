@@ -5,7 +5,6 @@ use std::borrow::Cow;
 use std::sync::atomic::{ AtomicUsize, Ordering::SeqCst };
 use wgpu::Adapter;
 use wgpu::BufferUsages;
-use wgpu::util::DeviceExt;
 use parking_lot::{ RwLock, Mutex };
 use crate::gpu:: { Buffers, BufferSource };
 use crate::stabilization::KernelParams;
@@ -144,7 +143,7 @@ impl WgpuWrapper {
         Some((name, list_name))
     }
 
-    pub fn new(params: &KernelParams, wgpu_format: (wgpu::TextureFormat, &str, bool), distortion_model: DistortionModel, digital_lens: Option<DistortionModel>, buffers: &Buffers, mut drawing_len: usize) -> Result<Self, WgpuError> {
+    pub fn new(params: &KernelParams, wgpu_format: (wgpu::TextureFormat, &str, bool), distortion_model: DistortionModel, digital_lens: Option<DistortionModel>, buffers: &Buffers, mut drawing_len: usize, lut: Option<std::sync::Arc<crate::color::Lut3D>>) -> Result<Self, WgpuError> {
         let max_matrix_count = 14 * if (params.flags & 16) == 16 { params.width } else { params.height } as usize;
 
         if params.height < 4 || params.output_height < 4 || buffers.input.size.0 < 16 || buffers.input.size.2 < 16 || buffers.output.size.0 < 16 || buffers.output.size.2 < 16 || params.width > 16384 || params.output_width > 16384 {
@@ -303,7 +302,13 @@ impl WgpuWrapper {
             let buf_matrices  = device.create_buffer(&wgpu::BufferDescriptor { size: params_size, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
             let buf_params = device.create_buffer(&wgpu::BufferDescriptor { size: std::mem::size_of::<KernelParams>() as u64, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
             let buf_drawing = device.create_buffer(&wgpu::BufferDescriptor { size: drawing_len as u64, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
-            let buf_coeffs  = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&crate::stabilization::COEFFS), usage: wgpu::BufferUsages::STORAGE });
+            let coeffs_data = crate::stabilization::build_coeffs_buffer(lut.as_deref());
+            let buf_coeffs = device.create_buffer(&wgpu::BufferDescriptor {
+                size: (coeffs_data.len() * std::mem::size_of::<f32>()) as u64,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                label: None, mapped_at_creation: false
+            });
+            queue.write_buffer(&buf_coeffs, 0, bytemuck::cast_slice(&coeffs_data));
             let buf_mesh_data = device.create_buffer(&wgpu::BufferDescriptor { size: (crate::gyro_source::splines::MAX_BUFFER_SIZE * std::mem::size_of::<f32>()).max(4096) as _, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
 
             let bind_group_layout = if uses_textures {
