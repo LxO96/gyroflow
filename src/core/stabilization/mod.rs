@@ -252,6 +252,20 @@ impl Stabilization {
         kernel_flags.set(KernelParamsFlags::FRAMEBUFFER_INVERTED, self.compute_params.framebuffer_inverted);
         kernel_flags.set(KernelParamsFlags::ANY_UNDERWATER, (self.compute_params.light_refraction_coefficient != 1.0 && self.compute_params.light_refraction_coefficient > 0.0) || self.compute_params.keyframes.is_keyframed(&crate::KeyframeType::LightRefractionCoeff));
 
+        // Colour flags must live here, not only in `FrameTransform::at_timestamp`, for two reasons:
+        // 1. `get_frame_transform_at` *assigns* (not ORs) `get_kernel_flags(..).bits()` over
+        //    `kernel_params.flags`, so anything set only in `at_timestamp` is discarded.
+        // 2. `get_current_key` derives the GPU-instance cache key from these flags. Without the
+        //    colour bits, toggling colour on or off produces an identical key, so the cached wgpu
+        //    instance and its already-specialized pipeline (`flags` is an `@id(103) override`)
+        //    are reused and the colour stage never switches on or off.
+        // The condition mirrors `frame_transform.rs` exactly (`color.is_active()`, and HAS_LUT
+        // only when a LUT is present); `at_timestamp` keeps setting them for its direct callers,
+        // which have no `Stabilization` to ask, and the two paths agree by construction.
+        let color_active = self.compute_params.color.is_active();
+        kernel_flags.set(KernelParamsFlags::COLOR_ENABLED, color_active);
+        kernel_flags.set(KernelParamsFlags::HAS_LUT, color_active && self.compute_params.color.lut.is_some());
+
         {
             let gyro = self.compute_params.gyro.read();
             let file_metadata = gyro.file_metadata.read();
@@ -791,6 +805,69 @@ mod coeffs_buffer_tests {
         assert_eq!(buf.len(), LUT_DATA_OFFSET + 24);
         assert_eq!(buf[LUT_DATA_OFFSET], 0.0);
         assert_eq!(buf[LUT_DATA_OFFSET + 23], 23.0);
+    }
+}
+
+/// The GPU-instance cache key must change when colour is toggled or a LUT is added/removed,
+/// otherwise a wgpu pipeline specialized on the old `flags` value is silently reused.
+#[cfg(test)]
+mod color_cache_key_tests {
+    use super::*;
+
+    fn buffers() -> Buffers<'static> {
+        Buffers { input: BufferDescription::default(), output: BufferDescription::default() }
+    }
+
+    fn stab_with(color: crate::color::ColorAdjustments) -> Stabilization {
+        let mut stab = Stabilization::default();
+        let mut params = ComputeParams::default();
+        params.color = color;
+        stab.set_compute_params(params);
+        stab
+    }
+
+    fn lut() -> std::sync::Arc<crate::color::Lut3D> {
+        std::sync::Arc::new(crate::color::Lut3D { size: 2, domain_min: 0.0, domain_max: 1.0, data: vec![0.5; 24], checksum: 12345 })
+    }
+
+    #[test]
+    fn toggling_enabled_changes_the_key() {
+        let mut off = crate::color::ColorAdjustments::default();
+        off.exposure = 1.0; // something for `is_active` to see
+        let mut on = off.clone();
+        on.enabled = true;
+
+        let b = buffers();
+        assert_ne!(stab_with(off).get_current_key(&b), stab_with(on).get_current_key(&b));
+    }
+
+    #[test]
+    fn adding_or_removing_a_lut_changes_the_key() {
+        let mut without = crate::color::ColorAdjustments::default();
+        without.enabled = true;
+        let mut with = without.clone();
+        with.lut = Some(lut());
+
+        let b = buffers();
+        assert_ne!(stab_with(without).get_current_key(&b), stab_with(with).get_current_key(&b));
+    }
+
+    #[test]
+    fn untouched_colour_leaves_the_flags_clear() {
+        // No colour usage must not perturb the key for everyone else.
+        let flags = stab_with(crate::color::ColorAdjustments::default()).get_kernel_flags(0, &buffers());
+        assert!(!flags.contains(KernelParamsFlags::COLOR_ENABLED));
+        assert!(!flags.contains(KernelParamsFlags::HAS_LUT));
+    }
+
+    #[test]
+    fn kernel_flags_reflect_colour_state() {
+        let mut c = crate::color::ColorAdjustments::default();
+        c.enabled = true;
+        c.lut = Some(lut());
+        let flags = stab_with(c).get_kernel_flags(0, &buffers());
+        assert!(flags.contains(KernelParamsFlags::COLOR_ENABLED));
+        assert!(flags.contains(KernelParamsFlags::HAS_LUT));
     }
 }
 unsafe impl Sync for Stabilization { }
