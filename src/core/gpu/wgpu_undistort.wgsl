@@ -49,6 +49,9 @@ struct KernelParams {
     reserved2:                f32, // 16
     ewa_coeffs_p:             vec4<f32>, // 16
     ewa_coeffs_q:             vec4<f32>, // 16
+    color_params_1:           vec4<f32>, // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
+    color_params_2:           vec4<f32>, // 16 - wb_gains.r, wb_gains.g, wb_gains.b, lut_size
+    color_params_3:           vec4<f32>, // 16 - domain_min, domain_max, unused, unused
 }
 
 @group(0) @binding(0) @fragment var<uniform> params: KernelParams;
@@ -119,6 +122,83 @@ fn remap_colorrange(px: vec4<f32>, isY: bool) -> vec4<f32> {
     if (isY) { return ((16.0 / 255.0) * params.max_pixel_value) + (px * 0.85882352); } // (235 - 16) / 255
     else     { return ((16.0 / 255.0) * params.max_pixel_value) + (px * 0.87843137); } // (240 - 16) / 255
 }
+////////////////////////////// Colour adjustments //////////////////////////////
+// This arithmetic is a deliberate, ratified duplicate of `crate::color::apply_color`
+// (src/core/color/mod.rs) and `crate::color::sample_trilinear` (src/core/color/lut.rs).
+// Every operation, and their order, must stay identical to the Rust reference - the
+// explicit `a + (b - a) * t` lerps below mirror the Rust source exactly and must not be
+// rewritten as `mix()`, which evaluates `a * (1 - t) + b * t` and is not bit-identical.
+//
+// LUT_DATA_OFFSET is mirrored from `LUT_DATA_OFFSET` in src/core/stabilization/mod.rs
+// (it equals COEFFS.len()); a change there must be made here too.
+const LUT_DATA_OFFSET: u32 = 488u;
+
+fn lerp3(a: vec3<f32>, b: vec3<f32>, t: f32) -> vec3<f32> {
+    return a + (b - a) * t;
+}
+
+fn lut_fetch(r: i32, g: i32, b: i32, n: i32) -> vec3<f32> {
+    let rc = clamp(r, 0, n - 1);
+    let gc = clamp(g, 0, n - 1);
+    let bc = clamp(b, 0, n - 1);
+    let idx = LUT_DATA_OFFSET + u32((bc * n * n + gc * n + rc) * 3);
+    return vec3<f32>(coeffs[idx], coeffs[idx + 1u], coeffs[idx + 2u]);
+}
+
+fn lut_sample(rgb: vec3<f32>, n: i32, domain_min: f32, domain_max: f32) -> vec3<f32> {
+    let scale = 1.0 / max(domain_max - domain_min, 1e-9);
+    let normalized = clamp((rgb - vec3<f32>(domain_min)) * scale, vec3<f32>(0.0), vec3<f32>(1.0));
+    let pos = normalized * f32(n - 1);
+    let base = clamp(vec3<i32>(floor(pos)), vec3<i32>(0), vec3<i32>(n - 1));
+    let f = pos - vec3<f32>(base);
+
+    let c000 = lut_fetch(base.x,     base.y,     base.z,     n);
+    let c100 = lut_fetch(base.x + 1, base.y,     base.z,     n);
+    let c010 = lut_fetch(base.x,     base.y + 1, base.z,     n);
+    let c110 = lut_fetch(base.x + 1, base.y + 1, base.z,     n);
+    let c001 = lut_fetch(base.x,     base.y,     base.z + 1, n);
+    let c101 = lut_fetch(base.x + 1, base.y,     base.z + 1, n);
+    let c011 = lut_fetch(base.x,     base.y + 1, base.z + 1, n);
+    let c111 = lut_fetch(base.x + 1, base.y + 1, base.z + 1, n);
+
+    let c00 = lerp3(c000, c100, f.x);
+    let c10 = lerp3(c010, c110, f.x);
+    let c01 = lerp3(c001, c101, f.x);
+    let c11 = lerp3(c011, c111, f.x);
+    let c0  = lerp3(c00, c10, f.y);
+    let c1  = lerp3(c01, c11, f.y);
+    return lerp3(c0, c1, f.z);
+}
+
+fn apply_color(px: vec4<f32>, max_value: f32) -> vec4<f32> {
+    let inv_max = select(1.0, 1.0 / max_value, max_value > 0.0);
+    var c = px.xyz * inv_max;
+
+    // 1. LUT, blended by strength
+    let lut_size = i32(params.color_params_2.w);
+    let lut_strength = params.color_params_1.w;
+    if (bool(flags & 8192) && lut_size >= 2 && lut_strength > 0.0) {
+        let graded = lut_sample(c, lut_size, params.color_params_3.x, params.color_params_3.y);
+        c = c + (graded - c) * lut_strength;
+    }
+
+    // 2. Exposure
+    c = c * params.color_params_1.x;
+
+    // 3. White balance
+    c = c * params.color_params_2.xyz;
+
+    // 4. Contrast around mid grey
+    c = (c - vec3<f32>(0.5)) * params.color_params_1.y + vec3<f32>(0.5);
+
+    // 5. Saturation around luma
+    let luma = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    c = vec3<f32>(luma) + (c - vec3<f32>(luma)) * params.color_params_1.z;
+
+    return vec4<f32>(c * max_value, px.w);
+}
+////////////////////////////// Colour adjustments //////////////////////////////
+
 fn map_coord(x: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> f32 {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
@@ -287,6 +367,9 @@ fn sample_input_at(uv_param: vec2<f32>, jac: vec4<f32>) -> vec4<f32> {
         }
     }
 
+    if (bool(flags & 4096)) {
+        sum = apply_color(sum, params.max_pixel_value);
+    }
     if (fix_range) {
         sum = remap_colorrange(sum, params.plane_index == 0);
     }
