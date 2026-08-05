@@ -174,13 +174,23 @@ DATA_TYPEF remap_colorrange(DATA_TYPEF px, bool isY, __global KernelParams *para
 // (it equals COEFFS.len()); a change there must be made here too.
 // Note: `lut_coeffs` is a separate buffer from the file-scope `__constant float coeffs[]`
 // interpolation table, which stays compiled into this kernel - the name must not collide.
+//
+// `lut_coeffs` carries no length, so the LUT reads below are bounds-safe only because the
+// buffer and `color_params_2.w` (the LUT size) are built from the same `Lut3D`: opencl.rs
+// sizes `buf_coeffs` with `build_coeffs_buffer(lut)` and frame_transform.rs fills
+// `color_params_2.w` from `lut.size`, and a LUT change forces a fresh OclWrapper via
+// `Stabilization::get_current_key`. Do not set one without the other.
+//
+// These functions carry no storage-class specifier, matching the rest of this file:
+// OpenCL C 1.2 6.8 lists `static` among the unsupported specifiers, and no -cl-std is
+// passed when the program is built.
 #define LUT_DATA_OFFSET 488
 
-static float3 lerp3(float3 a, float3 b, float t) {
+float3 lerp3(float3 a, float3 b, float t) {
     return a + (b - a) * t;
 }
 
-static float3 lut_fetch(__global const float *lut_coeffs, int r, int g, int b, int n) {
+float3 lut_fetch(__global const float *lut_coeffs, int r, int g, int b, int n) {
     int rc = clamp(r, 0, n - 1);
     int gc = clamp(g, 0, n - 1);
     int bc = clamp(b, 0, n - 1);
@@ -188,7 +198,7 @@ static float3 lut_fetch(__global const float *lut_coeffs, int r, int g, int b, i
     return (float3)(lut_coeffs[idx], lut_coeffs[idx + 1], lut_coeffs[idx + 2]);
 }
 
-static float3 lut_sample(__global const float *lut_coeffs, float3 rgb, int n, float domain_min, float domain_max) {
+float3 lut_sample(__global const float *lut_coeffs, float3 rgb, int n, float domain_min, float domain_max) {
     float scale = 1.0f / fmax(domain_max - domain_min, 1e-9f);
     float3 normalized = clamp((rgb - (float3)(domain_min)) * scale, (float3)(0.0f), (float3)(1.0f));
     float3 pos = normalized * (float)(n - 1);
@@ -213,7 +223,7 @@ static float3 lut_sample(__global const float *lut_coeffs, float3 rgb, int n, fl
     return lerp3(c0, c1, f.z);
 }
 
-static float4 apply_color(float4 px, __global const float *lut_coeffs, __global KernelParams *params) {
+float4 apply_color(float4 px, __global const float *lut_coeffs, __global KernelParams *params) {
     float max_value = params->max_pixel_value;
     float inv_max = max_value > 0.0f ? 1.0f / max_value : 1.0f;
     float3 c = px.xyz * inv_max;

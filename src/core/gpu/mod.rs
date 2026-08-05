@@ -211,11 +211,17 @@ mod opencl_source_tests {
         let device_side = "__kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstptr, __global const void *params_buf, __global const float *matrices, __global const uchar *drawing, __global const float *mesh_data, __global const float *lut_coeffs)";
         assert!(CL.contains(device_side), "undistort_image signature changed; update the host-side arg order in opencl.rs too:\n{device_side}");
 
-        // Host side, in `set_arg` order. Indices are positional.
+        // Host side: the `.arg()` calls must appear in exactly this order, because kernel
+        // argument indices are positional. Presence alone is not enough - two swapped
+        // `.arg()` calls would still bind, just to the wrong parameters.
+        let mut prev: Option<(&str, usize)> = None;
         for (idx, name) in ["source_buffer", "dest_buffer", "buf_params", "buf_matrices", "buf_drawing", "buf_mesh_data", "buf_coeffs"].iter().enumerate() {
             let expected = format!(".arg(&{name})");
-            let expected_end = format!(".arg(&{name});");
-            assert!(HOST.contains(&expected) || HOST.contains(&expected_end), "opencl.rs must bind `{name}` as kernel argument {idx}");
+            let at = HOST.find(&expected).unwrap_or_else(|| panic!("opencl.rs must bind `{name}` as kernel argument {idx} via `{expected}`"));
+            if let Some((prev_name, prev_at)) = prev {
+                assert!(at > prev_at, "`{name}` must be bound after `{prev_name}`: kernel argument {idx} is positional, and opencl_undistort.cl expects this exact order");
+            }
+            prev = Some((name, at));
         }
     }
 
@@ -223,7 +229,7 @@ mod opencl_source_tests {
     /// `mix()` and `dot()` are not (see the comment block in the .cl).
     #[test]
     fn colour_stage_avoids_non_identical_builtins() {
-        let start = CL.find("static float3 lerp3").expect("colour block missing from opencl_undistort.cl");
+        let start = CL.find("float3 lerp3(").expect("colour block missing from opencl_undistort.cl");
         let end = CL.find("float map_coord(").expect("colour block end marker missing");
         let block = &CL[start..end];
         assert!(!block.contains("mix("), "the OpenCL colour stage must not use mix()");

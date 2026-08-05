@@ -82,7 +82,12 @@ pub fn apply_color(px: Vec4, coeffs: &[f32], params: &KernelParams) -> Vec4 {
     // It never fires for the wgpu/OpenCL buffers, which are always built by
     // `build_coeffs_buffer`; it exists because the Qt RHI entry point passes an empty
     // slice for `coeffs` until Task 11 gives it a real LUT binding.
-    let lut_fits = lut_size >= 2 && coeffs.len() >= LUT_DATA_OFFSET + (lut_size * lut_size * lut_size * 3) as usize;
+    // `lut_size` comes from a saturating float cast, so bound it before cubing: in i32 the
+    // product overflows above ~860 (panic on a debug host build, wrap in SPIR-V, and a
+    // wrapped-negative product would make this guard trivially true). 64 is the maximum
+    // `parse_cube` accepts (src/core/color/lut.rs).
+    let n = lut_size.clamp(0, 64) as usize;
+    let lut_fits = lut_size >= 2 && lut_size <= 64 && coeffs.len() >= LUT_DATA_OFFSET + n * n * n * 3;
     if (params.flags & 8192) != 0 && lut_fits && lut_strength > 0.0 {
         let graded = lut_sample(coeffs, c, lut_size, params.color_params_3.x, params.color_params_3.y);
         c = c + (graded - c) * lut_strength;
