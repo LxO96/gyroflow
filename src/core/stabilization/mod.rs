@@ -523,8 +523,9 @@ impl Stabilization {
                     let params = transform.kernel_params;
                     let distortion_model = self.compute_params.distortion_model.clone();
                     let digital_lens = self.compute_params.digital_lens.clone();
+                    let lut = self.compute_params.color.lut.clone();
                     let cl = std::panic::catch_unwind(|| {
-                        opencl::OclWrapper::new(&params, T::ocl_names(), distortion_model, digital_lens, buffers, canvas_len)
+                        opencl::OclWrapper::new(&params, T::ocl_names(), distortion_model, digital_lens, buffers, canvas_len, lut)
                     });
                     match cl {
                         Ok(Ok(cl)) => {

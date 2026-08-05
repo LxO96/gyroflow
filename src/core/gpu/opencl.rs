@@ -23,6 +23,8 @@ pub struct OclWrapper {
     buf_drawing: Buffer<u8>,
     buf_mesh_data: Buffer<f32>,
     buf_matrices: Buffer<f32>,
+    #[allow(dead_code)] // Written once at creation, then only read by the kernel
+    buf_coeffs: Buffer<f32>,
 }
 
 pub struct CtxWrapper {
@@ -175,7 +177,7 @@ impl OclWrapper {
         Ok((name, list_name))
     }
 
-    pub fn new(params: &KernelParams, ocl_names: (&str, &str, &str, &str), distortion_model: DistortionModel, digital_lens: Option<DistortionModel>, buffers: &Buffers, drawing_len: usize) -> ocl::Result<Self> {
+    pub fn new(params: &KernelParams, ocl_names: (&str, &str, &str, &str), distortion_model: DistortionModel, digital_lens: Option<DistortionModel>, buffers: &Buffers, drawing_len: usize, lut: Option<std::sync::Arc<crate::color::Lut3D>>) -> ocl::Result<Self> {
         if params.height < 4 || params.output_height < 4 || params.stride < 1 { return Err(ocl::BufferCmdError::AlreadyMapped.into()); }
 
         let mut kernel = include_str!("opencl_undistort.cl").to_string();
@@ -292,17 +294,28 @@ impl OclWrapper {
             let buf_matrices = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(max_matrix_count).build()?;
             let buf_mesh_data = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(crate::gyro_source::splines::MAX_BUFFER_SIZE).build()?;
 
+            // Unlike the other backends, OpenCL keeps its interpolation tables as `__constant`
+            // literals inside the .cl, so this buffer exists only to carry the LUT payload.
+            // It is still built with `build_coeffs_buffer`, and therefore still starts with the
+            // 488 interpolation coefficients, so that LUT_DATA_OFFSET is the same everywhere.
+            // The buffer contents are static for the lifetime of this instance; a LUT change
+            // produces a different `get_current_key` and therefore a fresh OclWrapper.
+            let coeffs_data = crate::stabilization::build_coeffs_buffer(lut.as_deref());
+            let buf_coeffs = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(coeffs_data.len()).build()?;
+            buf_coeffs.write(&coeffs_data).enq()?;
+
             let mut builder = Kernel::builder();
             unsafe {
                 builder.program(&program).name("undistort_image").queue(ocl_queue.clone())
                     .global_work_size((buffers.output.size.0, buffers.output.size.1))
                     .disable_arg_type_check()
-                    .arg(&source_buffer)
-                    .arg(&dest_buffer)
-                    .arg(&buf_params)
-                    .arg(&buf_matrices)
-                    .arg(&buf_drawing)
-                    .arg(&buf_mesh_data);
+                    .arg(&source_buffer)  // 0
+                    .arg(&dest_buffer)    // 1
+                    .arg(&buf_params)     // 2
+                    .arg(&buf_matrices)   // 3
+                    .arg(&buf_drawing)    // 4
+                    .arg(&buf_mesh_data)  // 5
+                    .arg(&buf_coeffs);    // 6
             }
 
             let kernel = builder.build()?;
@@ -321,6 +334,7 @@ impl OclWrapper {
                 buf_drawing,
                 buf_matrices,
                 buf_mesh_data,
+                buf_coeffs,
             })
         } else {
             Err(ocl::BufferCmdError::AlreadyMapped.into())

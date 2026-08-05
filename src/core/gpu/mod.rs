@@ -14,6 +14,49 @@ pub mod wgpu_interop;
 pub mod drawing;
 use std::hash::Hasher;
 
+/// Source-text checks on the OpenCL kernel. The kernel itself is only compiled by an
+/// OpenCL driver at runtime (and `opencl.rs` only exists under `--features use-opencl`),
+/// so these run unconditionally to catch the two things that would otherwise fail
+/// silently on a user's machine: a stale LUT offset, and a kernel-argument index that no
+/// longer matches the host-side `set_arg` order.
+#[cfg(test)]
+mod opencl_source_tests {
+    const CL: &str = include_str!("opencl_undistort.cl");
+    const HOST: &str = include_str!("opencl.rs");
+
+    /// The offset the kernel reads LUT data at must match the Rust constant it mirrors.
+    #[test]
+    fn lut_data_offset_matches_rust() {
+        let expected = format!("#define LUT_DATA_OFFSET {}", crate::stabilization::LUT_DATA_OFFSET);
+        assert!(CL.contains(&expected), "opencl_undistort.cl must contain `{expected}`");
+    }
+
+    /// A kernel-argument index mismatch is a silent runtime failure, so pin both sides.
+    #[test]
+    fn kernel_argument_order_matches_host() {
+        let device_side = "__kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstptr, __global const void *params_buf, __global const float *matrices, __global const uchar *drawing, __global const float *mesh_data, __global const float *lut_coeffs)";
+        assert!(CL.contains(device_side), "undistort_image signature changed; update the host-side arg order in opencl.rs too:\n{device_side}");
+
+        // Host side, in `set_arg` order. Indices are positional.
+        for (idx, name) in ["source_buffer", "dest_buffer", "buf_params", "buf_matrices", "buf_drawing", "buf_mesh_data", "buf_coeffs"].iter().enumerate() {
+            let expected = format!(".arg(&{name})");
+            let expected_end = format!(".arg(&{name});");
+            assert!(HOST.contains(&expected) || HOST.contains(&expected_end), "opencl.rs must bind `{name}` as kernel argument {idx}");
+        }
+    }
+
+    /// The colour arithmetic must stay bit-identical to `crate::color::apply_color`;
+    /// `mix()` and `dot()` are not (see the comment block in the .cl).
+    #[test]
+    fn colour_stage_avoids_non_identical_builtins() {
+        let start = CL.find("static float3 lerp3").expect("colour block missing from opencl_undistort.cl");
+        let end = CL.find("float map_coord(").expect("colour block end marker missing");
+        let block = &CL[start..end];
+        assert!(!block.contains("mix("), "the OpenCL colour stage must not use mix()");
+        assert!(!block.contains("dot("), "the OpenCL colour stage must not use dot()");
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BufferDescription<'a> {
     pub size: (usize, usize, usize), // width, height, stride
