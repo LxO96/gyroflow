@@ -728,13 +728,22 @@ impl Stabilization {
 
             //let ok = Self::undistort_image_cpu_spirv::<T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer);
             // CPU path
-            // Only build the combined coeffs+LUT buffer (and allocate) when a LUT is actually
-            // present; otherwise reuse the static COEFFS table with no extra allocation, so the
-            // CPU path costs nothing extra when colour/LUT is disabled.
+            // Only build the combined coeffs+LUT buffer (and allocate) when colour is actually
+            // enabled for this frame; otherwise reuse the static COEFFS table with no extra
+            // allocation. `enabled` and `lut` are independent fields (Task 15's UI and Task 13's
+            // project deserialisation both let a LUT be selected while colour is toggled off), so
+            // gating on `lut.is_some()` alone would allocate on every frame even when
+            // COLOR_ENABLED is unset and the pixel path is a no-op. Gate on the flag actually
+            // consulted by the pixel path instead.
+            let color_enabled = (itm.kernel_params.flags & KernelParamsFlags::COLOR_ENABLED.bits()) != 0;
             let coeffs_buf;
-            let coeffs: &[f32] = if let Some(lut) = self.compute_params.color.lut.as_deref() {
-                coeffs_buf = build_coeffs_buffer(Some(lut));
-                &coeffs_buf
+            let coeffs: &[f32] = if color_enabled {
+                if let Some(lut) = self.compute_params.color.lut.as_deref() {
+                    coeffs_buf = build_coeffs_buffer(Some(lut));
+                    &coeffs_buf
+                } else {
+                    &COEFFS
+                }
             } else {
                 &COEFFS
             };

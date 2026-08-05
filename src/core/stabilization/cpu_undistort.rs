@@ -930,4 +930,126 @@ mod color_stage_tests {
         let out = apply_color([0.25, 0.25, 0.25], &ColorKernelParams { contrast_factor: 1.0, saturation_factor: 1.0, wb_gains: [1.0; 3], ..cp }, None);
         assert!((out[0] - 0.5).abs() < 1e-6, "was {}", out[0]);
     }
+
+    /// End-to-end pixel-path test: actually calls `undistort_image_cpu` (not just
+    /// `apply_color` directly), with COLOR_ENABLED/HAS_LUT set in `flags`, a real LUT
+    /// sliced out of a `build_coeffs_buffer` result at `LUT_DATA_OFFSET`, and non-neutral
+    /// colour params. Geometry is set up to be a pure identity resample (k=0 distortion,
+    /// f=[1,1], c=[0,0], lens_correction_amount=1.0, r_limit=0, 1:1 rects, background_mode
+    /// 0) so that, before the colour stage, output pixel (x,y) is bit-identical to input
+    /// pixel (x,y) — this isolates what the colour stage itself does to the pixel.
+    #[test]
+    fn color_stage_applied_end_to_end_through_undistort_image_cpu() {
+        use crate::gpu::BufferDescription;
+        use crate::color::Lut3D;
+        use crate::stabilization::RGBAf;
+
+        const W: i32 = 2;
+        const H: i32 = 2;
+        const BPP: i32 = 16; // RGBAf: 4 x f32
+        const STRIDE: i32 = W * BPP;
+
+        // Inverts every channel: sample_trilinear(lut, c) == [1-c0, 1-c1, 1-c2] for any c
+        // in 0..1 (bilinear interpolation of a linear function is exact), corner order
+        // matches lut.rs's documented "red varying fastest" .cube layout.
+        let lut = Lut3D {
+            size: 2,
+            domain_min: 0.0,
+            domain_max: 1.0,
+            data: vec![
+                1.0, 1.0, 1.0,   0.0, 1.0, 1.0,   1.0, 0.0, 1.0,   0.0, 0.0, 1.0,
+                1.0, 1.0, 0.0,   0.0, 1.0, 0.0,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0,
+            ],
+            checksum: 0,
+        };
+        let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
+        assert_eq!(coeffs.len(), crate::stabilization::LUT_DATA_OFFSET + 24, "LUT payload not appended where undistort_image_cpu expects to slice it");
+
+        let color_params_1 = [1.2f32, 1.1, 0.8, 0.5]; // exposure_gain, contrast_factor, saturation_factor, lut_strength
+        let color_params_2 = [1.05f32, 1.0, 0.95, 2.0]; // wb_gain_r/g/b, lut_size
+        let color_params_3 = [0.0f32, 1.0, 0.0, 0.0]; // domain_min, domain_max
+
+        fn base_params(flags: i32, color_params_1: [f32; 4], color_params_2: [f32; 4], color_params_3: [f32; 4]) -> KernelParams {
+            let mut p = KernelParams::default();
+            p.width = W; p.height = H; p.stride = STRIDE;
+            p.output_width = W; p.output_height = H; p.output_stride = STRIDE;
+            p.matrix_count = 1;
+            p.interpolation = 2;
+            p.bytes_per_pixel = BPP;
+            p.pix_element_count = 4;
+            p.f = [1.0, 1.0];
+            p.c = [0.0, 0.0];
+            p.fov = 1.0;
+            p.lens_correction_amount = 1.0; // skips the lens-correction block entirely
+            p.source_rect = [0, 0, W, H];
+            p.output_rect = [0, 0, W, H];
+            p.max_pixel_value = 1.0;
+            p.pixel_value_limit = f32::MAX;
+            p.light_refraction_coefficient = 1.0;
+            p.flags = flags;
+            p.color_params_1 = color_params_1;
+            p.color_params_2 = color_params_2;
+            p.color_params_3 = color_params_3;
+            p
+        }
+
+        // Identity 3x3 rotation/translation block (first 9 of the 14 matrix fields); the
+        // trailing 5 (extra shift/angle fields) stay zero, which disables that adjustment.
+        let matrices: [[f32; 14]; 1] = [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]];
+        let distortion_model = DistortionModel::default(); // OpenCVFisheye with k=0 => identity distort/undistort
+
+        // Four distinct, non-trivial input pixels so the pipeline can't pass by coincidence.
+        let input_pixels: [[f32; 4]; 4] = [
+            [0.10, 0.80, 0.30, 1.0],
+            [0.90, 0.05, 0.60, 1.0],
+            [0.40, 0.40, 0.40, 1.0],
+            [0.75, 0.20, 0.95, 1.0],
+        ];
+        let mut input_bytes = vec![0u8; (STRIDE * H) as usize];
+        for (i, p) in input_pixels.iter().enumerate() {
+            input_bytes[i * 16..i * 16 + 16].copy_from_slice(bytemuck::bytes_of(p));
+        }
+
+        let run = |flags: i32| -> Vec<[f32; 4]> {
+            let params = base_params(flags, color_params_1, color_params_2, color_params_3);
+            let mut input = input_bytes.clone();
+            let mut output = vec![0u8; (STRIDE * H) as usize];
+            let mut buffers = Buffers {
+                input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
+                output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+            };
+            let ok = Stabilization::undistort_image_cpu::<2, RGBAf>(&mut buffers, &params, &distortion_model, None, &matrices, &[], &[], &coeffs);
+            assert!(ok, "undistort_image_cpu returned false");
+            (0..4).map(|i| *bytemuck::from_bytes::<[f32; 4]>(&output[i * 16..i * 16 + 16])).collect()
+        };
+
+        let disabled = run(0);
+        let enabled = run(4096 | 8192); // COLOR_ENABLED | HAS_LUT
+
+        // Half 1 of the constraint: COLOR_ENABLED unset => bit-identical no-op (pure identity resample).
+        for (i, p) in input_pixels.iter().enumerate() {
+            assert_eq!(disabled[i], *p, "pixel {i} not a no-op with colour disabled");
+        }
+
+        // Half 2: COLOR_ENABLED set => differs from the disabled run, and matches apply_color()
+        // called directly with the same params/LUT on the same (identity-resampled) input.
+        let cp = ColorKernelParams {
+            exposure_gain:     color_params_1[0],
+            contrast_factor:   color_params_1[1],
+            saturation_factor: color_params_1[2],
+            lut_strength:      color_params_1[3],
+            wb_gains:          [color_params_2[0], color_params_2[1], color_params_2[2]],
+            lut_size:          color_params_2[3] as u32,
+            domain_min:        color_params_3[0],
+            domain_max:        color_params_3[1],
+        };
+        for (i, p) in input_pixels.iter().enumerate() {
+            assert_ne!(enabled[i], disabled[i], "pixel {i} identical with colour enabled vs disabled");
+            let expected_rgb = apply_color([p[0], p[1], p[2]], &cp, Some(&lut));
+            for c in 0..3 {
+                assert!((enabled[i][c] - expected_rgb[c]).abs() < 1e-5, "channel {c} mismatch on pixel {i}: {} != {}", enabled[i][c], expected_rgb[c]);
+            }
+            assert_eq!(enabled[i][3], p[3], "alpha should pass through the colour stage unaffected on pixel {i}");
+        }
+    }
 }
