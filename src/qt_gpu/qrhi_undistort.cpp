@@ -378,7 +378,13 @@ public:
         // resizeLutTexture() runs mid-frame and can latch m_bindingsValid false when its
         // restore rebind also fails, so the check at the top of render() is not enough -
         // re-check here, before anything draws with the SRB.
-        if (!m_bindingsValid) return false;
+        //
+        // `u` has been acquired and written to by this point. Update batches come from a
+        // fixed-size pool and are only returned to it by beginPass()/resourceUpdate() or by
+        // an explicit release(), so bailing out without releasing would consume a pool slot
+        // for good. This is the only early return in render() that sits after
+        // nextResourceUpdateBatch().
+        if (!m_bindingsValid) { u->release(); return false; }
 
         QMatrix4x4 mvp = item->textureMatrix();
         mvp.scale(2.0f);
