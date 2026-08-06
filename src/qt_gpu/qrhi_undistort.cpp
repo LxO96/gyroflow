@@ -232,7 +232,17 @@ public:
     // referencing freed memory, because the caller goes on to draw.
     bool resizeLutTexture(QRhi *rhi, uint32_t size) {
         QScopedPointer<QRhiTexture> tex(rhi->newTexture(m_lutFormat, QSize(int(size * size), int(size)), 1, QRhiTexture::Flags()));
-        if (!tex || !tex->create()) { qDebug2("resizeLutTexture") << "failed to create the LUT texture at size" << size << "- keeping the previous one"; return false; }
+        if (!tex || !tex->create()) {
+            // The checksum is deliberately not advanced by the caller, so the next frame
+            // retries - which is what makes this self-healing. The log line is latched
+            // instead, otherwise a persistent condition (device OOM with a large LUT) would
+            // print once per frame forever. Reset on success so a later failure is heard.
+            if (!m_lutResizeFailureLogged) {
+                qDebug2("resizeLutTexture") << "failed to create the LUT texture at size" << size << "- keeping the previous one, and retrying on later frames";
+                m_lutResizeFailureLogged = true;
+            }
+            return false;
+        }
 
         QRhiTexture *previous = m_texLut.take(); // Kept alive until the new bindings are live.
         const uint32_t previousSize = m_lutSize;
@@ -252,6 +262,7 @@ public:
         }
 
         delete previous;
+        m_lutResizeFailureLogged = false;
         return true;
     }
 
@@ -364,6 +375,10 @@ public:
                 if (uploadLut(u, lutData, lutSize, false)) m_lutChecksum = lutChecksum;
             }
         }
+        // resizeLutTexture() runs mid-frame and can latch m_bindingsValid false when its
+        // restore rebind also fails, so the check at the top of render() is not enough -
+        // re-check here, before anything draws with the SRB.
+        if (!m_bindingsValid) return false;
 
         QMatrix4x4 mvp = item->textureMatrix();
         mvp.scale(2.0f);
@@ -418,6 +433,7 @@ public:
     QRhiTexture::Format m_lutFormat{QRhiTexture::RGBA32F};
     int m_lutRung{0};
     bool m_lutRefusalLogged{false};
+    bool m_lutResizeFailureLogged{false};
     bool m_bindingsValid{true};
 
     QSize m_outputSize;
