@@ -58,7 +58,19 @@ pub fn render(mdkplayer: &MDKPlayerWrapper, timestamp: f64, frame: usize, width:
             let canvas_size = undist.drawing.get_size();
             let canvas_size = QSize { width: canvas_size.0 as u32, height: canvas_size.1 as u32 };
 
-            let ok = cpp!(unsafe [mdkplayer as "MDKPlayerWrapper *", output_size as "QSize", shader_path as "QString", width as "uint32_t", height as "uint32_t", params_ptr as "uint8_t*", matrices_ptr as "uint8_t*", canvas_ptr as "uint8_t*", mesh_data_ptr as "float*", mesh_data_len as "uint32_t", matrices_len as "uint32_t", params_len as "uint32_t", canvas_len as "uint32_t", canvas_size as "QSize", size_for_rs as "uint32_t"] -> bool as "bool" {
+            // The colour LUT, tiled into a 2D texture on the C++ side. `lut_checksum` is the
+            // crc32 from `Lut3D`, so 0 means "nothing loaded" and leaves the identity LUT
+            // that `init()` uploaded in place - binding 6 is never unbound.
+            // try_read, like the other locks here: a null pointer just skips the upload, and
+            // because m_lutChecksum is only advanced on a successful upload the next frame
+            // retries.
+            let color = stab.color.try_read();
+            let lut = color.as_ref().and_then(|c| c.lut.as_deref());
+            let lut_ptr = lut.map(|l| l.data.as_ptr()).unwrap_or(std::ptr::null());
+            let lut_size = lut.map(|l| l.size).unwrap_or(0);
+            let lut_checksum = lut.map(|l| l.checksum).unwrap_or(0);
+
+            let ok = cpp!(unsafe [mdkplayer as "MDKPlayerWrapper *", output_size as "QSize", shader_path as "QString", width as "uint32_t", height as "uint32_t", params_ptr as "uint8_t*", matrices_ptr as "uint8_t*", canvas_ptr as "uint8_t*", mesh_data_ptr as "float*", mesh_data_len as "uint32_t", matrices_len as "uint32_t", params_len as "uint32_t", canvas_len as "uint32_t", canvas_size as "QSize", size_for_rs as "uint32_t", lut_ptr as "const float *", lut_size as "uint32_t", lut_checksum as "uint32_t"] -> bool as "bool" {
                 if (!mdkplayer || !mdkplayer->mdkplayer || shader_path.isEmpty() || output_size.isEmpty()) return false;
 
                 auto rhiUndistortion = static_cast<QtRHIUndistort *>(mdkplayer->mdkplayer->userData());
@@ -96,8 +108,9 @@ pub fn render(mdkplayer: &MDKPlayerWrapper, timestamp: f64, frame: usize, width:
                     });
                 }
 
-                return rhiUndistortion->render(mdkplayer->mdkplayer, params_ptr, params_len, matrices_ptr, matrices_len, canvas_ptr, canvas_len, mesh_data_ptr, mesh_data_len);
+                return rhiUndistortion->render(mdkplayer->mdkplayer, params_ptr, params_len, matrices_ptr, matrices_len, canvas_ptr, canvas_len, mesh_data_ptr, mesh_data_len, lut_ptr, lut_size, lut_checksum);
             });
+            drop(color);
             if ok {
                 return Some(ProcessedInfo {
                     fov: itm.fov,

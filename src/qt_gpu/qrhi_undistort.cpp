@@ -43,6 +43,16 @@ static float quadVertexData[16] = { // Y up, CCW
 };
 static quint16 quadIndexData[6] = { 0, 1, 2, 0, 2, 3 };
 
+// 2³ identity LUT in .cube order (RGB-major, red varying fastest), used until a real LUT
+// is loaded so that binding 6 is never left unbound - that is a validation error on
+// several RHI backends.
+static const float identityLut2[8 * 3] = {
+    0.0f, 0.0f, 0.0f,   1.0f, 0.0f, 0.0f,
+    0.0f, 1.0f, 0.0f,   1.0f, 1.0f, 0.0f,
+    0.0f, 0.0f, 1.0f,   1.0f, 0.0f, 1.0f,
+    0.0f, 1.0f, 1.0f,   1.0f, 1.0f, 1.0f
+};
+
 // ubufAlignment
 // static inline uint aligned(uint v, uint byteAlign) { return (v + byteAlign - 1) & ~(byteAlign - 1); }
 
@@ -116,16 +126,20 @@ public:
         m_meshDataSampler.reset(rhi->newSampler(QRhiSampler::Nearest, QRhiSampler::Nearest, QRhiSampler::None, QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge));
         if (!m_meshDataSampler->create()) { qDebug2("init") << "failed to create m_meshDataSampler"; return false; }
 
-        m_srb.reset(rhi->newShaderResourceBindings());
-        m_srb->setBindings({
-            QRhiShaderResourceBinding::uniformBuffer (0, QRhiShaderResourceBinding::FragmentStage | QRhiShaderResourceBinding::VertexStage, m_drawingUniform.get()),
-            QRhiShaderResourceBinding::sampledTexture(1, QRhiShaderResourceBinding::FragmentStage, item->rhiTexture(), m_drawingSampler.get()),
-            QRhiShaderResourceBinding::uniformBuffer (2, QRhiShaderResourceBinding::FragmentStage, m_kernelParams.get()),
-            QRhiShaderResourceBinding::sampledTexture(3, QRhiShaderResourceBinding::FragmentStage, m_texMatrices.get(), m_matricesSampler.get()),
-            QRhiShaderResourceBinding::sampledTexture(4, QRhiShaderResourceBinding::FragmentStage, m_texCanvas.get(), m_canvasSampler.get()),
-            QRhiShaderResourceBinding::sampledTexture(5, QRhiShaderResourceBinding::FragmentStage, m_texMeshData.get(), m_meshDataSampler.get()),
-        });
-        if (!m_srb->create()) { qDebug2("init") << "failed to create m_srb"; return false; }
+        // The 3D LUT is tiled into 2D: (size * size) wide by size tall. The fragment shader
+        // does its own trilinear interpolation via texelFetch, so this sampler MUST stay
+        // Nearest in both filters with ClampToEdge addressing - any hardware filtering would
+        // make the preview diverge from the export.
+        m_lutSampler.reset(rhi->newSampler(QRhiSampler::Nearest, QRhiSampler::Nearest, QRhiSampler::None, QRhiSampler::ClampToEdge, QRhiSampler::ClampToEdge));
+        if (!m_lutSampler->create()) { qDebug2("init") << "failed to create m_lutSampler"; return false; }
+
+        if (!rhi->isTextureFormatSupported(QRhiTexture::RGBA32F)) {
+            qDebug2("init") << "QRhiTexture::RGBA32F is not supported by this RHI backend; colour LUTs will not work in the preview";
+        }
+        // Always created, even with no LUT loaded, so binding 6 is never left unbound.
+        if (!createLutTexture(rhi, 2)) return false;
+
+        if (!updateBindings(rhi)) { qDebug2("init") << "failed to create m_srb"; return false; }
 
         m_pipeline.reset(rhi->newGraphicsPipeline());
         m_pipeline->setShaderStages({
@@ -147,11 +161,52 @@ public:
         m_initialUpdates->uploadStaticBuffer(m_vertexBuffer.get(), quadVertexData);
         m_initialUpdates->uploadStaticBuffer(m_indexBuffer.get(), quadIndexData);
         m_initialUpdates->updateDynamicBuffer(m_drawingUniform.get(), 64, 4, &flip);
+        uploadLut(m_initialUpdates, identityLut2, 2);
 
         return true;
     }
 
-    bool render(MDKPlayer *item, uint8_t *params, uint paramsLen, uint8_t *matrices, uint matricesLen, uint8_t *canvas, uint canvasLen, float *meshData, uint meshDataLen) {
+    // The binding layout never changes, so recreating m_srb after swapping the LUT texture
+    // leaves m_pipeline valid (QRhi only requires layout compatibility).
+    bool updateBindings(QRhi *rhi) {
+        if (!m_srb) m_srb.reset(rhi->newShaderResourceBindings());
+        m_srb->setBindings({
+            QRhiShaderResourceBinding::uniformBuffer (0, QRhiShaderResourceBinding::FragmentStage | QRhiShaderResourceBinding::VertexStage, m_drawingUniform.get()),
+            QRhiShaderResourceBinding::sampledTexture(1, QRhiShaderResourceBinding::FragmentStage, m_itemTexturePtr, m_drawingSampler.get()),
+            QRhiShaderResourceBinding::uniformBuffer (2, QRhiShaderResourceBinding::FragmentStage, m_kernelParams.get()),
+            QRhiShaderResourceBinding::sampledTexture(3, QRhiShaderResourceBinding::FragmentStage, m_texMatrices.get(), m_matricesSampler.get()),
+            QRhiShaderResourceBinding::sampledTexture(4, QRhiShaderResourceBinding::FragmentStage, m_texCanvas.get(), m_canvasSampler.get()),
+            QRhiShaderResourceBinding::sampledTexture(5, QRhiShaderResourceBinding::FragmentStage, m_texMeshData.get(), m_meshDataSampler.get()),
+            QRhiShaderResourceBinding::sampledTexture(6, QRhiShaderResourceBinding::FragmentStage, m_texLut.get(), m_lutSampler.get()),
+        });
+        return m_srb->create();
+    }
+
+    bool createLutTexture(QRhi *rhi, uint32_t size) {
+        m_texLut.reset(rhi->newTexture(QRhiTexture::RGBA32F, QSize(int(size * size), int(size)), 1, QRhiTexture::Flags()));
+        if (!m_texLut || !m_texLut->create()) { qDebug2("createLutTexture") << "failed to create m_texLut of size" << size; m_texLut.reset(); return false; }
+        m_lutSize = size;
+        return true;
+    }
+
+    // `data` is `size³ * 3` floats in .cube order (RGB-major, red varying fastest), which is
+    // exactly the row-major order of the (size*size) x size tiled image the shader reads.
+    void uploadLut(QRhiResourceUpdateBatch *u, const float *data, uint32_t size) {
+        const int texels = int(size * size * size);
+        // The texture is RGBA32F, so the RGB triplets have to be expanded to 4 components.
+        QByteArray rgba(texels * 4 * int(sizeof(float)), Qt::Uninitialized);
+        float *dst = reinterpret_cast<float *>(rgba.data());
+        for (int i = 0; i < texels; ++i) {
+            dst[i * 4 + 0] = data[i * 3 + 0];
+            dst[i * 4 + 1] = data[i * 3 + 1];
+            dst[i * 4 + 2] = data[i * 3 + 2];
+            dst[i * 4 + 3] = 1.0f;
+        }
+        QRhiTextureSubresourceUploadDescription desc(rgba.constData(), rgba.size());
+        u->uploadTexture(m_texLut.get(), QRhiTextureUploadDescription({ QRhiTextureUploadEntry(0, 0, desc) }));
+    }
+
+    bool render(MDKPlayer *item, uint8_t *params, uint paramsLen, uint8_t *matrices, uint matricesLen, uint8_t *canvas, uint canvasLen, float *meshData, uint meshDataLen, const float *lutData, uint32_t lutSize, uint32_t lutChecksum) {
         if (!item->qmlItem() || !item->rhiTexture() || !item->qmlWindow()) return false;
         auto context = item->rhiContext();
         auto rhi = context->rhi();
@@ -186,6 +241,21 @@ public:
         if (canvasLen > 0) {
             QRhiTextureSubresourceUploadDescription desc2(canvas, canvasLen);
             u->uploadTexture(m_texCanvas.get(), QRhiTextureUploadDescription({ QRhiTextureUploadEntry(0, 0, desc2) }));
+        }
+
+        // Re-upload the LUT only when it actually changed. The checksum is the crc32 of the
+        // LUT data from `Lut3D`, so 0 means "no LUT loaded" and keeps the identity uploaded
+        // by init().
+        if (lutData && lutSize >= 2 && lutChecksum != m_lutChecksum) {
+            bool ok = true;
+            if (lutSize != m_lutSize) {
+                ok = createLutTexture(rhi, lutSize) && updateBindings(rhi);
+                if (!ok) qDebug2("render") << "failed to resize the LUT texture to" << lutSize;
+            }
+            if (ok) {
+                uploadLut(u, lutData, lutSize);
+                m_lutChecksum = lutChecksum;
+            }
         }
 
         QMatrix4x4 mvp = item->textureMatrix();
@@ -233,6 +303,9 @@ public:
     QScopedPointer<QRhiTexture> m_texCanvas;
     QScopedPointer<QRhiBuffer> m_kernelParams;
     QScopedPointer<QRhiTexture> m_texMeshData;
+    QScopedPointer<QRhiTexture> m_texLut;
+    uint32_t m_lutSize{0};
+    uint32_t m_lutChecksum{0};
 
     QSize m_outputSize;
     QSize m_textureSize;
@@ -246,6 +319,7 @@ public:
     QScopedPointer<QRhiSampler> m_drawingSampler;
     QScopedPointer<QRhiSampler> m_matricesSampler;
     QScopedPointer<QRhiSampler> m_meshDataSampler;
+    QScopedPointer<QRhiSampler> m_lutSampler;
     QScopedPointer<QRhiShaderResourceBindings> m_srb;
     QScopedPointer<QRhiGraphicsPipeline> m_pipeline;
 
