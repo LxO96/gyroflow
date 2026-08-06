@@ -1283,6 +1283,29 @@ impl StabilizationManager {
 
         let input_file = self.input_file.read().clone();
 
+        let color = {
+            let c = self.color.read();
+            serde_json::json!({
+                "enabled":                c.enabled,
+                "bake_in_render":         c.bake_in_render,
+                "exposure":               c.exposure,
+                "contrast":               c.contrast,
+                "saturation":             c.saturation,
+                "source_kelvin":          c.source_kelvin,
+                "source_kelvin_detected": c.source_kelvin_detected,
+                "target_kelvin":          c.target_kelvin,
+                "tint":                   c.tint,
+                "lut_strength":           c.lut_strength,
+                "lut_path":               c.lut_path,
+                "lut_name":               c.lut_name,
+                // Embedded fallback, so the project still grades identically if the
+                // .cube file moves, is deleted, or the project travels to another machine.
+                // The checksum is deliberately not stored - it's recomputed from the data
+                // on import so it can never disagree with it.
+                "lut_data":               c.lut.as_ref().and_then(|l| util::compress_to_base91_cbor(&(l.size, l.domain_min, l.domain_max, &l.data))),
+            })
+        };
+
         let trim_ranges_ms = params.trim_ranges.iter().map(|(a, b)| (a * params.duration_ms, b * params.duration_ms)).collect::<Vec<_>>();
 
         let mut obj = serde_json::json!({
@@ -1355,6 +1378,8 @@ impl StabilizationManager {
                 "sample_index":       gyro.file_load_options.sample_index,
                 "detected_source":    gyro.file_metadata.read().detected_source,
             },
+
+            "color": color,
 
             "offsets": gyro.get_offsets(), // timestamp, offset value
             "keyframes": self.keyframes.read().serialize(),
@@ -1744,6 +1769,49 @@ impl StabilizationManager {
                 if let Some(v) = obj.get("focal_length_smoothing_strength").and_then(|x| x.as_f64())  { params.focal_length_smoothing_strength = v.clamp(0.0, 1.0); }
 
                 obj.remove("adaptive_zoom_fovs");
+            }
+            if let Some(serde_json::Value::Object(obj)) = obj.get("color") {
+                let mut c = self.color.write();
+                if let Some(v) = obj.get("enabled")               .and_then(|x| x.as_bool()) { c.enabled                = v; }
+                if let Some(v) = obj.get("bake_in_render")        .and_then(|x| x.as_bool()) { c.bake_in_render         = v; }
+                if let Some(v) = obj.get("exposure")              .and_then(|x| x.as_f64())  { c.exposure               = v; }
+                if let Some(v) = obj.get("contrast")              .and_then(|x| x.as_f64())  { c.contrast               = v; }
+                if let Some(v) = obj.get("saturation")            .and_then(|x| x.as_f64())  { c.saturation             = v; }
+                if let Some(v) = obj.get("source_kelvin")         .and_then(|x| x.as_f64())  { c.source_kelvin          = v; }
+                if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
+                if let Some(v) = obj.get("target_kelvin")         .and_then(|x| x.as_f64())  { c.target_kelvin          = v; }
+                if let Some(v) = obj.get("tint")                  .and_then(|x| x.as_f64())  { c.tint                   = v; }
+                if let Some(v) = obj.get("lut_strength")          .and_then(|x| x.as_f64())  { c.lut_strength           = v; }
+                c.lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
+                c.lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
+
+                // Prefer the file on disk, so an edited .cube is picked up; fall back to the embedded copy.
+                let from_path = c.lut_path.as_ref()
+                    .map(|p| if p.contains("://") { p.clone() } else { filesystem::path_to_url(p) })
+                    .and_then(|url| filesystem::read_to_string(&url).ok())
+                    .and_then(|text| color::parse_cube(&text).ok());
+
+                let from_embedded = || {
+                    obj.get("lut_data").and_then(|x| x.as_str())
+                       .and_then(|s| util::decompress_from_base91_cbor::<(u32, f32, f32, Vec<f32>)>(s).ok())
+                       .map(|(size, domain_min, domain_max, data)| {
+                            // Recomputed rather than stored, so `checksum` can never disagree with
+                            // `data` - `get_current_key` and every backend's GPU cache depend on it.
+                            let checksum = crc32fast::hash(bytemuck::cast_slice(&data));
+                            color::Lut3D { size, domain_min, domain_max, data, checksum }
+                       })
+                };
+
+                match from_path.or_else(from_embedded) {
+                    Some(lut) => { c.lut = Some(std::sync::Arc::new(lut)); }
+                    None => {
+                        // A missing LUT must never make a project unopenable - load without it.
+                        if let Some(name) = c.lut_name.as_deref() {
+                            ::log::warn!("LUT '{name}' could not be loaded, continuing without it");
+                        }
+                        c.lut = None;
+                    }
+                }
             }
             if let Some(serde_json::Value::Object(obj)) = obj.get_mut("output") {
                 if let Some(w) =  obj.get("output_width").and_then(|x| x.as_u64()) {
@@ -2144,4 +2212,203 @@ pub enum GyroflowCoreError {
 
     #[error("Unknown error")]
     Unknown
+}
+
+#[cfg(test)]
+mod color_project_tests {
+    use super::*;
+
+    // Smallest valid LUT: 2³ = 8 entries. Deliberately not the identity, so a
+    // silently-dropped LUT can't pass by accident.
+    const CUBE_2: &str = "\
+TITLE \"round-trip\"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.0 0.0 0.0
+DOMAIN_MAX 1.0 1.0 1.0
+0.00 0.01 0.02
+0.10 0.11 0.12
+0.20 0.21 0.22
+0.30 0.31 0.32
+0.40 0.41 0.42
+0.50 0.51 0.52
+0.60 0.61 0.62
+0.70 0.71 0.72
+";
+
+    fn write_temp_cube(name: &str, contents: &str) -> String {
+        let path = std::env::temp_dir().join(format!("gyroflow_test_{}_{}.cube", name, fastrand::u32(..)));
+        std::fs::write(&path, contents).unwrap();
+        filesystem::path_to_url(&path.to_string_lossy())
+    }
+
+    /// A manager with every colour field set to a non-default value.
+    fn configured_manager(lut_path: Option<String>) -> StabilizationManager {
+        let mgr = StabilizationManager::default();
+        {
+            let mut c = mgr.color.write();
+            c.enabled = true;
+            c.bake_in_render = true;
+            c.exposure = 0.75;
+            c.contrast = -0.25;
+            c.saturation = 0.5;
+            c.source_kelvin = 5200.0;
+            c.source_kelvin_detected = true;
+            c.target_kelvin = 6200.0;
+            c.tint = 0.125;
+            c.lut_strength = 0.8;
+            c.lut = Some(std::sync::Arc::new(color::parse_cube(CUBE_2).unwrap()));
+            c.lut_path = lut_path;
+            c.lut_name = Some("round-trip.cube".into());
+        }
+        mgr
+    }
+
+    fn round_trip(mgr: &StabilizationManager) -> StabilizationManager {
+        let json = mgr.export_gyroflow_data(GyroflowProjectType::WithGyroData, "{}", None).unwrap();
+        let restored = StabilizationManager::default();
+        let mut is_preset = false;
+        restored.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        restored
+    }
+
+    fn assert_scalars_match(a: &color::ColorAdjustments, b: &color::ColorAdjustments) {
+        assert_eq!(b.enabled,                a.enabled);
+        assert_eq!(b.bake_in_render,         a.bake_in_render);
+        assert_eq!(b.exposure,               a.exposure);
+        assert_eq!(b.contrast,               a.contrast);
+        assert_eq!(b.saturation,             a.saturation);
+        assert_eq!(b.source_kelvin,          a.source_kelvin);
+        assert_eq!(b.source_kelvin_detected, a.source_kelvin_detected);
+        assert_eq!(b.target_kelvin,          a.target_kelvin);
+        assert_eq!(b.tint,                   a.tint);
+        assert_eq!(b.lut_strength,           a.lut_strength);
+        assert_eq!(b.lut_name,               a.lut_name);
+    }
+
+    #[test]
+    fn color_section_round_trips_without_a_lut_path() {
+        let mgr = configured_manager(None);
+        let restored = round_trip(&mgr);
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_scalars_match(&a, &b);
+        assert_eq!(b.lut_path, None);
+
+        let la = a.lut.as_ref().unwrap();
+        let lb = b.lut.as_ref().unwrap();
+        assert_eq!(lb.size,       la.size);
+        assert_eq!(lb.domain_min, la.domain_min);
+        assert_eq!(lb.domain_max, la.domain_max);
+        assert_eq!(lb.data,       la.data);
+        assert_eq!(lb.checksum,   la.checksum);
+    }
+
+    #[test]
+    fn lut_is_reloaded_from_its_path_when_it_resolves() {
+        // The file on disk differs from the embedded copy, so this proves which one won.
+        let on_disk = CUBE_2.replace("0.70 0.71 0.72", "0.77 0.78 0.79");
+        let url = write_temp_cube("present", &on_disk);
+        let mgr = configured_manager(Some(url.clone()));
+        let restored = round_trip(&mgr);
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_scalars_match(&a, &b);
+        assert_eq!(b.lut_path.as_deref(), Some(url.as_str()));
+
+        let expected = color::parse_cube(&on_disk).unwrap();
+        assert_eq!(b.lut.as_ref().unwrap().data,     expected.data);
+        assert_eq!(b.lut.as_ref().unwrap().checksum, expected.checksum);
+        assert_ne!(b.lut.as_ref().unwrap().data,     a.lut.as_ref().unwrap().data);
+    }
+
+    #[test]
+    fn lut_falls_back_to_embedded_data_when_the_path_is_gone() {
+        let url = write_temp_cube("missing", CUBE_2);
+        let mgr = configured_manager(Some(url.clone()));
+        let json = mgr.export_gyroflow_data(GyroflowProjectType::WithGyroData, "{}", None).unwrap();
+        std::fs::remove_file(filesystem::url_to_path(&url)).unwrap();
+
+        let restored = StabilizationManager::default();
+        let mut is_preset = false;
+        restored.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_scalars_match(&a, &b);
+        assert_eq!(b.lut.as_ref().unwrap().data,     a.lut.as_ref().unwrap().data);
+        assert_eq!(b.lut.as_ref().unwrap().checksum, a.lut.as_ref().unwrap().checksum);
+    }
+
+    #[test]
+    fn lut_falls_back_to_embedded_data_when_the_path_is_unparsable() {
+        let url = write_temp_cube("broken", "this is not a cube file\n");
+        let mgr = configured_manager(Some(url));
+        let restored = round_trip(&mgr);
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_eq!(b.lut.as_ref().unwrap().data,     a.lut.as_ref().unwrap().data);
+        assert_eq!(b.lut.as_ref().unwrap().checksum, a.lut.as_ref().unwrap().checksum);
+    }
+
+    #[test]
+    fn restored_lut_checksum_matches_its_data() {
+        let mgr = configured_manager(None);
+        let restored = round_trip(&mgr);
+        let b = restored.color.read();
+        let lut = b.lut.as_ref().unwrap();
+        assert_eq!(lut.checksum, crc32fast::hash(bytemuck::cast_slice(&lut.data)));
+    }
+
+    #[test]
+    fn missing_lut_does_not_make_the_project_unopenable() {
+        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"x.mp4","color":{"enabled":true,"exposure":0.5,"lut_path":"file:///nonexistent/nope.cube","lut_name":"nope.cube"}}"#;
+        let mgr = StabilizationManager::default();
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        let c = mgr.color.read();
+        assert!(c.lut.is_none());
+        assert_eq!(c.exposure, 0.5);
+        assert_eq!(c.lut_name.as_deref(), Some("nope.cube"));
+    }
+
+    #[test]
+    fn project_without_color_section_loads_with_color_disabled() {
+        let mgr = StabilizationManager::default();
+        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"x.mp4"}"#;
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        let c = mgr.color.read();
+        let d = color::ColorAdjustments::default();
+        assert!(!c.enabled);
+        assert_eq!(c.bake_in_render,         d.bake_in_render);
+        assert_eq!(c.exposure,               d.exposure);
+        assert_eq!(c.contrast,               d.contrast);
+        assert_eq!(c.saturation,             d.saturation);
+        assert_eq!(c.source_kelvin,          d.source_kelvin);
+        assert_eq!(c.source_kelvin_detected, d.source_kelvin_detected);
+        assert_eq!(c.target_kelvin,          d.target_kelvin);
+        assert_eq!(c.tint,                   d.tint);
+        assert_eq!(c.lut_strength,           d.lut_strength);
+        assert!(c.lut.is_none());
+        assert!(c.lut_path.is_none());
+        assert!(c.lut_name.is_none());
+    }
+
+    /// The six colour keyframe variants ride the existing `"keyframes"` section
+    /// for free — `KeyframeType` derives Serialize/Deserialize in the
+    /// `define_keyframes!` macro. This test is the evidence.
+    #[test]
+    fn color_keyframes_round_trip_through_the_keyframes_section() {
+        let mgr = StabilizationManager::default();
+        mgr.keyframes.write().set(&KeyframeType::ColorExposure,  1_000_000, 1.5);
+        mgr.keyframes.write().set(&KeyframeType::ColorLutStrength, 2_000_000, 0.25);
+
+        let restored = round_trip(&mgr);
+        let kf = restored.keyframes.read();
+        assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorExposure,    1000.0), Some(1.5));
+        assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorLutStrength, 2000.0), Some(0.25));
+    }
 }
