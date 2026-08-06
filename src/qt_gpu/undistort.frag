@@ -77,9 +77,14 @@ layout(binding = 6) uniform sampler2D texLut;
 //
 // Unlike the OpenCL and wgpu kernels, this backend does not carry the LUT in the coeffs
 // buffer - it has none. The LUT is a 2D-tiled RGBA32F texture instead: the `size³` entries
-// are laid out `size*size` wide by `size` tall, so entry (r, g, b) lives at texel
-// (b*size + r, g). That matches `sample_trilinear`'s linear index `(b*n*n + g*n + r)`
-// exactly: row `g` starts at `g*n*n` texels into a row-major image `n*n` wide.
+// are uploaded verbatim in .cube order (red fastest, then green, then blue) into an image
+// `size*size` wide and `size` tall. A row-major image `n*n` wide puts texel (x, y) at linear
+// entry `y*n*n + x`, and `sample_trilinear` wants entry `b*n*n + g*n + r` (lut.rs:107), so
+// the blue index selects the ROW and (g, r) select the column: entry (r, g, b) lives at
+// texel `(g*size + r, b)`.
+//
+// Note this is not the (b*size + r, g) addressing one might expect from a "blue selects the
+// tile column" layout - that would need the upload to be reordered, and it is not.
 //
 // The sampler is Nearest/ClampToEdge and every read goes through texelFetch, because the
 // trilinear interpolation below is done by hand - any hardware filtering would make the
@@ -97,7 +102,7 @@ vec3 lut_fetch(int r, int g, int b, int n) {
     // out-of-range texelFetch is undefined; clamping to the actual texture size is not.
     // When the two agree - the normal case - this min() changes nothing.
     ivec2 sz = textureSize(texLut, 0);
-    return texelFetch(texLut, min(ivec2(bc * n + rc, gc), sz - ivec2(1)), 0).rgb;
+    return texelFetch(texLut, min(ivec2(gc * n + rc, bc), sz - ivec2(1)), 0).rgb;
 }
 
 vec3 lut_sample(vec3 rgb, int n, float domain_min, float domain_max) {
