@@ -97,10 +97,9 @@ vec3 lut_fetch(int r, int g, int b, int n) {
     int rc = clamp(r, 0, n - 1);
     int gc = clamp(g, 0, n - 1);
     int bc = clamp(b, 0, n - 1);
-    // Bounds guard: `n` arrives in the uniform block while the texture is uploaded
-    // separately, so the two can disagree for a frame right after the LUT changes. An
-    // out-of-range texelFetch is undefined; clamping to the actual texture size is not.
-    // When the two agree - the normal case - this min() changes nothing.
+    // Belt and braces: apply_color() already refuses to call this unless the texture size
+    // agrees with `n`, so the min() below never bites. It stays because an out-of-range
+    // texelFetch is undefined behaviour and this is the only place that could produce one.
     ivec2 sz = textureSize(texLut, 0);
     return texelFetch(texLut, min(ivec2(gc * n + rc, bc), sz - ivec2(1)), 0).rgb;
 }
@@ -138,7 +137,14 @@ vec4 apply_color(vec4 px) {
     // 1. LUT, blended by strength
     int lut_size = int(params.color_params_2.w);
     float lut_strength = params.color_params_1.w;
-    if (bool(params.flags & 8192) && lut_size >= 2 && lut_strength > 0.0) {
+    // `lut_size` arrives in the uniform block, baked into KernelParams when the frame
+    // transform was computed, while the texture is uploaded from an independently acquired
+    // read of the colour state. The two can disagree for a single frame after the LUT
+    // changes. Skipping the LUT for that frame is strictly better than grading with
+    // clamped-garbage LUT values; the next frame corrects itself either way.
+    ivec2 lut_tex_size = textureSize(texLut, 0);
+    bool lut_usable = lut_tex_size.x == lut_size * lut_size && lut_tex_size.y == lut_size;
+    if (bool(params.flags & 8192) && lut_size >= 2 && lut_strength > 0.0 && lut_usable) {
         vec3 graded = lut_sample(c, lut_size, params.color_params_3.x, params.color_params_3.y);
         c = c + (graded - c) * lut_strength;
     }
