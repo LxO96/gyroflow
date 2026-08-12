@@ -1794,6 +1794,18 @@ impl StabilizationManager {
                 let from_embedded = || {
                     obj.get("lut_data").and_then(|x| x.as_str())
                        .and_then(|s| util::decompress_from_base91_cbor::<(u32, f32, f32, Vec<f32>)>(s).ok())
+                       // A blob can decode cleanly and still be self-inconsistent. Enforce exactly
+                       // what `parse_cube` enforces (color/lut.rs) - a `size` that disagrees with
+                       // `data` indexes out of bounds in `sample_trilinear` and reads past the GPU
+                       // coefficient buffer, and a non-finite value NaNs every pixel silently.
+                       // Rejecting here falls through to the "LUT absent" arm below, so a corrupt
+                       // project still opens.
+                       .filter(|(size, domain_min, domain_max, data)| {
+                            (2..=64).contains(size)
+                            && data.len() / 3 == (*size as usize).pow(3) && data.len() % 3 == 0
+                            && domain_min.is_finite() && domain_max.is_finite()
+                            && data.iter().all(|v| v.is_finite())
+                       })
                        .map(|(size, domain_min, domain_max, data)| {
                             // Recomputed rather than stored, so `checksum` can never disagree with
                             // `data` - `get_current_key` and every backend's GPU cache depend on it.
@@ -2395,6 +2407,105 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert!(c.lut.is_none());
         assert!(c.lut_path.is_none());
         assert!(c.lut_name.is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Embedded-LUT validation. A blob that decompresses and decodes cleanly but
+    // whose contents are self-inconsistent must not reach the renderer: a `size`
+    // that disagrees with `data.len()` indexes out of bounds in `sample_trilinear`
+    // and reads past the GPU coefficient buffer. Every case below must import
+    // successfully with the LUT simply absent - a corrupt project still opens.
+    // ---------------------------------------------------------------------
+
+    fn zeros(size: u32) -> Vec<f32> { vec![0.0; (size as usize).pow(3) * 3] }
+
+    /// Imports a minimal project whose `lut_data` blob is built from exactly these
+    /// values, however malformed. Panics if the import itself fails.
+    fn import_lut_data(size: u32, domain_min: f32, domain_max: f32, data: &[f32]) -> StabilizationManager {
+        let blob = util::compress_to_base91_cbor(&(size, domain_min, domain_max, data)).unwrap();
+        let json = serde_json::json!({
+            "title": "Gyroflow data file", "version": 4, "videofile": "x.mp4",
+            "color": { "enabled": true, "lut_name": "handcrafted.cube", "lut_data": blob }
+        }).to_string();
+
+        let mgr = StabilizationManager::default();
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        mgr
+    }
+
+    #[test]
+    fn a_well_formed_embedded_lut_is_still_accepted() {
+        // Guards the validation against being over-strict: without this, "reject
+        // everything" would pass every other test in this group.
+        let mgr = import_lut_data(2, 0.0, 1.0, &zeros(2));
+        assert_eq!(mgr.color.read().lut.as_ref().unwrap().size, 2);
+    }
+
+    #[test]
+    fn embedded_lut_with_size_below_range_is_rejected() {
+        assert!(import_lut_data(1, 0.0, 1.0, &zeros(1)).color.read().lut.is_none());
+        assert!(import_lut_data(0, 0.0, 1.0, &[]).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_size_above_range_is_rejected() {
+        assert!(import_lut_data(65, 0.0, 1.0, &zeros(65)).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_too_little_data_is_rejected() {
+        // The exact shape that panics `sample_trilinear`: a plausible size, no data.
+        assert!(import_lut_data(64, 0.0, 1.0, &[]).color.read().lut.is_none());
+        assert!(import_lut_data(2, 0.0, 1.0, &vec![0.0; 8 * 3 - 3]).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_too_much_data_is_rejected() {
+        assert!(import_lut_data(2, 0.0, 1.0, &vec![0.0; 8 * 3 + 3]).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_a_non_finite_value_is_rejected() {
+        // No panic, but every graded pixel would silently become NaN.
+        let mut data = zeros(2);
+        data[5] = f32::NAN;
+        assert!(import_lut_data(2, 0.0, 1.0, &data).color.read().lut.is_none());
+
+        let mut data = zeros(2);
+        data[0] = f32::INFINITY;
+        assert!(import_lut_data(2, 0.0, 1.0, &data).color.read().lut.is_none());
+
+        assert!(import_lut_data(2, f32::NAN,      1.0,           &zeros(2)).color.read().lut.is_none());
+        assert!(import_lut_data(2, 0.0,      f32::INFINITY,      &zeros(2)).color.read().lut.is_none());
+    }
+
+    /// Anti-drift guard: the embedded path must accept exactly what `parse_cube`
+    /// accepts. If either side's rules change without the other, this fails.
+    #[test]
+    fn embedded_lut_validation_agrees_with_parse_cube() {
+        fn cube_text(size: u32, data: &[f32]) -> String {
+            let mut s = format!("LUT_3D_SIZE {size}\n");
+            for e in data.chunks(3) { s.push_str(&format!("{} {} {}\n", e[0], e[1], e[2])); }
+            s
+        }
+        let mut nan_2 = zeros(2); nan_2[4] = f32::NAN;
+        let mut inf_3 = zeros(3); inf_3[7] = f32::NEG_INFINITY;
+
+        let cases: Vec<(u32, Vec<f32>)> = vec![
+            (1,  zeros(1)),               // size below range
+            (2,  zeros(2)),               // smallest valid
+            (3,  zeros(3)),               // valid
+            (2,  vec![0.0; 8 * 3 - 3]),   // short
+            (2,  vec![0.0; 8 * 3 + 3]),   // long
+            (2,  nan_2),                  // NaN entry
+            (3,  inf_3),                  // -inf entry
+        ];
+        for (size, data) in cases {
+            let by_parse_cube = color::parse_cube(&cube_text(size, &data)).is_ok();
+            let by_embedded   = import_lut_data(size, 0.0, 1.0, &data).color.read().lut.is_some();
+            assert_eq!(by_embedded, by_parse_cube, "size {size}, {} values: parse_cube says {by_parse_cube}, embedded says {by_embedded}", data.len());
+        }
     }
 
     /// The six colour keyframe variants ride the existing `"keyframes"` section
