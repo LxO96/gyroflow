@@ -147,12 +147,20 @@ When colour is enabled and baking is on, `rendering/mod.rs` selects the plane di
 
 | Source | Behaviour |
 |---|---|
-| Planar YUV (NV12, YUV420P, P010, YUV444P10…) | convert → `AYUV64LE`, single `AYUV16` plane |
-| Already packed and full-colour (`AYUV64LE`, `RGB24`, `RGBA`, `RGB48BE`, `RGBA64BE`) | unchanged, no conversion |
-| Planar RGB (`GBRPF32LE`, `GBRAPF32LE`) | convert → packed float; see open question OQ1 |
+| 8-bit (NV12, NV21, YUV420P, YUVJ420P…) | convert → `Pixel::RGBA`, single `RGBA8` plane |
+| Deeper integer (P010LE, YUV444P12LE, YUVA444P16LE, `AYUV64LE`…) | convert → `Pixel::RGBA64LE`, single `RGBA16` plane |
+| Already packed RGB (`RGB24`, `RGBA`, `RGB48BE`, `RGBA64BE`) | unchanged, no conversion; graded in place |
+| Float (`GBRPF32LE`, `GBRAPF32LE`) | baking refused, warning logged; see open question OQ1 |
+| Hardware frames, or formats swscale cannot read | baking refused, warning logged |
 | Baking off | today's per-plane path, byte-for-byte unchanged |
 
-`AYUV64LE` is chosen over an RGB target because it is 16-bit (no banding from the grade) and stays in YUV, so swscale only upsamples chroma and packs rather than doing a full colour-space round trip that can clip out-of-gamut values.
+The target is packed **RGB**, not `AYUV64LE`. No kernel performs any colour-space conversion — `apply_color` grades whatever three channel values it is handed — so a YUV target would run exposure, white balance, contrast and saturation over Y, U and V as if they were R, G and B. U and V are offset by 0.5, which turns an exposure gain into a hue rotation and a saturation change into a chroma shift on the wrong axis. It would also make the preview/export match impossible by construction, since the Qt preview grades RGBA8 in RGB.
+
+The target must be packed rather than planar for the other half of the reason: a planar dispatch hands the kernel one channel per plane, and the colour stage needs all three at once.
+
+Source precision is preserved — 8-bit sources stay 8-bit, deeper sources go to 16-bit — and the decision is made once, from the source format, and reused by both the plane construction and the per-frame dispatch so the two cannot disagree about the layout the plane closures were built for.
+
+Independently of the format choice, `create_planes_proc!` forces the colour stage off for any plane whose `PixelType::COUNT` is below 3. A single-channel (`Luma8`/`Luma16`/`R32f`) or two-channel (`UV8`/`UV16`) plane therefore cannot have an RGB grade run on it whatever the flags say, which is what makes the "baking refused" rows above safe rather than merely intended.
 
 The preview path needs none of this — MDK already provides RGBA8.
 
@@ -257,9 +265,11 @@ Performance: measure a 4K render before and after with baking on, so the documen
 
 ## Open questions
 
-**OQ1 — packed float format.** Resolved: unavailable; baking is refused for `GBRPF32LE`/`GBRAPF32LE` sources with the message 'Colour baking is not supported for 32-bit float sources'.
+**OQ1 — packed float format.** Resolved: swscale cannot output it, so baking is refused for float sources; they render with colour adjustments skipped and a warning in the log.
 
-Investigation found that while FFmpeg 8.1's libavutil defines `AV_PIX_FMT_RGBAF32LE` and `AV_PIX_FMT_RGBF32LE`, the ffmpeg-sys-next Rust bindings used by this project do not expose these formats. A repository search confirms no RGBF32 variants are defined in ffmpeg-sys-next.
+The earlier answer — that the format does not exist in the bindings — was wrong, and was reached by reading ffmpeg-sys-next on GitHub with no toolchain available. `Pixel::RGBAF32LE` *is* in the vendored ffmpeg-next 8.1 (`util/format/pixel.rs:402`), and `RGBAf` has been a first-class `PixelType` all along (`src/core/stabilization/pixel_formats.rs:58`).
+
+The real obstacle is that enum membership is not converter support. Re-verified empirically against the linked ffmpeg 8.1 in Task 12: `sws_isSupportedOutput(AV_PIX_FMT_RGBAF32LE)` returns 0, and building a `YUV420P → RGBAF32LE` scaling context fails with `128bpp not supported by yuv2rgb` / `rgbaf32le is not supported as output pixel format`. With no way to get a float source into a packed RGB frame, and 16-bit being the one thing a float source exists to avoid, `packed_color_format` returns `None` for any format ffmpeg marks `AV_PIX_FMT_FLAG_FLOAT`. The per-plane gate then keeps the colour stage off the `R32f` planes those sources dispatch to. The test `swscale_still_cannot_output_packed_float` (`src/rendering/mod.rs`) records this, and will fail if a future ffmpeg gains the support — at which point the float path can simply be implemented.
 
 ## Out of scope
 
