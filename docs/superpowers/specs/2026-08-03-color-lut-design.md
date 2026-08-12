@@ -139,7 +139,9 @@ rgb  = mix(luma, rgb, saturation_factor)
 
 `contrast` and `saturation` are stored as −1..1 with 0 neutral and both map to a multiplier identically: `factor = 1 + value`, giving 0× at −1 (flat grey / fully desaturated) and 2× at +1. Both mappings are applied in Rust so the shaders receive ready multipliers, consistent with how `wb_gains` is handled. The contrast pivot is 0.5, display-referred, which is appropriate because contrast runs after the LUT.
 
-YUV pixel types (notably `AYUV16`) convert to RGB at the top of this block and back at the bottom; `pixel_formats.rs:26` already holds the Rec709 matrix on the Rust side and the shaders use the same constants.
+The colour stage assumes its input is RGB, and no kernel converts colour spaces to make that true. This was an error in an earlier draft of this spec, which claimed YUV pixel types (notably `AYUV16`) convert to RGB at the top of the block and back at the bottom. They do not, and never did: the only colour-space-aware code in the whole pixel path is `remap_colorrange`, a full↔limited *range* remap, and `PixelType::from_rgb_color`, which converts the *background colour* into the frame's native space. The Rec709 matrix at `pixel_formats.rs:26` is used only by the latter.
+
+Feeding a YUV pixel type to the colour stage would therefore grade Y, U and V as if they were R, G and B — an exposure gain becomes a hue rotation, because U and V are offset by 0.5. This is prevented structurally rather than by convention: the render path converts to packed RGB before baking (see the table below), and `create_planes_proc!` forces `color.enabled` off for any plane whose `PixelType::COUNT` is under 3.
 
 ### Render path
 
