@@ -1774,14 +1774,20 @@ impl StabilizationManager {
                 let mut c = self.color.write();
                 if let Some(v) = obj.get("enabled")               .and_then(|x| x.as_bool()) { c.enabled                = v; }
                 if let Some(v) = obj.get("bake_in_render")        .and_then(|x| x.as_bool()) { c.bake_in_render         = v; }
-                if let Some(v) = obj.get("exposure")              .and_then(|x| x.as_f64())  { c.exposure               = v; }
-                if let Some(v) = obj.get("contrast")              .and_then(|x| x.as_f64())  { c.contrast               = v; }
-                if let Some(v) = obj.get("saturation")            .and_then(|x| x.as_f64())  { c.saturation             = v; }
-                if let Some(v) = obj.get("source_kelvin")         .and_then(|x| x.as_f64())  { c.source_kelvin          = v; }
+                // Clamped to the ranges the rest of the code already treats as valid, so a
+                // hand-edited or corrupted project can't produce a nonsensical grade. `exposure`
+                // is the one that matters: nothing downstream bounds it, and `1e6` gives an
+                // infinite gain and a white frame. The others are clamped again further down
+                // (`to_kernel_params`, `kelvin_to_rgb_gains`); doing it here too keeps the
+                // stored value honest, so the UI shows what is actually applied.
+                if let Some(v) = obj.get("exposure")              .and_then(|x| x.as_f64())  { c.exposure               = v.clamp(-5.0, 5.0); }
+                if let Some(v) = obj.get("contrast")              .and_then(|x| x.as_f64())  { c.contrast               = v.clamp(-1.0, 1.0); }
+                if let Some(v) = obj.get("saturation")            .and_then(|x| x.as_f64())  { c.saturation             = v.clamp(-1.0, 1.0); }
+                if let Some(v) = obj.get("source_kelvin")         .and_then(|x| x.as_f64())  { c.source_kelvin          = v.clamp(1667.0, 25000.0); }
                 if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
-                if let Some(v) = obj.get("target_kelvin")         .and_then(|x| x.as_f64())  { c.target_kelvin          = v; }
-                if let Some(v) = obj.get("tint")                  .and_then(|x| x.as_f64())  { c.tint                   = v; }
-                if let Some(v) = obj.get("lut_strength")          .and_then(|x| x.as_f64())  { c.lut_strength           = v; }
+                if let Some(v) = obj.get("target_kelvin")         .and_then(|x| x.as_f64())  { c.target_kelvin          = v.clamp(1667.0, 25000.0); }
+                if let Some(v) = obj.get("tint")                  .and_then(|x| x.as_f64())  { c.tint                   = v.clamp(-1.0, 1.0); }
+                if let Some(v) = obj.get("lut_strength")          .and_then(|x| x.as_f64())  { c.lut_strength           = v.clamp(0.0, 1.0); }
                 c.lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
                 c.lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
 
@@ -2506,6 +2512,37 @@ DOMAIN_MAX 1.0 1.0 1.0
             let by_embedded   = import_lut_data(size, 0.0, 1.0, &data).color.read().lut.is_some();
             assert_eq!(by_embedded, by_parse_cube, "size {size}, {} values: parse_cube says {by_parse_cube}, embedded says {by_embedded}", data.len());
         }
+    }
+
+    /// A hand-edited or corrupted project must not be able to push a scalar
+    /// outside the range the rest of the code considers valid. `exposure` is the
+    /// one that bites: nothing downstream clamps it, so `1e6` becomes an infinite
+    /// gain and a white frame with no diagnostic.
+    #[test]
+    fn out_of_range_scalars_are_clamped_on_import() {
+        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"x.mp4","color":{
+            "enabled":true,"exposure":1e6,"contrast":-9.0,"saturation":42.0,
+            "source_kelvin":1.0,"target_kelvin":1e9,"tint":-7.0,"lut_strength":5.0}}"#;
+        let mgr = StabilizationManager::default();
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+
+        let c = mgr.color.read();
+        assert_eq!(c.exposure,      5.0);
+        assert_eq!(c.contrast,     -1.0);
+        assert_eq!(c.saturation,    1.0);
+        assert_eq!(c.source_kelvin, 1667.0);
+        assert_eq!(c.target_kelvin, 25000.0);
+        assert_eq!(c.tint,         -1.0);
+        assert_eq!(c.lut_strength,  1.0);
+        assert!(c.to_kernel_params(c.exposure, c.contrast, c.saturation, c.target_kelvin, c.tint, c.lut_strength).exposure_gain.is_finite());
+    }
+
+    #[test]
+    fn in_range_scalars_survive_the_clamp_untouched() {
+        let mgr = configured_manager(None);
+        let restored = round_trip(&mgr);
+        assert_scalars_match(&mgr.color.read(), &restored.color.read());
     }
 
     /// The six colour keyframe variants ride the existing `"keyframes"` section
