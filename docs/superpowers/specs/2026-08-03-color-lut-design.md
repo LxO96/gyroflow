@@ -265,6 +265,32 @@ Manual acceptance (no automated test can assert it): load a log clip, set a LUT 
 
 Performance: measure a 4K render before and after with baking on, so the documented cost is measured rather than estimated.
 
+### R5 acceptance — executed, export half only
+
+Run headless through the CLI on Windows, against a 4K 25p Sony Cinema Line clip (`YUV422P10LE`, `color_range=pc`, `color_space=unknown`) and a 33³ S-Log3/S-Gamut3.Cine→Rec.709 `.cube`:
+
+```
+gyroflow CLIP.MP4 --preset color-on.json -t _lutbaked -f \
+    -p "{'pixel_format':'P010LE','codec':'H.265/HEVC','bitrate':60}"
+```
+
+with a matching `color-off.json` control. The log confirms the dispatch:
+
+```
+[INFO] Baking colour adjustments: converting P010LE to RGBA64LE
+```
+
+The graded frame is a correct log-to-display conversion: black point restored, warm tone recovered in the highlights, saturation plausible, no hue rotation. A hue rotation is the signature failure of grading YUV as RGB, which is what the plan originally specified (`AYUV64LE`) and what the packed-RGB switch exists to prevent, so its absence is the load-bearing observation here.
+
+This exercises, for the first time on real data: the packed-RGB conversion and its precision choice (10-bit → `RGBA64LE`), the LUT upload at `LUT_DATA_OFFSET` with 33³ trilinear interpolation, colour deserialised from a preset, and `bake_in_render` being honoured. The source is full-range with an unspecified matrix, so it also traverses the swscale colour-range path and its BT.709 fallback without visible level error.
+
+**Not covered by this run, and still owed:** the preview half of R5 (the CLI opens no preview, so preview/export match remains unverified), numerical comparison against a reference implementation (the result is visibly right, not measured to the 1/1024 the equivalence test specifies), and cross-backend equivalence — one backend was exercised, whichever the CLI selected.
+
+Two pre-existing obstacles found while doing this, neither caused by colour and both reproducible with colour disabled:
+
+- `YUV422P10LE` is not among the supported render output formats, so a stock Sony Cinema Line clip cannot be exported without overriding `pixel_format`. Worth its own issue.
+- The CLI aborts on a debug-only null-pointer assertion: `RenderQueue` is a QObject constructed at `cli.rs:222`, but `QCoreApplication` is not created until `cli.rs:645`. Release builds do not trip it. Also worth its own issue.
+
 ## Verification owed on other platforms
 
 Everything below is inert on Windows and Linux and was written without any way to execute it. It is shipped deliberately, on the reasoning recorded here, and needs a human on the named platform to confirm.
