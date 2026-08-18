@@ -265,6 +265,18 @@ Manual acceptance (no automated test can assert it): load a log clip, set a LUT 
 
 Performance: measure a 4K render before and after with baking on, so the documented cost is measured rather than estimated.
 
+## Verification owed on other platforms
+
+Everything below is inert on Windows and Linux and was written without any way to execute it. It is shipped deliberately, on the reasoning recorded here, and needs a human on the named platform to confirm.
+
+**ProRes VideoToolbox range under baking (macOS/iOS).** `prores_videotoolbox` is tagged limited-range at the encoder (`ffmpeg_video.rs:108`, `cfg!`-gated to Apple), and the kernel-side `FIX_COLOR_RANGE` remap is what makes the samples match that tag. Under baking the kernel only ever sees packed RGB, where a YUV range remap is meaningless, so `tag_limited_range_for_prores_videotoolbox` (`rendering/mod.rs:271`) declares the range on the output frame instead and lets swscale fold it into the RGB→YUV matrix. Gated at runtime on the codec name, so it compiles and ships everywhere and is simply unreachable off Apple.
+
+To confirm: render a full-range NV12 source to ProRes twice, once with "apply to rendered video" on and once off, and check the black and white levels match. If they do not, the baking path is writing full-range samples into a frame the encoder declares limited. CI will not catch this — `release.yml` has a macOS runner, but it builds and packages rather than rendering and inspecting.
+
+**Note a pre-existing asymmetry, out of scope here:** the same encoder-side workaround also covers `dnxhd`, which never had a kernel-side counterpart at all. That predates this branch and is unchanged by it, but suggests a latent levels bug for `dnxhd` on Apple worth its own issue.
+
+**Android/Apple LUT paths.** `lut_path` stores an encoded URL rather than a filesystem path, because content URIs and security-scoped URLs have no path. The round-trip through the project importer is unit-tested, but loading a `.cube` through the platform file picker on Android or iOS has never been executed.
+
 ## Open questions
 
 **OQ1 — packed float format.** Resolved: swscale cannot output it, so baking is refused for float sources; they render with colour adjustments skipped and a warning in the log.
