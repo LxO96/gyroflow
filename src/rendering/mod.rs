@@ -219,12 +219,19 @@ fn format_depth(format: Pixel) -> (i32, bool) {
 /// case the plane dispatch is left untouched and the per-plane gate in `create_planes_proc!`
 /// switches the colour stage off, so `None` is always safe.
 ///
+/// Only `RGB24` and `RGBA` qualify as "already packed RGB". `RGB48BE` and `RGBA64BE` are
+/// dispatched to the `RGB16` / `RGBA16` `PixelType`s, whose fields are plain native-endian
+/// `u16` read straight out of the frame by `bytemuck`, so on a little-endian host the kernel
+/// sees every sample byte-swapped. Untouched bytes round-trip, which is why the non-baking
+/// dispatch gets away with it, but colour arithmetic on byte-swapped values produces
+/// garbage - so those two are converted like any other unsuitable source.
+///
 /// Source precision is preserved: 8-bit in, 8-bit out; anything deeper goes to 16-bit.
 /// 32-bit float sources are refused - see the note on `Pixel::RGBAF32LE` below.
 fn packed_color_format(format: Pixel) -> Option<Pixel> {
     match format {
-        // Already dispatched as packed RGB (`RGB8` / `RGBA8` / `RGB16` / `RGBA16`).
-        Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE => None,
+        // Already dispatched as packed RGB (`RGB8` / `RGBA8`), in the host's byte order.
+        Pixel::RGB24 | Pixel::RGBA => None,
         _ => {
             let (depth, is_float) = format_depth(format);
             if is_float {
@@ -683,7 +690,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     ::log::warn!("Colour baking is not supported for hardware frames ({:?}); rendering without colour adjustments", input_frame.format());
                 } else {
                     color_convert_to = packed_color_format(format);
-                    if color_convert_to.is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE) {
+                    if color_convert_to.is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA) {
                         ::log::warn!("Colour baking is not supported for {:?} sources; rendering without colour adjustments", format);
                     }
                 }
@@ -1182,12 +1189,14 @@ mod packed_color_format_tests {
             assert_eq!(packed_color_format(f), Some(Pixel::RGBA), "{f:?}");
         }
         // Deeper integer sources -> 16-bit packed RGB. AYUV64LE is packed, but it is YUV,
-        // so it must be converted too.
-        for f in [Pixel::P010LE, Pixel::P016LE, Pixel::YUV420P10LE, Pixel::YUV444P12LE, Pixel::YUVA444P16LE, Pixel::AYUV64LE] {
+        // so it must be converted too. RGB48BE / RGBA64BE are packed RGB already, but in the
+        // wrong byte order for the native-endian `RGB16` / `RGBA16` kernel types, so they are
+        // converted as well - swscale does the byte swap and the kernel grades real values.
+        for f in [Pixel::P010LE, Pixel::P016LE, Pixel::YUV420P10LE, Pixel::YUV444P12LE, Pixel::YUVA444P16LE, Pixel::AYUV64LE, Pixel::RGB48BE, Pixel::RGBA64BE] {
             assert_eq!(packed_color_format(f), Some(Pixel::RGBA64LE), "{f:?}");
         }
-        // Already dispatched as packed RGB - graded in place, no conversion.
-        for f in [Pixel::RGB24, Pixel::RGBA, Pixel::RGB48BE, Pixel::RGBA64BE] {
+        // Already dispatched as packed RGB in native byte order - graded in place.
+        for f in [Pixel::RGB24, Pixel::RGBA] {
             assert_eq!(packed_color_format(f), None, "{f:?}");
         }
         // Float sources - refused, see `swscale_still_cannot_output_packed_float`.
