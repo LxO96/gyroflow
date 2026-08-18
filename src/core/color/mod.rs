@@ -12,6 +12,9 @@ pub use white_balance::kelvin_to_rgb_gains;
 use std::sync::Arc;
 
 pub const DEFAULT_KELVIN: f64 = 5500.0;
+/// The range over which `white_balance::cct_to_xy` is defined.
+pub const MIN_KELVIN: f64 = 1667.0;
+pub const MAX_KELVIN: f64 = 25000.0;
 
 #[derive(Debug, Clone)]
 pub struct ColorAdjustments {
@@ -65,6 +68,36 @@ pub struct ColorKernelParams {
 }
 
 impl ColorAdjustments {
+    /// The single definition of every scalar's valid range. Both entry points that can
+    /// write these values - the project importer (`StabilizationManager::import_gyroflow_data`)
+    /// and the QML slider path (`Controller::set_color_param`) - go through here, so a value
+    /// can't enter the struct out of range whichever way it arrives.
+    ///
+    /// `exposure` is the one that matters: nothing downstream bounds it, and `1e6` gives an
+    /// infinite gain and a white frame. The others are clamped again further down
+    /// (`to_kernel_params`, `kelvin_to_rgb_gains`); doing it here too keeps the stored value
+    /// honest, so the UI shows what is actually applied.
+    ///
+    /// Non-finite values are rejected rather than clamped - `f64::clamp` passes NaN through,
+    /// and a NaN scalar NaNs every pixel silently. JSON has no NaN literal so the importer
+    /// can't produce one; QML can.
+    ///
+    /// Returns false, having changed nothing, if the name is unknown or the value is not finite.
+    pub fn set_param(&mut self, name: &str, val: f64) -> bool {
+        if !val.is_finite() { return false; }
+        match name {
+            "exposure"      => self.exposure      = val.clamp(-5.0, 5.0),
+            "contrast"      => self.contrast      = val.clamp(-1.0, 1.0),
+            "saturation"    => self.saturation    = val.clamp(-1.0, 1.0),
+            "tint"          => self.tint          = val.clamp(-1.0, 1.0),
+            "source_kelvin" => self.source_kelvin = val.clamp(MIN_KELVIN, MAX_KELVIN),
+            "target_kelvin" => self.target_kelvin = val.clamp(MIN_KELVIN, MAX_KELVIN),
+            "lut_strength"  => self.lut_strength  = val.clamp(0.0, 1.0),
+            _ => return false,
+        }
+        true
+    }
+
     pub fn is_active(&self) -> bool {
         self.enabled && (
             self.lut.is_some()
@@ -203,6 +236,57 @@ mod tests {
         let c = ColorAdjustments::default();
         assert!(!c.enabled);
         assert!(!c.is_active());
+    }
+
+    #[test]
+    fn set_param_clamps_every_scalar_to_its_range() {
+        let mut c = ColorAdjustments::default();
+        for (name, too_low, too_high, min, max) in [
+            ("exposure",      -1e6, 1e6, -5.0,       5.0),
+            ("contrast",      -1e6, 1e6, -1.0,       1.0),
+            ("saturation",    -1e6, 1e6, -1.0,       1.0),
+            ("tint",          -1e6, 1e6, -1.0,       1.0),
+            ("source_kelvin",  0.0, 1e6, MIN_KELVIN, MAX_KELVIN),
+            ("target_kelvin",  0.0, 1e6, MIN_KELVIN, MAX_KELVIN),
+            ("lut_strength",  -1e6, 1e6,  0.0,       1.0),
+        ] {
+            assert!(c.set_param(name, too_low), "{name} should be a known parameter");
+            assert_eq!(read_param(&c, name), min, "{name} not clamped at the low end");
+            assert!(c.set_param(name, too_high));
+            assert_eq!(read_param(&c, name), max, "{name} not clamped at the high end");
+        }
+    }
+
+    #[test]
+    fn set_param_stores_in_range_values_untouched() {
+        let mut c = ColorAdjustments::default();
+        assert!(c.set_param("exposure", 1.25));
+        assert!(c.set_param("target_kelvin", 3200.0));
+        assert_eq!(c.exposure, 1.25);
+        assert_eq!(c.target_kelvin, 3200.0);
+    }
+
+    #[test]
+    fn set_param_rejects_unknown_names_and_non_finite_values() {
+        let mut c = ColorAdjustments::default();
+        c.exposure = 1.0;
+        assert!(!c.set_param("gamma", 2.2));
+        assert!(!c.set_param("exposure", f64::NAN));
+        assert!(!c.set_param("exposure", f64::INFINITY));
+        assert_eq!(c.exposure, 1.0, "a rejected value must leave the field alone");
+    }
+
+    fn read_param(c: &ColorAdjustments, name: &str) -> f64 {
+        match name {
+            "exposure"      => c.exposure,
+            "contrast"      => c.contrast,
+            "saturation"    => c.saturation,
+            "tint"          => c.tint,
+            "source_kelvin" => c.source_kelvin,
+            "target_kelvin" => c.target_kelvin,
+            "lut_strength"  => c.lut_strength,
+            _ => unreachable!(),
+        }
     }
 
     #[test]

@@ -1775,19 +1775,13 @@ impl StabilizationManager {
                 if let Some(v) = obj.get("enabled")               .and_then(|x| x.as_bool()) { c.enabled                = v; }
                 if let Some(v) = obj.get("bake_in_render")        .and_then(|x| x.as_bool()) { c.bake_in_render         = v; }
                 // Clamped to the ranges the rest of the code already treats as valid, so a
-                // hand-edited or corrupted project can't produce a nonsensical grade. `exposure`
-                // is the one that matters: nothing downstream bounds it, and `1e6` gives an
-                // infinite gain and a white frame. The others are clamped again further down
-                // (`to_kernel_params`, `kelvin_to_rgb_gains`); doing it here too keeps the
-                // stored value honest, so the UI shows what is actually applied.
-                if let Some(v) = obj.get("exposure")              .and_then(|x| x.as_f64())  { c.exposure               = v.clamp(-5.0, 5.0); }
-                if let Some(v) = obj.get("contrast")              .and_then(|x| x.as_f64())  { c.contrast               = v.clamp(-1.0, 1.0); }
-                if let Some(v) = obj.get("saturation")            .and_then(|x| x.as_f64())  { c.saturation             = v.clamp(-1.0, 1.0); }
-                if let Some(v) = obj.get("source_kelvin")         .and_then(|x| x.as_f64())  { c.source_kelvin          = v.clamp(1667.0, 25000.0); }
+                // hand-edited or corrupted project can't produce a nonsensical grade. The
+                // ranges live in `ColorAdjustments::set_param`, shared with the QML entry
+                // point in `Controller::set_color_param`.
+                for key in ["exposure", "contrast", "saturation", "source_kelvin", "target_kelvin", "tint", "lut_strength"] {
+                    if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { c.set_param(key, v); }
+                }
                 if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
-                if let Some(v) = obj.get("target_kelvin")         .and_then(|x| x.as_f64())  { c.target_kelvin          = v.clamp(1667.0, 25000.0); }
-                if let Some(v) = obj.get("tint")                  .and_then(|x| x.as_f64())  { c.tint                   = v.clamp(-1.0, 1.0); }
-                if let Some(v) = obj.get("lut_strength")          .and_then(|x| x.as_f64())  { c.lut_strength           = v.clamp(0.0, 1.0); }
                 c.lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
                 c.lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
 
