@@ -82,6 +82,7 @@ pub struct Controller {
     set_color_enabled: qt_method!(fn(&self, enabled: bool, bake_in_render: bool)),
     load_lut: qt_method!(fn(&mut self, url: QUrl) -> QString),
     clear_lut: qt_method!(fn(&mut self)),
+    get_lut_name: qt_method!(fn(&self) -> QString),
     get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
     set_horizon_lock: qt_method!(fn(&self, lock_percent: f64, roll: f64, lock_pitch: bool, pitch: f64, automatic_lock: bool, turn_threshold: f64, turn_smoothing_ms: f64, turn_multiplier: f64, tilt_accel_limit: f64)),
     get_turn_speed: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
@@ -1298,6 +1299,14 @@ impl Controller {
             c.lut_name = None;
         }
         self.request_recompute();
+    }
+
+    /// The filename of the currently loaded LUT, or an empty string if there isn't one. The
+    /// QML side treats "" as "no LUT" (`lutName.length > 0`) rather than distinguishing it
+    /// from a `None`, because a LUT with an empty filename isn't a thing `load_lut` can
+    /// produce - `filesystem::get_filename` always yields at least one character.
+    fn get_lut_name(&self) -> QString {
+        QString::from(self.stabilizer.color.read().lut_name.clone().unwrap_or_default())
     }
 
     /// What the camera recorded, for the read-only panel readout. Fields the camera didn't

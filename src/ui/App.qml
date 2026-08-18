@@ -57,6 +57,8 @@ Rectangle {
             syncHr  .parent = paramsTab.inner;
             stab    .parent = paramsTab.inner;
             stabHr  .parent = paramsTab.inner;
+            colorAdjustments  .parent = paramsTab.inner;
+            colorAdjustmentsHr.parent = paramsTab.inner;
             advanced.parent = paramsTab.inner;
             advancedHr.parent = paramsTab.inner;
             nlePlugins.parent = paramsTab.inner;
@@ -75,6 +77,8 @@ Rectangle {
             syncHr        .parent = rightPanel.col;
             stab          .parent = rightPanel.col;
             stabHr        .parent = rightPanel.col;
+            colorAdjustments  .parent = rightPanel.col;
+            colorAdjustmentsHr.parent = rightPanel.col;
             exportSettings.parent = rightPanel.col;
             exportHr      .parent = rightPanel.col;
             advanced      .parent = rightPanel.col;
@@ -92,6 +96,7 @@ Rectangle {
     property alias outputFile: outputFile;
     property alias sync: sync.item;
     property alias stab: stab.item;
+    property alias colorAdjustments: colorAdjustments.item;
     property alias exportSettings: exportSettings.item;
     property alias advanced: advanced.item;
     property alias renderBtn: renderBtn;
@@ -509,6 +514,8 @@ Rectangle {
             Hr { id: syncHr; }
             ItemLoader { id: stab; sourceComponent: Component { Menu.Stabilization { } } }
             Hr { id: stabHr; }
+            ItemLoader { id: colorAdjustments; sourceComponent: Component { Menu.ColorAdjustments { } } }
+            Hr { id: colorAdjustmentsHr; }
             ItemLoader { id: exportSettings; sourceComponent: Component { Menu.Export { showBtn: !window.isMobileLayout; } } }
             Hr { id: exportHr; visible: !isMobileLayout; }
             ItemLoader { id: advanced; sourceComponent: Component { Menu.Advanced { } } }
