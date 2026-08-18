@@ -284,7 +284,29 @@ The graded frame is a correct log-to-display conversion: black point restored, w
 
 This exercises, for the first time on real data: the packed-RGB conversion and its precision choice (10-bit → `RGBA64LE`), the LUT upload at `LUT_DATA_OFFSET` with 33³ trilinear interpolation, colour deserialised from a preset, and `bake_in_render` being honoured. The source is full-range with an unspecified matrix, so it also traverses the swscale colour-range path and its BT.709 fallback without visible level error.
 
-**Not covered by this run, and still owed:** the preview half of R5 (the CLI opens no preview, so preview/export match remains unverified), numerical comparison against a reference implementation (the result is visibly right, not measured to the 1/1024 the equivalence test specifies), and cross-backend equivalence — one backend was exercised, whichever the CLI selected.
+**Not covered by this run, and still owed:** the preview half of R5 (the CLI opens no preview, so preview/export match remains unverified) and numerical comparison against a reference implementation — the result is visibly right, not measured.
+
+### Cross-backend equivalence — the planned test cannot be run through full renders
+
+`NO_OPENCL` and `NO_WGPU` (`gpu/mod.rs:375`) select the backend, so the same clip and preset were rendered through each and compared frame-for-frame as 16-bit RGB.
+
+First, the pipeline is **bit-exact deterministic**: two OpenCL renders of the same input produce byte-identical output (equal SHA-256 over the decoded frame). The lossy encoder contributes no noise, so any difference between backends is real signal rather than compression.
+
+Measured on one frame (frame 72 of 144), per-channel absolute difference in 16-bit terms:
+
+| comparison | max | mean | samples differing |
+|---|---|---|---|
+| OpenCL vs OpenCL (same backend, rerun) | 0 | 0 | 0% |
+| OpenCL vs wgpu, **colour disabled** | 4822 (≈1/14 scale) | 180 | 92.9% |
+| OpenCL vs wgpu, **colour enabled** | 9469 (≈1/7 scale) | 300 | 96.3% |
+
+The colour-disabled row is the load-bearing one: **the two backends already disagree by roughly 75× the 1/1024 threshold before any colour code runs.** That divergence is pre-existing — different undistortion and Lanczos4 resampling implementations — and is not attributable to this branch.
+
+Colour roughly doubles the divergence, which is what an S-Log3→Rec.709 LUT should do to a pre-existing difference: the curve is steep through shadows and midtones, so it amplifies whatever disagreement it is handed. That is the most plausible reading, but **this measurement cannot separate amplification from a genuine colour-stage divergence**, because the baseline is already far above the threshold.
+
+The consequence for the planned test is concrete: cross-backend equivalence must be asserted on **a synthetic frame through the colour stage in isolation**, exactly as this spec's testing section originally specified, and never by diffing full renders. A full-render diff can only ever measure the pipeline's pre-existing backend disagreement. That isolated test remains unwritten and unrun.
+
+**CPU-only rendering does not work at all.** Setting both `NO_OPENCL=1` and `NO_WGPU=1` fails with `No cached wgpu found for key: …` rather than falling back to the CPU pixel path, so the CPU backend could not be included above. Reproduced with colour disabled, so pre-existing and not attributable to this branch — but it does mean the CPU colour stage (Task 8) has never been executed through a real render, only through unit tests.
 
 Two pre-existing obstacles found while doing this, neither caused by colour and both reproducible with colour disabled:
 
