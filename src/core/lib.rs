@@ -1782,46 +1782,70 @@ impl StabilizationManager {
                     if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { c.set_param(key, v); }
                 }
                 if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
-                c.lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
-                c.lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
+                let new_lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
+                let new_lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
+                let has_lut_data = obj.get("lut_data").and_then(|x| x.as_str()).is_some_and(|x| !x.is_empty());
 
-                // Prefer the file on disk, so an edited .cube is picked up; fall back to the embedded copy.
-                let from_path = c.lut_path.as_ref()
-                    .map(|p| if p.contains("://") { p.clone() } else { filesystem::path_to_url(p) })
-                    .and_then(|url| filesystem::read_to_string(&url).ok())
-                    .and_then(|text| color::parse_cube(&text).ok());
+                // A project file is the complete state, so it may legitimately say "no LUT".
+                // A preset is an overlay applied on top of whatever the user already has, and
+                // a preset authored on another machine carries a `lut_path` that doesn't
+                // resolve here. Neither case may cost the user a LUT they loaded by hand
+                // without being told, so a preset only touches the LUT fields when it actually
+                // carries one, and only commits them once that one has resolved.
+                let carries_lut = new_lut_path.is_some() || new_lut_name.is_some() || has_lut_data;
+                if !*is_preset || carries_lut {
+                    // Prefer the file on disk, so an edited .cube is picked up; fall back to the embedded copy.
+                    let from_path = new_lut_path.as_ref()
+                        .map(|p| if p.contains("://") { p.clone() } else { filesystem::path_to_url(p) })
+                        .and_then(|url| filesystem::read_to_string(&url).ok())
+                        .and_then(|text| color::parse_cube(&text).ok());
 
-                let from_embedded = || {
-                    obj.get("lut_data").and_then(|x| x.as_str())
-                       .and_then(|s| util::decompress_from_base91_cbor::<(u32, f32, f32, Vec<f32>)>(s).ok())
-                       // A blob can decode cleanly and still be self-inconsistent. Enforce exactly
-                       // what `parse_cube` enforces (color/lut.rs) - a `size` that disagrees with
-                       // `data` indexes out of bounds in `sample_trilinear` and reads past the GPU
-                       // coefficient buffer, and a non-finite value NaNs every pixel silently.
-                       // Rejecting here falls through to the "LUT absent" arm below, so a corrupt
-                       // project still opens.
-                       .filter(|(size, domain_min, domain_max, data)| {
-                            (2..=64).contains(size)
-                            && data.len() / 3 == (*size as usize).pow(3) && data.len() % 3 == 0
-                            && domain_min.is_finite() && domain_max.is_finite()
-                            && data.iter().all(|v| v.is_finite())
-                       })
-                       .map(|(size, domain_min, domain_max, data)| {
-                            // Recomputed rather than stored, so `checksum` can never disagree with
-                            // `data` - `get_current_key` and every backend's GPU cache depend on it.
-                            let checksum = crc32fast::hash(bytemuck::cast_slice(&data));
-                            color::Lut3D { size, domain_min, domain_max, data, checksum }
-                       })
-                };
+                    let from_embedded = || {
+                        obj.get("lut_data").and_then(|x| x.as_str())
+                           .and_then(|s| util::decompress_from_base91_cbor::<(u32, f32, f32, Vec<f32>)>(s).ok())
+                           // A blob can decode cleanly and still be self-inconsistent. Enforce exactly
+                           // what `parse_cube` enforces (color/lut.rs) - a `size` that disagrees with
+                           // `data` indexes out of bounds in `sample_trilinear` and reads past the GPU
+                           // coefficient buffer, and a non-finite value NaNs every pixel silently.
+                           // Rejecting here falls through to the "LUT absent" arm below, so a corrupt
+                           // project still opens.
+                           .filter(|(size, domain_min, domain_max, data)| {
+                                (2..=64).contains(size)
+                                && data.len() / 3 == (*size as usize).pow(3) && data.len() % 3 == 0
+                                && domain_min.is_finite() && domain_max.is_finite()
+                                && data.iter().all(|v| v.is_finite())
+                           })
+                           .map(|(size, domain_min, domain_max, data)| {
+                                // Recomputed rather than stored, so `checksum` can never disagree with
+                                // `data` - `get_current_key` and every backend's GPU cache depend on it.
+                                let checksum = crc32fast::hash(bytemuck::cast_slice(&data));
+                                color::Lut3D { size, domain_min, domain_max, data, checksum }
+                           })
+                    };
 
-                match from_path.or_else(from_embedded) {
-                    Some(lut) => { c.lut = Some(std::sync::Arc::new(lut)); }
-                    None => {
-                        // A missing LUT must never make a project unopenable - load without it.
-                        if let Some(name) = c.lut_name.as_deref() {
-                            ::log::warn!("LUT '{name}' could not be loaded, continuing without it");
+                    match from_path.or_else(from_embedded) {
+                        Some(lut) => {
+                            c.lut_path = new_lut_path;
+                            c.lut_name = new_lut_name;
+                            c.lut = Some(std::sync::Arc::new(lut));
                         }
-                        c.lut = None;
+                        None if *is_preset => {
+                            // The preset named a LUT that doesn't resolve on this machine. Keep
+                            // what the user has - `lut`, `lut_path` and `lut_name` are all left
+                            // untouched. The UI notices the mismatch between the preset's
+                            // `lut_name` and `Controller::get_lut_name` and says so.
+                            ::log::warn!("Preset LUT '{}' could not be loaded, keeping the currently loaded LUT",
+                                         new_lut_name.as_deref().unwrap_or("<unnamed>"));
+                        }
+                        None => {
+                            c.lut_path = new_lut_path;
+                            c.lut_name = new_lut_name;
+                            // A missing LUT must never make a project unopenable - load without it.
+                            if let Some(name) = c.lut_name.as_deref() {
+                                ::log::warn!("LUT '{name}' could not be loaded, continuing without it");
+                            }
+                            c.lut = None;
+                        }
                     }
                 }
             }
@@ -2376,10 +2400,14 @@ DOMAIN_MAX 1.0 1.0 1.0
 
     #[test]
     fn missing_lut_does_not_make_the_project_unopenable() {
-        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"x.mp4","color":{"enabled":true,"exposure":0.5,"lut_path":"file:///nonexistent/nope.cube","lut_name":"nope.cube"}}"#;
+        // The `videofile` must be a URL, not a bare relative name: `import_gyroflow_data`
+        // decides `is_preset` from whether it resolves to a non-empty URL, and a project and a
+        // preset now handle an unresolvable LUT differently (see the preset tests below).
+        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"file:///nonexistent/x.mp4","color":{"enabled":true,"exposure":0.5,"lut_path":"file:///nonexistent/nope.cube","lut_name":"nope.cube"}}"#;
         let mgr = StabilizationManager::default();
         let mut is_preset = false;
         mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        assert!(!is_preset, "fixture must exercise the project path, not the preset path");
         let c = mgr.color.read();
         assert!(c.lut.is_none());
         assert_eq!(c.exposure, 0.5);
@@ -2407,6 +2435,57 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert!(c.lut.is_none());
         assert!(c.lut_path.is_none());
         assert!(c.lut_name.is_none());
+    }
+
+    /// Applies `json` to `mgr` as a preset (no `videofile` key), asserting it really was
+    /// treated as one - otherwise these tests would silently exercise the project path.
+    fn apply_as_preset(mgr: &StabilizationManager, json: &str) {
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        assert!(is_preset, "fixture was not treated as a preset");
+    }
+
+    #[test]
+    fn a_preset_carrying_no_lut_leaves_the_loaded_one_alone() {
+        let url = write_temp_cube("preset_keep", CUBE_2);
+        let mgr = configured_manager(Some(url.clone()));
+
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"color":{"enabled":true,"exposure":-1.5}}"#);
+
+        let c = mgr.color.read();
+        assert_eq!(c.exposure, -1.5, "the preset's own scalars must still be applied");
+        assert!(c.lut.is_some(), "a preset carrying no LUT must not clear the user's");
+        assert_eq!(c.lut_name.as_deref(), Some("round-trip.cube"));
+        assert_eq!(c.lut_path.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn a_preset_whose_lut_does_not_resolve_keeps_the_loaded_one() {
+        let url = write_temp_cube("preset_unresolvable", CUBE_2);
+        let mgr = configured_manager(Some(url.clone()));
+        let before = mgr.color.read().lut.as_ref().unwrap().checksum;
+
+        // Authored on another machine: the path is meaningless here and there's no embedded copy.
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"color":{"lut_path":"file:///nonexistent/elsewhere.cube","lut_name":"elsewhere.cube"}}"#);
+
+        let c = mgr.color.read();
+        assert_eq!(c.lut.as_ref().unwrap().checksum, before, "the user's LUT must survive");
+        assert_eq!(c.lut_name.as_deref(), Some("round-trip.cube"));
+        assert_eq!(c.lut_path.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn a_preset_whose_lut_resolves_replaces_the_loaded_one() {
+        let mgr = configured_manager(Some(write_temp_cube("preset_replace_old", CUBE_2)));
+
+        let other = CUBE_2.replace("0.70 0.71 0.72", "0.77 0.78 0.79");
+        let other_url = write_temp_cube("preset_replace_new", &other);
+        apply_as_preset(&mgr, &format!(r#"{{"title":"Gyroflow data file","version":4,"color":{{"lut_path":"{other_url}","lut_name":"elsewhere.cube"}}}}"#));
+
+        let c = mgr.color.read();
+        assert_eq!(c.lut_name.as_deref(), Some("elsewhere.cube"));
+        assert_eq!(c.lut_path.as_deref(), Some(other_url.as_str()));
+        assert_eq!(c.lut.as_ref().unwrap().data, color::parse_cube(&other).unwrap().data);
     }
 
     // ---------------------------------------------------------------------
