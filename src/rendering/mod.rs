@@ -668,7 +668,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 // frame it sees must be packed RGB. `packed_color_format` picks the target
                 // and guarantees it is one of these two.
                 ::log::info!("Baking colour adjustments: converting {:?} to {:?}", format, target);
-                converter.convert_pixel_format(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
+                converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
                     if target == Pixel::RGBA {
                         create_planes_proc!(planes, (RGBA8,  converted_frame, converted_output, 0, [], 255.0), );
                     } else {
@@ -782,7 +782,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             // The plane closures above were built for this converted packed RGB frame, so
             // the frame handed to them must go through the same conversion. `color_convert_to`
             // is the one value both decisions read, so they cannot disagree.
-            converter.convert_pixel_format(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
+            converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
                 undistort_frame(converted_frame, converted_output);
             })?;
         } else {
