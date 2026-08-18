@@ -131,4 +131,45 @@ mod tests {
         assert!(s.white_balance_k.is_none() && s.iso.is_none() && s.ev.is_none());
         assert!(s.is_empty());
     }
+
+    /// Verbatim `recording_settings` from a Sony Cinema Line clip (FX-series, S-Log3),
+    /// as exported by `gyroflow --export-metadata 2:…`. Every other test here uses
+    /// hand-written JSON, so this is the only one that pins the real key spellings and
+    /// value formats a camera actually emits — note the trailing `s` on the shutter
+    /// speed and the `f/` prefix on the iris, neither of which is obvious from the
+    /// field names.
+    #[test]
+    fn parses_real_sony_cinema_line_settings() {
+        let json = serde_json::json!({
+            "Shutter angle":       "33.0°",
+            "Shutter speed":       "1/272s",
+            "Exposure":            "Iris Priority Auto",
+            "ISO":                 "800",
+            "Color primaries":     "BT.709",
+            "Gamma equation":      "S-Gamut3.Cine/S-Log3",
+            "White balance mode":  "Automatic",
+            "White balance":       "5000K",
+            "Iris":                "f/2.8",
+            "Focal length":        "21.80 mm",
+            "Focus mode":          "Full Screen Sensing Auto"
+        });
+        let s = SourceExposure::from_recording_settings(&json);
+
+        assert_eq!(s.white_balance_k, Some(5000.0));
+        assert_eq!(s.wb_mode.as_deref(), Some("Automatic"));
+        assert_eq!(s.iso, Some(800.0));
+        assert_eq!(s.aperture, Some(2.8));
+
+        // "1/272s" - the trailing unit must not poison the denominator.
+        let shutter = s.shutter_s.expect("shutter parsed");
+        assert!((shutter - 1.0 / 272.0).abs() < 1e-9, "shutter was {shutter}");
+
+        // log2(2.8² / (1/272)) - log2(800/100) = log2(2132.48) - 3 ≈ 8.058
+        let ev = s.ev.expect("ev computed");
+        assert!((ev - 8.058).abs() < 0.01, "ev was {ev}");
+
+        // The camera reported a real Kelvin value even though the mode is "Automatic",
+        // so the anchor is detected rather than falling back to DEFAULT_KELVIN.
+        assert!(!s.is_empty());
+    }
 }
