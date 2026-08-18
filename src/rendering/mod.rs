@@ -246,6 +246,27 @@ fn packed_color_format(format: Pixel) -> Option<Pixel> {
     }
 }
 
+/// Companion to the prores videotoolbox workaround in `create_planes_proc!`, for the baking
+/// path only.
+///
+/// `ffmpeg_video.rs` tags the *encoder* limited-range for NV12 + `prores_videotoolbox` (see
+/// the matching workaround there), so the samples handed to it have to be limited-range too.
+/// Without baking the kernel does that itself, with `FIX_COLOR_RANGE` / `remap_colorrange`.
+/// Under baking the kernel only ever sees packed RGB, where a YUV range remap would be
+/// meaningless, and the conversion back to NV12 is swscale's job instead. swscale will apply
+/// exactly that range as part of the RGB->YUV matrix - but only if the destination frame
+/// declares it, so declare it. The frame then also describes what it really holds, which is
+/// what `ffmpeg_video.rs` reads if it converts again on the way to the encoder.
+///
+/// `prores_videotoolbox` only exists on macOS, so this is unreachable elsewhere. Note the
+/// encoder-side workaround also covers `dnxhd`, which never had a kernel-side counterpart;
+/// that pre-existing asymmetry is left alone here.
+fn tag_limited_range_for_prores_videotoolbox(out_frame: &mut Video, is_prores_videotoolbox: bool) {
+    if is_prores_videotoolbox && out_frame.format() == Pixel::NV12 {
+        out_frame.set_color_range(ffmpeg_next::util::color::Range::MPEG);
+    }
+}
+
 /// The colour stage is RGB-only, so it must never run on a plane that cannot carry RGB:
 /// a single-channel `Luma8` / `Luma16` / `R32f` plane or a two-channel `UV8` / `UV16` one.
 /// This is applied to every plane `create_planes_proc!` builds, so no dispatch arm can
@@ -578,7 +599,12 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     plane.share_wgpu_instances = true;
                     plane.set_device(stab.params.read().current_device as isize);
 
-                    // Workaround for a bug in prores videotoolbox encoder
+                    // Workaround for a bug in prores videotoolbox encoder.
+                    // Under baking `$in_frame` is the converted packed RGB frame, so this is
+                    // false and the kernel-side remap does not run - deliberately: it is a
+                    // YUV range remap and RGB has no such range. The equivalent for that path
+                    // is `tag_limited_range_for_prores_videotoolbox`, which makes swscale do
+                    // it during the conversion back to NV12.
                     if $in_frame.format() == ffmpeg_next::format::Pixel::NV12 && is_prores_videotoolbox {
                         plane.kernel_flags.set(KernelParamsFlags::FIX_COLOR_RANGE, true);
                     }
@@ -668,6 +694,9 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 // frame it sees must be packed RGB. `packed_color_format` picks the target
                 // and guarantees it is one of these two.
                 ::log::info!("Baking colour adjustments: converting {:?} to {:?}", format, target);
+                // Must happen before the first conversion: the swscale contexts read the
+                // frame's range when they are built, and they are cached from then on.
+                tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
                 converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
                     if target == Pixel::RGBA {
                         create_planes_proc!(planes, (RGBA8,  converted_frame, converted_output, 0, [], 255.0), );
@@ -782,6 +811,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             // The plane closures above were built for this converted packed RGB frame, so
             // the frame handed to them must go through the same conversion. `color_convert_to`
             // is the one value both decisions read, so they cannot disagree.
+            tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
             converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
                 undistort_frame(converted_frame, converted_output);
             })?;
