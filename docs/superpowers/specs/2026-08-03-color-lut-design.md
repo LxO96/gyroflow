@@ -313,6 +313,17 @@ Two pre-existing obstacles found while doing this, neither caused by colour and 
 - `YUV422P10LE` is not among the supported render output formats, so a stock Sony Cinema Line clip cannot be exported without overriding `pixel_format`. Worth its own issue.
 - The CLI aborts on a debug-only null-pointer assertion: `RenderQueue` is a QObject constructed at `cli.rs:222`, but `QCoreApplication` is not created until `cli.rs:645`. Release builds do not trip it. Also worth its own issue.
 
+## Known kernel divergence — colour stage placement
+
+Found by review of the finished branch, confirmed by reading, **not fixed**. The CPU path applies the colour stage once to the final pixel (`cpu_undistort.rs:641,655`). The wgpu and OpenCL kernels apply it inside `sample_input_at` (`wgpu_undistort.wgsl:370`, `opencl_undistort.cl:483`), which places it before compositing rather than after. Two consequences:
+
+- **Background pixels.** When `undistort_coord` returns its sentinel — the `r_limit`-clipped region on fisheye profiles — the GPU kernels leave the background ungraded, while the CPU path and the Qt preview (`qt_gpu/undistort.frag:416`) grade it. With colour enabled those arcs differ between a preview and a GPU render.
+- **The feather band.** In `background_mode == 3`, the GPU kernels grade the two samples and then blend; the CPU path blends and then grades. Exposure, white balance, contrast and saturation are affine and commute with the blend, so this is invisible for them — but `sample_trilinear` is not, so **with a LUT loaded the feather band renders differently on GPU than on CPU.**
+
+This breaks the invariant the five-way duplication rests on: the implementations must be arithmetically identical, and reviewers verify that rather than flagging the duplication. The correct target is the CPU order — grade the composited pixel once — because that is what the reference `apply_color` describes and what the preview already does.
+
+It is deliberately left for a change that can be verified. Moving the call site in two GPU kernels is exactly the kind of edit that needs the cross-backend equivalence test to confirm, and that test's wgpu identity control is not yet solved (see below), so a fix today could not be checked by anything except reading. The edge cases involved — clipped fisheye arcs, and the feather band with a LUT — are narrow enough to be worth less than a silently wrong "fix".
+
 ## Manual verification checklist
 
 Everything below needs a human at a running GUI. The export path has been verified headlessly through the CLI (see the R5 section above), but **the CLI opens no preview and no dialogs, so the entire UI layer is unobserved** — the panel has never been rendered, no `.cube` has been loaded through a file dialog, and no `messageBox` or notification in this feature has ever fired.
