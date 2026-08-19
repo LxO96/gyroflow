@@ -313,6 +313,25 @@ Two pre-existing obstacles found while doing this, neither caused by colour and 
 - `YUV422P10LE` is not among the supported render output formats, so a stock Sony Cinema Line clip cannot be exported without overriding `pixel_format`. Worth its own issue.
 - The CLI aborts on a debug-only null-pointer assertion: `RenderQueue` is a QObject constructed at `cli.rs:222`, but `QCoreApplication` is not created until `cli.rs:645`. Release builds do not trip it. Also worth its own issue.
 
+## Manual verification checklist
+
+Everything below needs a human at a running GUI. The export path has been verified headlessly through the CLI (see the R5 section above), but **the CLI opens no preview and no dialogs, so the entire UI layer is unobserved** — the panel has never been rendered, no `.cube` has been loaded through a file dialog, and no `messageBox` or notification in this feature has ever fired.
+
+1. **Panel appears and is neutral.** Load any video. "Color adjustments" appears in the right panel below "Stabilization", opens, and every slider sits at neutral (exposure 0 EV; contrast/saturation/tint 0; temperature 5500 K or the clip's source Kelvin). Preview unchanged. The `pencil` icon renders and is not blank.
+2. **Exposure changes the preview.** Tick Enable, drag exposure — the preview must brighten immediately. This is the first real proof that `request_recompute` reaches the *preview*; Task 14 could only argue it from the call graph, and the CLI render does not exercise it.
+3. **Load a valid `.cube`.** The preview changes, the button label becomes the filename, the "LUT strength" slider appears and visibly scales the effect.
+4. **Load a truncated `.cube`.** The parse error appears in a dialog and the *previous* LUT stays active with the preview untouched.
+5. **Source Kelvin.** On a clip with white-balance metadata the temperature slider and its reset default both read the source Kelvin, and the "Source: …" line shows it with ISO/shutter/aperture/EV. A clip without it reads 5500 K and shows no Source line. Then, with the panel **enabled** and a temperature dialled in, load a second clip and confirm the dialled-in value is not overwritten — this is the ratified anchoring behaviour and the case flagged as a rough edge.
+6. **Project round-trip.** Distinct non-default values on every slider plus a LUT, save, restart, reopen — everything returns exactly.
+7. **Preset without a LUT (F3).** Applying a preset carrying a `color` section but no LUT must leave the loaded LUT alone while applying the scalars.
+8. **Preset with an unresolvable LUT (F3).** A preset whose `lut_path` does not exist and whose `lut_data` is absent must keep the current LUT and show a non-blocking warning naming both — not an error dialog.
+9. **Keyframes.** Right-click each slider → Enable keyframing → Add keyframe. The timeline value must match the slider. A mismatch shows as 100× on contrast, saturation, tint and LUT strength — the `scaler` mapping the plan got wrong.
+10. **Preset authoring.** Save a preset and confirm the new "Color adjustments" category appears with its six rows, that the LUT row is unticked by default, and that ticking it embeds the LUT.
+11. **Mobile layout.** With `forceMobileLayout`, the panel and its `Hr` appear in the Parameters tab below Stabilization.
+12. **Localisation/RTL**, including the "Choose file…" ellipsis, in a non-English locale.
+
+On macOS, Android and iOS the panel is compiled in through `qmlcachegen` rather than the `resources_qml.rs` qrc list. Both lists are updated, but that is a different code path from the one exercised on Windows and has never been run.
+
 ## Verification owed on other platforms
 
 Everything below is inert on Windows and Linux and was written without any way to execute it. It is shipped deliberately, on the reasoning recorded here, and needs a human on the named platform to confirm.
