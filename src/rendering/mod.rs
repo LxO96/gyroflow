@@ -522,7 +522,10 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     // Colour adjustments are baked into the render only when the user asked for it.
     // Read once, so the decision (and the pixel format it implies) cannot change between
     // the frame that builds the plane closures and the frames that run them.
-    let bake_color = {
+    // Cleared below if the source turns out not to be bakeable, so that the decision is
+    // carried by this one flag rather than by `color_convert_to` being `None` - the plane
+    // dispatch reads this, and `None` there does not by itself mean "do not grade".
+    let mut bake_color = {
         let c = stab.color.read();
         c.is_active() && c.bake_in_render
     };
@@ -688,10 +691,17 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     // A hardware frame's pixels are not in system memory, so swscale cannot
                     // convert it; the zero-copy plane path is the only way to reach them.
                     ::log::warn!("Colour baking is not supported for hardware frames ({:?}); rendering without colour adjustments", input_frame.format());
+                    bake_color = false;
                 } else {
                     color_convert_to = packed_color_format(format);
                     if color_convert_to.is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA) {
+                        // `packed_color_format` also returns `None` when swscale cannot
+                        // handle the format, and those sources dispatch to 3- and 4-channel
+                        // plane types that `should_bake_color` would happily grade - as YUV,
+                        // or byte-swapped. Make the warning true instead of relying on the
+                        // per-plane channel-count gate to catch it.
                         ::log::warn!("Colour baking is not supported for {:?} sources; rendering without colour adjustments", format);
+                        bake_color = false;
                     }
                 }
             }

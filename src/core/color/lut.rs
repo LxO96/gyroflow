@@ -69,7 +69,27 @@ pub fn parse_cube(text: &str) -> Result<Lut3D, LutError> {
                 }
                 if parts[0].eq_ignore_ascii_case("DOMAIN_MIN") { domain_min = v[0]; } else { domain_max = v[0]; }
             }
+            // Resolve's input-range extension, the two-value equivalent of
+            // DOMAIN_MIN/DOMAIN_MAX. It appears in real-world .cube files, and because it
+            // has three tokens it used to fall through to the data arm and fail trying to
+            // parse its own keyword as a number.
+            "LUT_3D_INPUT_RANGE" | "LUT_1D_INPUT_RANGE" => {
+                if parts.len() < 3 { return Err(LutError::InvalidNumber(line_no)); }
+                let lo: f32 = parts[1].parse().map_err(|_| LutError::InvalidNumber(line_no))?;
+                let hi: f32 = parts[2].parse().map_err(|_| LutError::InvalidNumber(line_no))?;
+                if !lo.is_finite() || !hi.is_finite() { return Err(LutError::InvalidNumber(line_no)); }
+                domain_min = lo;
+                domain_max = hi;
+            }
             _ => {
+                // A line whose first token is not a number is some other keyword. The .cube
+                // format is open-ended and writers emit metadata we do not model, so skip it
+                // rather than misreporting it as a bad number. A genuinely corrupt data line
+                // is still caught: it leaves the entry count wrong, which is checked below.
+                if parts[0].parse::<f32>().is_err() {
+                    ::log::debug!("Ignoring unrecognised .cube directive on line {line_no}: {}", parts[0]);
+                    continue;
+                }
                 if parts.len() < 3 { return Err(LutError::InvalidNumber(line_no)); }
                 let v = parse_triplet(&parts, line_no)?;
                 data.extend_from_slice(&v);
@@ -239,5 +259,54 @@ LUT_3D_SIZE 2
         let lut = parse_cube(IDENTITY_2).unwrap();
         assert_eq!(sample_trilinear(&lut, [-1.0, 2.0, 0.5])[0], 0.0);
         assert_eq!(sample_trilinear(&lut, [-1.0, 2.0, 0.5])[1], 1.0);
+    }
+
+    /// `LUT_3D_INPUT_RANGE` is a Resolve extension that appears in real `.cube` files. It
+    /// has three tokens, so before this was handled it fell through to the data arm and the
+    /// whole file was rejected with a misleading "invalid number" pointing at its own line.
+    #[test]
+    fn accepts_the_resolve_input_range_extension() {
+        let text = "TITLE \"x\"
+LUT_3D_SIZE 2
+LUT_3D_INPUT_RANGE 0.0 1.0
+".to_string()
+                 + &"0.0 0.0 0.0
+".repeat(8);
+        let lut = parse_cube(&text).expect("input-range LUT must parse");
+        assert_eq!(lut.size, 2);
+        assert_eq!(lut.domain_min, 0.0);
+        assert_eq!(lut.domain_max, 1.0);
+    }
+
+    /// A non-default input range must actually reach the domain, not just be tolerated.
+    #[test]
+    fn input_range_sets_the_domain() {
+        let text = "LUT_3D_SIZE 2
+LUT_3D_INPUT_RANGE -0.5 2.5
+".to_string()
+                 + &"0.0 0.0 0.0
+".repeat(8);
+        let lut = parse_cube(&text).unwrap();
+        assert_eq!(lut.domain_min, -0.5);
+        assert_eq!(lut.domain_max, 2.5);
+    }
+
+    /// Unknown keywords are skipped rather than misread as data - but a short data table is
+    /// still an error, so skipping cannot mask a truncated file.
+    #[test]
+    fn unknown_keywords_are_skipped_but_a_short_table_still_fails() {
+        let ok = "LUT_3D_SIZE 2
+SOME_FUTURE_DIRECTIVE a b c
+".to_string()
+               + &"0.0 0.0 0.0
+".repeat(8);
+        assert!(parse_cube(&ok).is_ok(), "unknown keyword must not fail the file");
+
+        let short = "LUT_3D_SIZE 2
+SOME_FUTURE_DIRECTIVE a b c
+".to_string()
+                  + &"0.0 0.0 0.0
+".repeat(7);
+        assert!(parse_cube(&short).is_err(), "a short table must still be rejected");
     }
 }
