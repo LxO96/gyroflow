@@ -1018,12 +1018,28 @@ mod cross_backend_color_tests {
     /// legitimate skip, from "wgpu is present but the run failed", which is a failure and
     /// must not be mistaken for a skip. Collapsing the two is how a test ends up asserting
     /// nothing while looking green.
+    ///
+    /// **The half-pixel correction is essential and is not a fudge.** The CPU path feeds the
+    /// transform the integer pixel index (`cpu_undistort.rs:597`, `Vector2::new(x, y)`),
+    /// while the wgpu *fragment* path feeds `@builtin(position)`, which is the pixel centre
+    /// `(x + 0.5, y + 0.5)`. Verified directly by instrumenting the shader to emit
+    /// `@builtin(position)` and `undistort_coord`: the coordinate maths is an exact identity
+    /// on both, and the entire divergence is that half pixel — at `uv = 0.5` the sampler
+    /// lands on the half-pixel coefficient row and blends two texels, where the CPU lands
+    /// exactly on one.
+    ///
+    /// `translation2d` is added to `out_pos` at the top of `undistort_coord`
+    /// (`wgpu_undistort.wgsl:561`), so -0.5 puts both backends on the same sampling grid.
+    /// Without it this test would be comparing two different resamplings and could say
+    /// nothing about colour. See the note on the backend divergence in the design spec: the
+    /// offset itself is a real, pre-existing, non-colour inconsistency between backends.
     fn run_wgpu(flags: i32, lut: Option<Arc<Lut3D>>) -> Result<Vec<[f32; 4]>, String> {
         if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() {
             return Err("UNAVAILABLE: no usable wgpu adapter".into());
         }
 
-        let itm = identity_transform(flags);
+        let mut itm = identity_transform(flags);
+        itm.kernel_params.translation2d = [-0.5, -0.5];
         let mut input = input_bytes();
         let mut output = vec![0u8; (STRIDE * H) as usize];
         let mut buffers = Buffers {
@@ -1183,7 +1199,8 @@ mod cross_backend_color_tests {
             input[i * 16..i * 16 + 16].copy_from_slice(bytemuck::bytes_of(&p));
         }
 
-        let itm = identity_transform(0);
+        let mut itm = identity_transform(0);
+        itm.kernel_params.translation2d = [-0.5, -0.5];
         let mut inp_buf = input.clone();
         let mut output = vec![0u8; (STRIDE * H) as usize];
         {
@@ -1211,18 +1228,21 @@ mod cross_backend_color_tests {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_in }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_out }, texture_copy: false },
             };
-            assert!(Stabilization::undistort_image_cpu::<2, RGBAf>(&mut b, &itm.kernel_params, &DistortionModel::default(), None, &itm.matrices, &[], &[], &coeffs));
+            // The CPU path must NOT get the wgpu half-pixel correction - it already feeds
+            // integer pixel coordinates. Applying it here would shift the CPU instead.
+            let cpu_itm = identity_transform(0);
+            assert!(Stabilization::undistort_image_cpu::<2, RGBAf>(&mut b, &cpu_itm.kernel_params, &DistortionModel::default(), None, &cpu_itm.matrices, &[], &[], &coeffs));
         }
 
         let out = read_pixels(&output);
         let cpu = read_pixels(&cpu_out);
-        println!("out (x,y) -> wgpu src (col,row) | cpu src (col,row)");
+        println!("out (x,y) -> RAW wgpu channels [r,g,b,a] | cpu src (col,row)");
         for i in 0..N {
             let x = i % W as usize;
             let y = i / W as usize;
-            let (gc, gr) = (out[i][1] * W as f32, out[i][2] * H as f32);
             let (cc, cr) = (cpu[i][1] * W as f32, cpu[i][2] * H as f32);
-            println!("  {i:2} ({x:2},{y}) -> wgpu({gc:7.3},{gr:6.3}) | cpu({cc:7.3},{cr:6.3})");
+            let (gc, gr) = (out[i][1] * W as f32, out[i][2] * H as f32);
+            println!("  {i:2} ({x:2},{y}) -> wgpu({gc:7.3},{gr:6.3}) | cpu({cc:6.2},{cr:5.2})");
         }
     }
 
@@ -1248,15 +1268,22 @@ mod cross_backend_color_tests {
     /// - *Not* the output-rect flag (bit 64, unset), the lens-correction branch (skipped at
     ///   `lens_correction_amount` 1.0), or `canvas_scale`.
     ///
-    /// The probe's own output is the sharpest description of what is left: the CPU maps
-    /// output x to input x exactly, while wgpu maps it to a nonlinear curve starting near
-    /// `(x + 0.5) / 4` and breaking pattern partway across the row. Note the fragment path
-    /// is what runs for a `BufferSource::Cpu` buffer (`init_texture` creates a texture, so
-    /// `uses_textures` is true), which explains the half-pixel term but not the rest.
+    /// **Found and corrected: a half-pixel offset.** Instrumenting the shader to emit
+    /// `@builtin(position)` and `undistort_coord` directly showed the coordinate maths is an
+    /// exact identity on both backends, and that the fragment path (which is what runs for a
+    /// `BufferSource::Cpu` buffer, since `init_texture` makes `uses_textures` true) is handed
+    /// the pixel *centre* `(x + 0.5, y + 0.5)` while the CPU path is handed the integer index
+    /// `(x, y)` (`cpu_undistort.rs:597`). `run_wgpu` cancels it via `translation2d`, which
+    /// made the **y axis exactly correct** and fixed pixel 0.
     ///
-    /// Root cause is **not yet identified**. The next step is to instrument the shader
-    /// itself — write `out_pos` straight out as colour and compare it against the fragment's
-    /// `@builtin(position)` — rather than to keep inferring it from sampled values.
+    /// **Residual, still unexplained:** with y exact, x is compressed 4x — output x of
+    /// 0,1,2,3,4 samples input x of 0.00,0.25,0.50,0.75,1.00, then breaks pattern at x=5.
+    /// A factor of 4 on x alone, with y unaffected, is the shape of a stride/element-count
+    /// error rather than a geometric one, and 4 is exactly
+    /// `bytes_per_pixel / pix_element_count` for this format — but the texture branch of
+    /// `read_input_at` uses `textureLoad` and never touches those. Worth checking next
+    /// whether the `interpolation`, `bytes_per_pixel` and `pix_element_count` pipeline
+    /// override constants actually arrive with the values passed to `WgpuWrapper::new`.
     ///
     /// Until it passes, no cross-backend colour claim can be made - which is exactly what
     /// this test existing and failing is for. Run it with `cargo test -- --ignored`.
