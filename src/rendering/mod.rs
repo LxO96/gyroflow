@@ -184,6 +184,104 @@ pub fn get_possible_encoders(codec: &str, use_gpu: bool) -> Vec<(&'static str, b
     encoders
 }
 
+/// `true` if swscale in the linked ffmpeg can read this format.
+fn sws_supports_input(format: Pixel) -> bool {
+    unsafe { ffi::sws_isSupportedInput(format.into()) != 0 }
+}
+/// `true` if swscale in the linked ffmpeg can write this format.
+fn sws_supports_output(format: Pixel) -> bool {
+    unsafe { ffi::sws_isSupportedOutput(format.into()) != 0 }
+}
+
+/// Component depth of the first component, and whether the format holds floats.
+/// Falls back to `(16, false)` for formats ffmpeg has no descriptor for, which is the
+/// conservative answer: it never loses source precision.
+fn format_depth(format: Pixel) -> (i32, bool) {
+    unsafe {
+        let desc = ffi::av_pix_fmt_desc_get(format.into());
+        if desc.is_null() { return (16, false); }
+        let is_float = ((*desc).flags & ffi::AV_PIX_FMT_FLAG_FLOAT as u64) != 0;
+        ((*desc).comp[0].depth, is_float)
+    }
+}
+
+/// The packed **RGB** format a source must be converted to before the colour stage can
+/// run on it, or `None` when no conversion is possible or needed.
+///
+/// The colour stage (`apply_color`) grades whatever three channel values it is handed as
+/// if they were R, G and B - no kernel performs any colour-space conversion. So the frame
+/// reaching it must be packed RGB: planar sources would give the kernel one channel at a
+/// time, and YUV sources (`AYUV64LE` included) would have exposure act as a hue rotation
+/// and saturation as a chroma shift, because U and V are offset by 0.5.
+///
+/// `None` means "do not convert": either the source is already dispatched as packed RGB
+/// and can be graded where it is, or colour cannot be baked for it at all. In the latter
+/// case the plane dispatch is left untouched and the per-plane gate in `create_planes_proc!`
+/// switches the colour stage off, so `None` is always safe.
+///
+/// Only `RGB24` and `RGBA` qualify as "already packed RGB". `RGB48BE` and `RGBA64BE` are
+/// dispatched to the `RGB16` / `RGBA16` `PixelType`s, whose fields are plain native-endian
+/// `u16` read straight out of the frame by `bytemuck`, so on a little-endian host the kernel
+/// sees every sample byte-swapped. Untouched bytes round-trip, which is why the non-baking
+/// dispatch gets away with it, but colour arithmetic on byte-swapped values produces
+/// garbage - so those two are converted like any other unsuitable source.
+///
+/// Source precision is preserved: 8-bit in, 8-bit out; anything deeper goes to 16-bit.
+/// 32-bit float sources are refused - see the note on `Pixel::RGBAF32LE` below.
+fn packed_color_format(format: Pixel) -> Option<Pixel> {
+    match format {
+        // Already dispatched as packed RGB (`RGB8` / `RGBA8`), in the host's byte order.
+        Pixel::RGB24 | Pixel::RGBA => None,
+        _ => {
+            let (depth, is_float) = format_depth(format);
+            if is_float {
+                // `Pixel::RGBAF32LE` exists and `RGBAf` is a `PixelType`, but swscale in
+                // ffmpeg 8.1 cannot *output* it ("rgbaf32le is not supported as output
+                // pixel format", "128bpp not supported by yuv2rgb"), so there is no way to
+                // get a float source into a packed RGB frame. Converting to 16-bit instead
+                // would silently throw away the source's precision, which is the one thing
+                // a float source is for. Baking is refused for these; see
+                // `swscale_still_cannot_output_packed_float`.
+                return None;
+            }
+            let target = if depth <= 8 { Pixel::RGBA } else { Pixel::RGBA64LE };
+            // A source swscale cannot read would turn a renderable file into a hard error,
+            // so fall back to not baking rather than to failing the render.
+            if !sws_supports_input(format) || !sws_supports_output(target) { return None; }
+            Some(target)
+        }
+    }
+}
+
+/// Companion to the prores videotoolbox workaround in `create_planes_proc!`, for the baking
+/// path only.
+///
+/// `ffmpeg_video.rs` tags the *encoder* limited-range for NV12 + `prores_videotoolbox` (see
+/// the matching workaround there), so the samples handed to it have to be limited-range too.
+/// Without baking the kernel does that itself, with `FIX_COLOR_RANGE` / `remap_colorrange`.
+/// Under baking the kernel only ever sees packed RGB, where a YUV range remap would be
+/// meaningless, and the conversion back to NV12 is swscale's job instead. swscale will apply
+/// exactly that range as part of the RGB->YUV matrix - but only if the destination frame
+/// declares it, so declare it. The frame then also describes what it really holds, which is
+/// what `ffmpeg_video.rs` reads if it converts again on the way to the encoder.
+///
+/// `prores_videotoolbox` only exists on macOS, so this is unreachable elsewhere. Note the
+/// encoder-side workaround also covers `dnxhd`, which never had a kernel-side counterpart;
+/// that pre-existing asymmetry is left alone here.
+fn tag_limited_range_for_prores_videotoolbox(out_frame: &mut Video, is_prores_videotoolbox: bool) {
+    if is_prores_videotoolbox && out_frame.format() == Pixel::NV12 {
+        out_frame.set_color_range(ffmpeg_next::util::color::Range::MPEG);
+    }
+}
+
+/// The colour stage is RGB-only, so it must never run on a plane that cannot carry RGB:
+/// a single-channel `Luma8` / `Luma16` / `R32f` plane or a two-channel `UV8` / `UV16` one.
+/// This is applied to every plane `create_planes_proc!` builds, so no dispatch arm can
+/// bypass it whatever the flags say.
+fn should_bake_color<T: PixelType>(bake_color: bool) -> bool {
+    bake_color && T::COUNT >= 3
+}
+
 pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &gyroflow_core::InputFile, render_options: &RenderOptions, gpu_decoder_index: i32, trim_range_ind: Option<usize>, cancel_flag: Arc<AtomicBool>, pause_flag: Arc<AtomicBool>, encoder_initialized: F2) -> Result<(), FFmpegError>
     where F: Fn((f64, usize, usize, bool, bool)) + Send + Sync + Clone,
           F2: Fn(String) + Send + Sync + Clone
@@ -421,6 +519,21 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
 
     let mut planes = Vec::<Box<dyn FnMut(i64, &mut Video, &mut Video, usize, bool)>>::new();
 
+    // Colour adjustments are baked into the render only when the user asked for it.
+    // Read once, so the decision (and the pixel format it implies) cannot change between
+    // the frame that builds the plane closures and the frames that run them.
+    // Cleared below if the source turns out not to be bakeable, so that the decision is
+    // carried by this one flag rather than by `color_convert_to` being `None` - the plane
+    // dispatch reads this, and `None` there does not by itself mean "do not grade".
+    let mut bake_color = {
+        let c = stab.color.read();
+        c.is_active() && c.bake_in_render
+    };
+    // The packed RGB format the source must be converted to for the colour stage, decided
+    // once when the planes are built and reused by the per-frame dispatch below, so the two
+    // cannot disagree about the layout the closures were built for.
+    let mut color_convert_to: Option<Pixel> = None;
+
     let is_prores_videotoolbox = proc.video_codec.as_deref() == Some("prores_videotoolbox");
 
     let progress2 = progress.clone();
@@ -496,12 +609,21 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     plane.share_wgpu_instances = true;
                     plane.set_device(stab.params.read().current_device as isize);
 
-                    // Workaround for a bug in prores videotoolbox encoder
+                    // Workaround for a bug in prores videotoolbox encoder.
+                    // Under baking `$in_frame` is the converted packed RGB frame, so this is
+                    // false and the kernel-side remap does not run - deliberately: it is a
+                    // YUV range remap and RGB has no such range. The equivalent for that path
+                    // is `tag_limited_range_for_prores_videotoolbox`, which makes swscale do
+                    // it during the conversion back to NV12.
                     if $in_frame.format() == ffmpeg_next::format::Pixel::NV12 && is_prores_videotoolbox {
                         plane.kernel_flags.set(KernelParamsFlags::FIX_COLOR_RANGE, true);
                     }
 
                     let mut compute_params = ComputeParams::from_manager(&stab);
+                    // Structural gate, applied to every plane this macro builds: the colour
+                    // stage runs only when the user asked to bake it *and* this plane can
+                    // actually carry RGB. See `should_bake_color`.
+                    compute_params.color.enabled &= should_bake_color::<$t>(bake_color);
 
                     let is_limited_range = $out_frame.color_range() == ffmpeg_next::util::color::Range::MPEG;
                     compute_params.background = <$t as PixelType>::from_rgb_color(compute_params.background, &$yuvi, is_limited_range);
@@ -556,97 +678,138 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 return Err(FFmpegError::FrameEmpty);
             }
 
-            if let Some(underlying_format) = zero_copy::map_hardware_format(format, input_frame) {
+            let is_hardware_frame = if let Some(underlying_format) = zero_copy::map_hardware_format(format, input_frame) {
                 log::debug!("HW frame ({:?}) underlying format: {:?}", format, underlying_format);
                 format = underlying_format;
+                true
+            } else {
+                false
+            };
+
+            if bake_color {
+                if is_hardware_frame {
+                    // A hardware frame's pixels are not in system memory, so swscale cannot
+                    // convert it; the zero-copy plane path is the only way to reach them.
+                    ::log::warn!("Colour baking is not supported for hardware frames ({:?}); rendering without colour adjustments", input_frame.format());
+                    bake_color = false;
+                } else {
+                    color_convert_to = packed_color_format(format);
+                    if color_convert_to.is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA) {
+                        // `packed_color_format` also returns `None` when swscale cannot
+                        // handle the format, and those sources dispatch to 3- and 4-channel
+                        // plane types that `should_bake_color` would happily grade - as YUV,
+                        // or byte-swapped. Make the warning true instead of relying on the
+                        // per-plane channel-count gate to catch it.
+                        ::log::warn!("Colour baking is not supported for {:?} sources; rendering without colour adjustments", format);
+                        bake_color = false;
+                    }
+                }
             }
-            match format {
-                Pixel::NV12 => {
-                    create_planes_proc!(planes,
-                        (Luma8, input_frame, output_frame, 0, [0], 255.0),
-                        (UV8,   input_frame, output_frame, 1, [1,2], 255.0),
-                    );
-                },
-                Pixel::NV21 => {
-                    create_planes_proc!(planes,
-                        (Luma8, input_frame, output_frame, 0, [0], 255.0),
-                        (UV8,   input_frame, output_frame, 1, [2,1], 255.0),
-                    );
-                },
-                Pixel::P010LE | Pixel::P016LE |
-                Pixel::P210LE | Pixel::P216LE |
-                Pixel::P410LE | Pixel::P416LE => {
-                    let max_val = match input_frame.format() {
-                        // I'm not sure if this is correct but it appears that P010LE uses 16-bit values, even though it's 10-bit
-                        //Pixel::P010LE | Pixel::P210LE | Pixel::P410LE => 1023.0,
-                        _ => 65535.0
-                    };
-                    create_planes_proc!(planes,
-                        (Luma16, input_frame, output_frame, 0, [0], max_val),
-                        (UV16,   input_frame, output_frame, 1, [1,2], max_val),
-                    );
-                },
-                Pixel::YUV420P | Pixel::YUVJ420P => {
-                    create_planes_proc!(planes,
-                        (Luma8, input_frame, output_frame, 0, [0], 255.0),
-                        (Luma8, input_frame, output_frame, 1, [1], 255.0),
-                        (Luma8, input_frame, output_frame, 2, [2], 255.0),
-                    );
-                },
-                Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
-                Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
-                Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE => {
-                    let max_val = match input_frame.format() {
-                        Pixel::YUV420P10LE | Pixel::YUV422P10LE | Pixel::YUV444P10LE => 1023.0,
-                        Pixel::YUV420P12LE | Pixel::YUV422P12LE | Pixel::YUV444P12LE => 4095.0,
-                        Pixel::YUV420P14LE | Pixel::YUV422P14LE | Pixel::YUV444P14LE => 16383.0,
-                        _ => 65535.0
-                    };
-                    create_planes_proc!(planes,
-                        (Luma16, input_frame, output_frame, 0, [0], max_val),
-                        (Luma16, input_frame, output_frame, 1, [1], max_val),
-                        (Luma16, input_frame, output_frame, 2, [2], max_val),
-                    );
-                },
-                Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE => {
-                    let max_val = match input_frame.format() {
-                        Pixel::YUVA444P10LE => 1023.0,
-                        Pixel::YUVA444P12LE => 4095.0,
-                        _ => 65535.0
-                    };
-                    create_planes_proc!(planes,
-                        (Luma16, input_frame, output_frame, 0, [0], max_val),
-                        (Luma16, input_frame, output_frame, 1, [1], max_val),
-                        (Luma16, input_frame, output_frame, 2, [2], max_val),
-                        (Luma16, input_frame, output_frame, 3, [3], max_val),
-                    );
-                },
-                Pixel::GBRAPF32LE => { create_planes_proc!(planes,
-                    (R32f,  input_frame, output_frame, 0, [2], 255.0),
-                    (R32f,  input_frame, output_frame, 0, [0], 255.0),
-                    (R32f,  input_frame, output_frame, 0, [1], 255.0),
-                    (R32f,  input_frame, output_frame, 0, [3], 255.0),
-                ); },
-                Pixel::GBRPF32LE => { create_planes_proc!(planes,
-                    (R32f,  input_frame, output_frame, 0, [2], 255.0),
-                    (R32f,  input_frame, output_frame, 0, [0], 255.0),
-                    (R32f,  input_frame, output_frame, 0, [1], 255.0),
-                ); },
-                Pixel::AYUV64LE => { create_planes_proc!(planes, (AYUV16, input_frame, output_frame, 0, [3,0,1,2], 65535.0), ); },
-                Pixel::RGB24    => { create_planes_proc!(planes, (RGB8,   input_frame, output_frame, 0, [], 255.0), ); },
-                Pixel::RGBA     => { create_planes_proc!(planes, (RGBA8,  input_frame, output_frame, 0, [], 255.0), ); },
-                Pixel::RGB48BE  => { create_planes_proc!(planes, (RGB16,  input_frame, output_frame, 0, [], 65535.0), ); },
-                Pixel::RGBA64BE => { create_planes_proc!(planes, (RGBA16, input_frame, output_frame, 0, [], 65535.0), ); },
-                format => { // All other convert to YUV444P16LE
-                    ::log::info!("Unknown format {:?}, converting to YUV444P16LE", format);
-                    // Go through 4:4:4 because of even plane dimensions
-                    converter.convert_pixel_format(input_frame, output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
+
+            if let Some(target) = color_convert_to {
+                // Baking: the colour stage grades R, G and B of one pixel at once, so the
+                // frame it sees must be packed RGB. `packed_color_format` picks the target
+                // and guarantees it is one of these two.
+                ::log::info!("Baking colour adjustments: converting {:?} to {:?}", format, target);
+                // Must happen before the first conversion: the swscale contexts read the
+                // frame's range when they are built, and they are cached from then on.
+                tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
+                converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
+                    if target == Pixel::RGBA {
+                        create_planes_proc!(planes, (RGBA8,  converted_frame, converted_output, 0, [], 255.0), );
+                    } else {
+                        create_planes_proc!(planes, (RGBA16, converted_frame, converted_output, 0, [], 65535.0), );
+                    }
+                })?;
+            } else {
+                match format {
+                    Pixel::NV12 => {
                         create_planes_proc!(planes,
-                            (Luma16, converted_frame, converted_output, 0, [0], 65535.0),
-                            (Luma16, converted_frame, converted_output, 1, [1], 65535.0),
-                            (Luma16, converted_frame, converted_output, 2, [2], 65535.0),
+                            (Luma8, input_frame, output_frame, 0, [0], 255.0),
+                            (UV8,   input_frame, output_frame, 1, [1,2], 255.0),
                         );
-                    })?;
+                    },
+                    Pixel::NV21 => {
+                        create_planes_proc!(planes,
+                            (Luma8, input_frame, output_frame, 0, [0], 255.0),
+                            (UV8,   input_frame, output_frame, 1, [2,1], 255.0),
+                        );
+                    },
+                    Pixel::P010LE | Pixel::P016LE |
+                    Pixel::P210LE | Pixel::P216LE |
+                    Pixel::P410LE | Pixel::P416LE => {
+                        let max_val = match input_frame.format() {
+                            // I'm not sure if this is correct but it appears that P010LE uses 16-bit values, even though it's 10-bit
+                            //Pixel::P010LE | Pixel::P210LE | Pixel::P410LE => 1023.0,
+                            _ => 65535.0
+                        };
+                        create_planes_proc!(planes,
+                            (Luma16, input_frame, output_frame, 0, [0], max_val),
+                            (UV16,   input_frame, output_frame, 1, [1,2], max_val),
+                        );
+                    },
+                    Pixel::YUV420P | Pixel::YUVJ420P => {
+                        create_planes_proc!(planes,
+                            (Luma8, input_frame, output_frame, 0, [0], 255.0),
+                            (Luma8, input_frame, output_frame, 1, [1], 255.0),
+                            (Luma8, input_frame, output_frame, 2, [2], 255.0),
+                        );
+                    },
+                    Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
+                    Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
+                    Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE => {
+                        let max_val = match input_frame.format() {
+                            Pixel::YUV420P10LE | Pixel::YUV422P10LE | Pixel::YUV444P10LE => 1023.0,
+                            Pixel::YUV420P12LE | Pixel::YUV422P12LE | Pixel::YUV444P12LE => 4095.0,
+                            Pixel::YUV420P14LE | Pixel::YUV422P14LE | Pixel::YUV444P14LE => 16383.0,
+                            _ => 65535.0
+                        };
+                        create_planes_proc!(planes,
+                            (Luma16, input_frame, output_frame, 0, [0], max_val),
+                            (Luma16, input_frame, output_frame, 1, [1], max_val),
+                            (Luma16, input_frame, output_frame, 2, [2], max_val),
+                        );
+                    },
+                    Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE => {
+                        let max_val = match input_frame.format() {
+                            Pixel::YUVA444P10LE => 1023.0,
+                            Pixel::YUVA444P12LE => 4095.0,
+                            _ => 65535.0
+                        };
+                        create_planes_proc!(planes,
+                            (Luma16, input_frame, output_frame, 0, [0], max_val),
+                            (Luma16, input_frame, output_frame, 1, [1], max_val),
+                            (Luma16, input_frame, output_frame, 2, [2], max_val),
+                            (Luma16, input_frame, output_frame, 3, [3], max_val),
+                        );
+                    },
+                    Pixel::GBRAPF32LE => { create_planes_proc!(planes,
+                        (R32f,  input_frame, output_frame, 0, [2], 255.0),
+                        (R32f,  input_frame, output_frame, 0, [0], 255.0),
+                        (R32f,  input_frame, output_frame, 0, [1], 255.0),
+                        (R32f,  input_frame, output_frame, 0, [3], 255.0),
+                    ); },
+                    Pixel::GBRPF32LE => { create_planes_proc!(planes,
+                        (R32f,  input_frame, output_frame, 0, [2], 255.0),
+                        (R32f,  input_frame, output_frame, 0, [0], 255.0),
+                        (R32f,  input_frame, output_frame, 0, [1], 255.0),
+                    ); },
+                    Pixel::AYUV64LE => { create_planes_proc!(planes, (AYUV16, input_frame, output_frame, 0, [3,0,1,2], 65535.0), ); },
+                    Pixel::RGB24    => { create_planes_proc!(planes, (RGB8,   input_frame, output_frame, 0, [], 255.0), ); },
+                    Pixel::RGBA     => { create_planes_proc!(planes, (RGBA8,  input_frame, output_frame, 0, [], 255.0), ); },
+                    Pixel::RGB48BE  => { create_planes_proc!(planes, (RGB16,  input_frame, output_frame, 0, [], 65535.0), ); },
+                    Pixel::RGBA64BE => { create_planes_proc!(planes, (RGBA16, input_frame, output_frame, 0, [], 65535.0), ); },
+                    format => { // All other convert to YUV444P16LE
+                        ::log::info!("Unknown format {:?}, converting to YUV444P16LE", format);
+                        // Go through 4:4:4 because of even plane dimensions
+                        converter.convert_pixel_format(input_frame, output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
+                            create_planes_proc!(planes,
+                                (Luma16, converted_frame, converted_output, 0, [0], 65535.0),
+                                (Luma16, converted_frame, converted_output, 1, [1], 65535.0),
+                                (Luma16, converted_frame, converted_output, 2, [2], 65535.0),
+                            );
+                        })?;
+                    }
                 }
             }
         }
@@ -661,22 +824,32 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             progress2((process_frame as f64 / render_frame_count as f64, process_frame, render_frame_count, false, false));
         };
 
-        match input_frame.format() {
-            Pixel::VIDEOTOOLBOX | // Pixel::D3D11 |
-            Pixel::NV12 | Pixel::NV21 | Pixel::YUV420P | Pixel::YUVJ420P |
-            Pixel::P010LE | Pixel::P016LE | Pixel::P210LE | Pixel::P216LE | Pixel::P410LE | Pixel::P416LE |
-            Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
-            Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
-            Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE |
-            Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE |
-            Pixel::AYUV64LE | Pixel::GBRAPF32LE | Pixel::GBRPF32LE |
-            Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE => {
-                undistort_frame(input_frame, output_frame)
-            },
-            _ => {
-                converter.convert_pixel_format(input_frame, output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
-                    undistort_frame(converted_frame, converted_output);
-                })?;
+        if let Some(target) = color_convert_to {
+            // The plane closures above were built for this converted packed RGB frame, so
+            // the frame handed to them must go through the same conversion. `color_convert_to`
+            // is the one value both decisions read, so they cannot disagree.
+            tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
+            converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
+                undistort_frame(converted_frame, converted_output);
+            })?;
+        } else {
+            match input_frame.format() {
+                Pixel::VIDEOTOOLBOX | // Pixel::D3D11 |
+                Pixel::NV12 | Pixel::NV21 | Pixel::YUV420P | Pixel::YUVJ420P |
+                Pixel::P010LE | Pixel::P016LE | Pixel::P210LE | Pixel::P216LE | Pixel::P410LE | Pixel::P416LE |
+                Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
+                Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
+                Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE |
+                Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE |
+                Pixel::AYUV64LE | Pixel::GBRAPF32LE | Pixel::GBRPF32LE |
+                Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE => {
+                    undistort_frame(input_frame, output_frame)
+                },
+                _ => {
+                    converter.convert_pixel_format(input_frame, output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
+                        undistort_frame(converted_frame, converted_output);
+                    })?;
+                }
             }
         }
 
@@ -981,3 +1154,83 @@ pub fn test_decode() {
     let _ = proc.start_decoder_only(vec![(0.0, 1000.0)], Arc::new(AtomicBool::new(false)));
     ::log::debug!("Done in {:.3} ms", _time.elapsed().as_micros() as f64 / 1000.0);
 }*/
+
+#[cfg(test)]
+mod packed_color_format_tests {
+    use super::*;
+
+    /// The two formats the baking path converts into must be writable by swscale, and a
+    /// real conversion into each must run - `sws_isSupportedOutput` alone is only a claim.
+    #[test]
+    fn swscale_can_output_the_packed_rgb_formats_we_bake_into() {
+        for target in [Pixel::RGBA, Pixel::RGBA64LE] {
+            assert!(sws_supports_output(target), "swscale cannot output {target:?}");
+
+            let mut ctx = ffmpeg_next::software::scaling::Context::get(
+                Pixel::YUV420P, 64, 64, target, 64, 64,
+                ffmpeg_next::software::scaling::Flags::BILINEAR
+            ).unwrap_or_else(|e| panic!("YUV420P -> {target:?} Context::get failed: {e:?}"));
+
+            let mut src = Video::new(Pixel::YUV420P, 64, 64);
+            let mut dst = Video::new(target, 64, 64);
+            for p in 0..3 { for b in src.data_mut(p).iter_mut() { *b = 128; } }
+            ctx.run(&mut src, &mut dst).unwrap_or_else(|e| panic!("YUV420P -> {target:?} run() failed: {e:?}"));
+        }
+    }
+
+    /// OQ1. `Pixel::RGBAF32LE` exists and `RGBAf` is a `PixelType`, but swscale in ffmpeg
+    /// 8.1 refuses it as an *output* format ("rgbaf32le is not supported as output pixel
+    /// format" / "128bpp not supported by yuv2rgb"), which is why `packed_color_format`
+    /// refuses to bake colour for float sources. If this test ever starts failing, swscale
+    /// has gained support and the float path can be implemented.
+    #[test]
+    fn swscale_still_cannot_output_packed_float() {
+        assert!(!sws_supports_output(Pixel::RGBAF32LE));
+        assert!(ffmpeg_next::software::scaling::Context::get(
+            Pixel::YUV420P, 64, 64, Pixel::RGBAF32LE, 64, 64,
+            ffmpeg_next::software::scaling::Flags::BILINEAR
+        ).is_err());
+    }
+
+    #[test]
+    fn packed_color_format_preserves_source_precision() {
+        // 8-bit sources -> 8-bit packed RGB.
+        for f in [Pixel::NV12, Pixel::NV21, Pixel::YUV420P, Pixel::YUVJ420P, Pixel::YUYV422] {
+            assert_eq!(packed_color_format(f), Some(Pixel::RGBA), "{f:?}");
+        }
+        // Deeper integer sources -> 16-bit packed RGB. AYUV64LE is packed, but it is YUV,
+        // so it must be converted too. RGB48BE / RGBA64BE are packed RGB already, but in the
+        // wrong byte order for the native-endian `RGB16` / `RGBA16` kernel types, so they are
+        // converted as well - swscale does the byte swap and the kernel grades real values.
+        for f in [Pixel::P010LE, Pixel::P016LE, Pixel::YUV420P10LE, Pixel::YUV444P12LE, Pixel::YUVA444P16LE, Pixel::AYUV64LE, Pixel::RGB48BE, Pixel::RGBA64BE] {
+            assert_eq!(packed_color_format(f), Some(Pixel::RGBA64LE), "{f:?}");
+        }
+        // Already dispatched as packed RGB in native byte order - graded in place.
+        for f in [Pixel::RGB24, Pixel::RGBA] {
+            assert_eq!(packed_color_format(f), None, "{f:?}");
+        }
+        // Float sources - refused, see `swscale_still_cannot_output_packed_float`.
+        for f in [Pixel::GBRPF32LE, Pixel::GBRAPF32LE] {
+            assert_eq!(packed_color_format(f), None, "{f:?}");
+        }
+    }
+
+    /// The gate that keeps the RGB colour stage off planes that cannot carry RGB.
+    #[test]
+    fn color_stage_is_refused_on_planes_that_cannot_carry_rgb() {
+        assert!(!should_bake_color::<Luma8>(true));
+        assert!(!should_bake_color::<Luma16>(true));
+        assert!(!should_bake_color::<R32f>(true));
+        assert!(!should_bake_color::<UV8>(true));
+        assert!(!should_bake_color::<UV16>(true));
+
+        assert!(should_bake_color::<RGB8>(true));
+        assert!(should_bake_color::<RGBA8>(true));
+        assert!(should_bake_color::<RGB16>(true));
+        assert!(should_bake_color::<RGBA16>(true));
+
+        // And nothing is graded when the user did not ask for baking.
+        assert!(!should_bake_color::<RGBA8>(false));
+        assert!(!should_bake_color::<RGBA16>(false));
+    }
+}

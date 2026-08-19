@@ -14,6 +14,7 @@ mod lens;        pub use lens::*;
 mod background;  pub use background::*;
 mod interpolate; pub use interpolate::*;
 mod distortion_models; pub use distortion_models::*;
+pub mod color;
 
 pub use spirv_std::glam;
 use glam::{ vec2, vec4, Vec4 };

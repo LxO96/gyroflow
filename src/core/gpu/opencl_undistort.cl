@@ -51,6 +51,9 @@ typedef struct {
     float reserved2;                 // 16
     float4 ewa_coeffs_p;             // 16
     float4 ewa_coeffs_q;             // 16
+    float4 color_params_1;           // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
+    float4 color_params_2;           // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
+    float4 color_params_3;           // 16 - lut_domain_min, lut_domain_max, unused, unused
 } KernelParams;
 
 #if INTERPOLATION == 2 // Bilinear
@@ -158,6 +161,97 @@ DATA_TYPEF remap_colorrange(DATA_TYPEF px, bool isY, __global KernelParams *para
     if (isY) { return ((16.0f / 255.0f) * params->max_pixel_value) + (px * 0.85882352f); } // (235 - 16) / 255
     else     { return ((16.0f / 255.0f) * params->max_pixel_value) + (px * 0.87843137f); } // (240 - 16) / 255
 }
+////////////////////////////// Colour adjustments //////////////////////////////
+// This arithmetic is a deliberate, ratified duplicate of `crate::color::apply_color`
+// (src/core/color/mod.rs) and `crate::color::sample_trilinear` (src/core/color/lut.rs).
+// Every operation, and their order, must stay identical to the Rust reference - the
+// explicit `a + (b - a) * t` lerps below mirror the Rust source exactly and must not be
+// rewritten as `mix()`, which evaluates `a * (1 - t) + b * t` and is not bit-identical.
+// Likewise the luma sum must stay an explicit left-associated sum, not `dot()`, which may
+// contract to an FMA chain with different rounding.
+//
+// LUT_DATA_OFFSET is mirrored from `LUT_DATA_OFFSET` in src/core/stabilization/mod.rs
+// (it equals COEFFS.len()); a change there must be made here too.
+// Note: `lut_coeffs` is a separate buffer from the file-scope `__constant float coeffs[]`
+// interpolation table, which stays compiled into this kernel - the name must not collide.
+//
+// `lut_coeffs` carries no length, so the LUT reads below are bounds-safe only because the
+// buffer and `color_params_2.w` (the LUT size) are built from the same `Lut3D`: opencl.rs
+// sizes `buf_coeffs` with `build_coeffs_buffer(lut)` and frame_transform.rs fills
+// `color_params_2.w` from `lut.size`, and a LUT change forces a fresh OclWrapper via
+// `Stabilization::get_current_key`. Do not set one without the other.
+//
+// These functions carry no storage-class specifier, matching the rest of this file:
+// OpenCL C 1.2 6.8 lists `static` among the unsupported specifiers, and no -cl-std is
+// passed when the program is built.
+#define LUT_DATA_OFFSET 488
+
+float3 lerp3(float3 a, float3 b, float t) {
+    return a + (b - a) * t;
+}
+
+float3 lut_fetch(__global const float *lut_coeffs, int r, int g, int b, int n) {
+    int rc = clamp(r, 0, n - 1);
+    int gc = clamp(g, 0, n - 1);
+    int bc = clamp(b, 0, n - 1);
+    int idx = LUT_DATA_OFFSET + (bc * n * n + gc * n + rc) * 3;
+    return (float3)(lut_coeffs[idx], lut_coeffs[idx + 1], lut_coeffs[idx + 2]);
+}
+
+float3 lut_sample(__global const float *lut_coeffs, float3 rgb, int n, float domain_min, float domain_max) {
+    float scale = 1.0f / fmax(domain_max - domain_min, 1e-9f);
+    float3 normalized = clamp((rgb - (float3)(domain_min)) * scale, (float3)(0.0f), (float3)(1.0f));
+    float3 pos = normalized * (float)(n - 1);
+    int3 base = clamp(convert_int3(floor(pos)), (int3)(0), (int3)(n - 1));
+    float3 f = pos - convert_float3(base);
+
+    float3 c000 = lut_fetch(lut_coeffs, base.x,     base.y,     base.z,     n);
+    float3 c100 = lut_fetch(lut_coeffs, base.x + 1, base.y,     base.z,     n);
+    float3 c010 = lut_fetch(lut_coeffs, base.x,     base.y + 1, base.z,     n);
+    float3 c110 = lut_fetch(lut_coeffs, base.x + 1, base.y + 1, base.z,     n);
+    float3 c001 = lut_fetch(lut_coeffs, base.x,     base.y,     base.z + 1, n);
+    float3 c101 = lut_fetch(lut_coeffs, base.x + 1, base.y,     base.z + 1, n);
+    float3 c011 = lut_fetch(lut_coeffs, base.x,     base.y + 1, base.z + 1, n);
+    float3 c111 = lut_fetch(lut_coeffs, base.x + 1, base.y + 1, base.z + 1, n);
+
+    float3 c00 = lerp3(c000, c100, f.x);
+    float3 c10 = lerp3(c010, c110, f.x);
+    float3 c01 = lerp3(c001, c101, f.x);
+    float3 c11 = lerp3(c011, c111, f.x);
+    float3 c0  = lerp3(c00, c10, f.y);
+    float3 c1  = lerp3(c01, c11, f.y);
+    return lerp3(c0, c1, f.z);
+}
+
+float4 apply_color(float4 px, __global const float *lut_coeffs, __global KernelParams *params) {
+    float max_value = params->max_pixel_value;
+    float inv_max = max_value > 0.0f ? 1.0f / max_value : 1.0f;
+    float3 c = px.xyz * inv_max;
+
+    // 1. LUT, blended by strength
+    int lut_size = (int)params->color_params_2.w;
+    float lut_strength = params->color_params_1.w;
+    if ((params->flags & 8192) && lut_size >= 2 && lut_strength > 0.0f) {
+        float3 graded = lut_sample(lut_coeffs, c, lut_size, params->color_params_3.x, params->color_params_3.y);
+        c = c + (graded - c) * lut_strength;
+    }
+
+    // 2. Exposure
+    c = c * params->color_params_1.x;
+
+    // 3. White balance
+    c = c * params->color_params_2.xyz;
+
+    // 4. Contrast around mid grey
+    c = (c - (float3)(0.5f)) * params->color_params_1.y + (float3)(0.5f);
+
+    // 5. Saturation around luma
+    float luma = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    c = (float3)(luma) + (c - (float3)(luma)) * params->color_params_1.z;
+
+    return (float4)(c * max_value, px.w);
+}
+////////////////////////////// Colour adjustments //////////////////////////////
 float map_coord(float x, float in_min, float in_max, float out_min, float out_max) {
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
@@ -303,7 +397,7 @@ inline float bc2(float x, __global KernelParams *params) {
 #endif
 ////////////////////////////// EWA (Elliptical Weighted Average) CubicBC sampling //////////////////////////////
 
-DATA_TYPEF sample_input_at(float2 uv, float4 jac, __global const uchar *srcptr, __global KernelParams *params, __global const uchar *drawing, DATA_TYPEF bg) {
+DATA_TYPEF sample_input_at(float2 uv, float4 jac, __global const uchar *srcptr, __global KernelParams *params, __global const uchar *drawing, DATA_TYPEF bg, __global const float *lut_coeffs) {
     bool fix_range = (params->flags & 1);
 
     DATA_TYPEF sum = 0;
@@ -386,6 +480,16 @@ DATA_TYPEF sample_input_at(float2 uv, float4 jac, __global const uchar *srcptr, 
         }
 #   endif
 
+    if ((params->flags & 4096)) {
+        // `sum` is DATA_TYPEF, which is float, float2 or float4 depending on the pixel
+        // format. Widen through a float4 the same way `bg` is punned above, apply the
+        // colour stage, then narrow back - identical to the CPU path, which always works
+        // on a Vector4<f32> regardless of the plane's channel count.
+        float4 color_px = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        *(DATA_TYPEF *)&color_px = sum;
+        color_px = apply_color(color_px, lut_coeffs, params);
+        sum = *(DATA_TYPEF *)&color_px;
+    }
     if (fix_range) {
         sum = remap_colorrange(sum, params->plane_index == 0, params);
     }
@@ -579,7 +683,10 @@ float2 undistort_coord(float2 out_pos, __global KernelParams *params, __global c
 // Adapted from OpenCV: initUndistortRectifyMap + remap
 // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/calib3d/src/fisheye.cpp#L465-L567
 // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/imgproc/src/opencl/remap.cl#L390-L498
-__kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstptr, __global const void *params_buf, __global const float *matrices, __global const uchar *drawing, __global const float *mesh_data) {
+// Argument order must match the `set_arg`/`builder.arg()` order in src/core/gpu/opencl.rs
+// exactly: 0 srcptr, 1 dstptr, 2 params_buf, 3 matrices, 4 drawing, 5 mesh_data, 6 lut_coeffs.
+// A mismatch is a silent runtime failure, not a compile error.
+__kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstptr, __global const void *params_buf, __global const float *matrices, __global const uchar *drawing, __global const float *mesh_data, __global const float *lut_coeffs) {
     int buf_x = get_global_id(0);
     int buf_y = get_global_id(1);
 
@@ -638,8 +745,8 @@ __kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstp
                 pt2.x = map_coord(pt2.x, 0.0f, (float)frame_size.x, (float)params->source_rect.x, (float)(params->source_rect.x + params->source_rect.z));
                 pt2.y = map_coord(pt2.y, 0.0f, (float)frame_size.y, (float)params->source_rect.y, (float)(params->source_rect.y + params->source_rect.w));
 
-                DATA_TYPEF c1 = sample_input_at(uv,  jac, srcptr, params, drawing, bg);
-                DATA_TYPEF c2 = sample_input_at(pt2, jac, srcptr, params, drawing, bg); // FIXME: jac should be adjusted for pt2
+                DATA_TYPEF c1 = sample_input_at(uv,  jac, srcptr, params, drawing, bg, lut_coeffs);
+                DATA_TYPEF c2 = sample_input_at(pt2, jac, srcptr, params, drawing, bg, lut_coeffs); // FIXME: jac should be adjusted for pt2
                 final_pix = DATA_CONVERT(c1 * alpha + c2 * (1.0f - alpha));
                 draw_pixel(&final_pix, x, y, false, max(params->width, params->output_width), params, drawing);
                 draw_safe_area(&final_pix, x, y, params);
@@ -647,7 +754,7 @@ __kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstp
                 return;
             }
 
-            final_pix = DATA_CONVERT(sample_input_at(uv, jac, srcptr, params, drawing, bg));
+            final_pix = DATA_CONVERT(sample_input_at(uv, jac, srcptr, params, drawing, bg, lut_coeffs));
         } else {
             final_pix = DATA_CONVERT(bg);
         }

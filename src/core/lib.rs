@@ -13,6 +13,7 @@ pub mod stabilization;
 pub mod camera_identifier;
 pub mod keyframes;
 pub mod stmap;
+pub mod color;
 
 pub mod zooming;
 pub mod smoothing;
@@ -83,6 +84,7 @@ pub struct StabilizationManager {
     pub gyro: Arc<RwLock<GyroSource>>,
     pub lens: Arc<RwLock<LensProfile>>,
     pub smoothing: Arc<RwLock<Smoothing>>,
+    pub color: Arc<RwLock<color::ColorAdjustments>>,
 
     pub stabilization: Arc<RwLock<Stabilization>>,
 
@@ -116,6 +118,7 @@ impl Default for StabilizationManager {
         util::init_telemetry_parser();
         Self {
             smoothing: Arc::new(RwLock::new(Smoothing::default())),
+            color: Arc::new(RwLock::new(color::ColorAdjustments::default())),
 
             params: Arc::new(RwLock::new(StabilizationParams::default())),
 
@@ -1280,6 +1283,29 @@ impl StabilizationManager {
 
         let input_file = self.input_file.read().clone();
 
+        let color = {
+            let c = self.color.read();
+            serde_json::json!({
+                "enabled":                c.enabled,
+                "bake_in_render":         c.bake_in_render,
+                "exposure":               c.exposure,
+                "contrast":               c.contrast,
+                "saturation":             c.saturation,
+                "source_kelvin":          c.source_kelvin,
+                "source_kelvin_detected": c.source_kelvin_detected,
+                "target_kelvin":          c.target_kelvin,
+                "tint":                   c.tint,
+                "lut_strength":           c.lut_strength,
+                "lut_path":               c.lut_path,
+                "lut_name":               c.lut_name,
+                // Embedded fallback, so the project still grades identically if the
+                // .cube file moves, is deleted, or the project travels to another machine.
+                // The checksum is deliberately not stored - it's recomputed from the data
+                // on import so it can never disagree with it.
+                "lut_data":               c.lut.as_ref().and_then(|l| util::compress_to_base91_cbor(&(l.size, l.domain_min, l.domain_max, &l.data))),
+            })
+        };
+
         let trim_ranges_ms = params.trim_ranges.iter().map(|(a, b)| (a * params.duration_ms, b * params.duration_ms)).collect::<Vec<_>>();
 
         let mut obj = serde_json::json!({
@@ -1352,6 +1378,8 @@ impl StabilizationManager {
                 "sample_index":       gyro.file_load_options.sample_index,
                 "detected_source":    gyro.file_metadata.read().detected_source,
             },
+
+            "color": color,
 
             "offsets": gyro.get_offsets(), // timestamp, offset value
             "keyframes": self.keyframes.read().serialize(),
@@ -1742,6 +1770,85 @@ impl StabilizationManager {
 
                 obj.remove("adaptive_zoom_fovs");
             }
+            if let Some(serde_json::Value::Object(obj)) = obj.get("color") {
+                let mut c = self.color.write();
+                if let Some(v) = obj.get("enabled")               .and_then(|x| x.as_bool()) { c.enabled                = v; }
+                if let Some(v) = obj.get("bake_in_render")        .and_then(|x| x.as_bool()) { c.bake_in_render         = v; }
+                // Clamped to the ranges the rest of the code already treats as valid, so a
+                // hand-edited or corrupted project can't produce a nonsensical grade. The
+                // ranges live in `ColorAdjustments::set_param`, shared with the QML entry
+                // point in `Controller::set_color_param`.
+                for key in ["exposure", "contrast", "saturation", "source_kelvin", "target_kelvin", "tint", "lut_strength"] {
+                    if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { c.set_param(key, v); }
+                }
+                if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
+                let new_lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
+                let new_lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
+                let has_lut_data = obj.get("lut_data").and_then(|x| x.as_str()).is_some_and(|x| !x.is_empty());
+
+                // A project file is the complete state, so it may legitimately say "no LUT".
+                // A preset is an overlay applied on top of whatever the user already has, and
+                // a preset authored on another machine carries a `lut_path` that doesn't
+                // resolve here. Neither case may cost the user a LUT they loaded by hand
+                // without being told, so a preset only touches the LUT fields when it actually
+                // carries one, and only commits them once that one has resolved.
+                let carries_lut = new_lut_path.is_some() || new_lut_name.is_some() || has_lut_data;
+                if !*is_preset || carries_lut {
+                    // Prefer the file on disk, so an edited .cube is picked up; fall back to the embedded copy.
+                    let from_path = new_lut_path.as_ref()
+                        .map(|p| if p.contains("://") { p.clone() } else { filesystem::path_to_url(p) })
+                        .and_then(|url| filesystem::read_to_string(&url).ok())
+                        .and_then(|text| color::parse_cube(&text).ok());
+
+                    let from_embedded = || {
+                        obj.get("lut_data").and_then(|x| x.as_str())
+                           .and_then(|s| util::decompress_from_base91_cbor::<(u32, f32, f32, Vec<f32>)>(s).ok())
+                           // A blob can decode cleanly and still be self-inconsistent. Enforce exactly
+                           // what `parse_cube` enforces (color/lut.rs) - a `size` that disagrees with
+                           // `data` indexes out of bounds in `sample_trilinear` and reads past the GPU
+                           // coefficient buffer, and a non-finite value NaNs every pixel silently.
+                           // Rejecting here falls through to the "LUT absent" arm below, so a corrupt
+                           // project still opens.
+                           .filter(|(size, domain_min, domain_max, data)| {
+                                (2..=64).contains(size)
+                                && data.len() / 3 == (*size as usize).pow(3) && data.len() % 3 == 0
+                                && domain_min.is_finite() && domain_max.is_finite()
+                                && data.iter().all(|v| v.is_finite())
+                           })
+                           .map(|(size, domain_min, domain_max, data)| {
+                                // Recomputed rather than stored, so `checksum` can never disagree with
+                                // `data` - `get_current_key` and every backend's GPU cache depend on it.
+                                let checksum = crc32fast::hash(bytemuck::cast_slice(&data));
+                                color::Lut3D { size, domain_min, domain_max, data, checksum }
+                           })
+                    };
+
+                    match from_path.or_else(from_embedded) {
+                        Some(lut) => {
+                            c.lut_path = new_lut_path;
+                            c.lut_name = new_lut_name;
+                            c.lut = Some(std::sync::Arc::new(lut));
+                        }
+                        None if *is_preset => {
+                            // The preset named a LUT that doesn't resolve on this machine. Keep
+                            // what the user has - `lut`, `lut_path` and `lut_name` are all left
+                            // untouched. The UI notices the mismatch between the preset's
+                            // `lut_name` and `Controller::get_lut_name` and says so.
+                            ::log::warn!("Preset LUT '{}' could not be loaded, keeping the currently loaded LUT",
+                                         new_lut_name.as_deref().unwrap_or("<unnamed>"));
+                        }
+                        None => {
+                            c.lut_path = new_lut_path;
+                            c.lut_name = new_lut_name;
+                            // A missing LUT must never make a project unopenable - load without it.
+                            if let Some(name) = c.lut_name.as_deref() {
+                                ::log::warn!("LUT '{name}' could not be loaded, continuing without it");
+                            }
+                            c.lut = None;
+                        }
+                    }
+                }
+            }
             if let Some(serde_json::Value::Object(obj)) = obj.get_mut("output") {
                 if let Some(w) =  obj.get("output_width").and_then(|x| x.as_u64()) {
                     if let Some(h) =  obj.get("output_height").and_then(|x| x.as_u64()) {
@@ -2127,6 +2234,9 @@ pub enum GyroflowCoreError {
     #[error("Invalid data")]
     InvalidData,
 
+    #[error("LUT error: {0}")]
+    Lut(#[from] crate::color::LutError),
+
     #[error("JSON error {0:?}")]
     JSONError(#[from] serde_json::Error),
 
@@ -2138,4 +2248,388 @@ pub enum GyroflowCoreError {
 
     #[error("Unknown error")]
     Unknown
+}
+
+#[cfg(test)]
+mod color_project_tests {
+    use super::*;
+
+    // Smallest valid LUT: 2³ = 8 entries. Deliberately not the identity, so a
+    // silently-dropped LUT can't pass by accident.
+    const CUBE_2: &str = "\
+TITLE \"round-trip\"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.0 0.0 0.0
+DOMAIN_MAX 1.0 1.0 1.0
+0.00 0.01 0.02
+0.10 0.11 0.12
+0.20 0.21 0.22
+0.30 0.31 0.32
+0.40 0.41 0.42
+0.50 0.51 0.52
+0.60 0.61 0.62
+0.70 0.71 0.72
+";
+
+    fn write_temp_cube(name: &str, contents: &str) -> String {
+        let path = std::env::temp_dir().join(format!("gyroflow_test_{}_{}.cube", name, fastrand::u32(..)));
+        std::fs::write(&path, contents).unwrap();
+        filesystem::path_to_url(&path.to_string_lossy())
+    }
+
+    /// A manager with every colour field set to a non-default value.
+    fn configured_manager(lut_path: Option<String>) -> StabilizationManager {
+        let mgr = StabilizationManager::default();
+        {
+            let mut c = mgr.color.write();
+            c.enabled = true;
+            c.bake_in_render = true;
+            c.exposure = 0.75;
+            c.contrast = -0.25;
+            c.saturation = 0.5;
+            c.source_kelvin = 5200.0;
+            c.source_kelvin_detected = true;
+            c.target_kelvin = 6200.0;
+            c.tint = 0.125;
+            c.lut_strength = 0.8;
+            c.lut = Some(std::sync::Arc::new(color::parse_cube(CUBE_2).unwrap()));
+            c.lut_path = lut_path;
+            c.lut_name = Some("round-trip.cube".into());
+        }
+        mgr
+    }
+
+    fn round_trip(mgr: &StabilizationManager) -> StabilizationManager {
+        let json = mgr.export_gyroflow_data(GyroflowProjectType::WithGyroData, "{}", None).unwrap();
+        let restored = StabilizationManager::default();
+        let mut is_preset = false;
+        restored.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        restored
+    }
+
+    fn assert_scalars_match(a: &color::ColorAdjustments, b: &color::ColorAdjustments) {
+        assert_eq!(b.enabled,                a.enabled);
+        assert_eq!(b.bake_in_render,         a.bake_in_render);
+        assert_eq!(b.exposure,               a.exposure);
+        assert_eq!(b.contrast,               a.contrast);
+        assert_eq!(b.saturation,             a.saturation);
+        assert_eq!(b.source_kelvin,          a.source_kelvin);
+        assert_eq!(b.source_kelvin_detected, a.source_kelvin_detected);
+        assert_eq!(b.target_kelvin,          a.target_kelvin);
+        assert_eq!(b.tint,                   a.tint);
+        assert_eq!(b.lut_strength,           a.lut_strength);
+        assert_eq!(b.lut_name,               a.lut_name);
+    }
+
+    #[test]
+    fn color_section_round_trips_without_a_lut_path() {
+        let mgr = configured_manager(None);
+        let restored = round_trip(&mgr);
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_scalars_match(&a, &b);
+        assert_eq!(b.lut_path, None);
+
+        let la = a.lut.as_ref().unwrap();
+        let lb = b.lut.as_ref().unwrap();
+        assert_eq!(lb.size,       la.size);
+        assert_eq!(lb.domain_min, la.domain_min);
+        assert_eq!(lb.domain_max, la.domain_max);
+        assert_eq!(lb.data,       la.data);
+        assert_eq!(lb.checksum,   la.checksum);
+    }
+
+    #[test]
+    fn lut_is_reloaded_from_its_path_when_it_resolves() {
+        // The file on disk differs from the embedded copy, so this proves which one won.
+        let on_disk = CUBE_2.replace("0.70 0.71 0.72", "0.77 0.78 0.79");
+        let url = write_temp_cube("present", &on_disk);
+        let mgr = configured_manager(Some(url.clone()));
+        let restored = round_trip(&mgr);
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_scalars_match(&a, &b);
+        assert_eq!(b.lut_path.as_deref(), Some(url.as_str()));
+
+        let expected = color::parse_cube(&on_disk).unwrap();
+        assert_eq!(b.lut.as_ref().unwrap().data,     expected.data);
+        assert_eq!(b.lut.as_ref().unwrap().checksum, expected.checksum);
+        assert_ne!(b.lut.as_ref().unwrap().data,     a.lut.as_ref().unwrap().data);
+    }
+
+    #[test]
+    fn lut_falls_back_to_embedded_data_when_the_path_is_gone() {
+        let url = write_temp_cube("missing", CUBE_2);
+        let mgr = configured_manager(Some(url.clone()));
+        let json = mgr.export_gyroflow_data(GyroflowProjectType::WithGyroData, "{}", None).unwrap();
+        std::fs::remove_file(filesystem::url_to_path(&url)).unwrap();
+
+        let restored = StabilizationManager::default();
+        let mut is_preset = false;
+        restored.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_scalars_match(&a, &b);
+        assert_eq!(b.lut.as_ref().unwrap().data,     a.lut.as_ref().unwrap().data);
+        assert_eq!(b.lut.as_ref().unwrap().checksum, a.lut.as_ref().unwrap().checksum);
+    }
+
+    #[test]
+    fn lut_falls_back_to_embedded_data_when_the_path_is_unparsable() {
+        let url = write_temp_cube("broken", "this is not a cube file\n");
+        let mgr = configured_manager(Some(url));
+        let restored = round_trip(&mgr);
+
+        let a = mgr.color.read();
+        let b = restored.color.read();
+        assert_eq!(b.lut.as_ref().unwrap().data,     a.lut.as_ref().unwrap().data);
+        assert_eq!(b.lut.as_ref().unwrap().checksum, a.lut.as_ref().unwrap().checksum);
+    }
+
+    #[test]
+    fn restored_lut_checksum_matches_its_data() {
+        let mgr = configured_manager(None);
+        let restored = round_trip(&mgr);
+        let b = restored.color.read();
+        let lut = b.lut.as_ref().unwrap();
+        assert_eq!(lut.checksum, crc32fast::hash(bytemuck::cast_slice(&lut.data)));
+    }
+
+    #[test]
+    fn missing_lut_does_not_make_the_project_unopenable() {
+        // The `videofile` must be a URL, not a bare relative name: `import_gyroflow_data`
+        // decides `is_preset` from whether it resolves to a non-empty URL, and a project and a
+        // preset now handle an unresolvable LUT differently (see the preset tests below).
+        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"file:///nonexistent/x.mp4","color":{"enabled":true,"exposure":0.5,"lut_path":"file:///nonexistent/nope.cube","lut_name":"nope.cube"}}"#;
+        let mgr = StabilizationManager::default();
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        assert!(!is_preset, "fixture must exercise the project path, not the preset path");
+        let c = mgr.color.read();
+        assert!(c.lut.is_none());
+        assert_eq!(c.exposure, 0.5);
+        assert_eq!(c.lut_name.as_deref(), Some("nope.cube"));
+    }
+
+    #[test]
+    fn project_without_color_section_loads_with_color_disabled() {
+        let mgr = StabilizationManager::default();
+        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"x.mp4"}"#;
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        let c = mgr.color.read();
+        let d = color::ColorAdjustments::default();
+        assert!(!c.enabled);
+        assert_eq!(c.bake_in_render,         d.bake_in_render);
+        assert_eq!(c.exposure,               d.exposure);
+        assert_eq!(c.contrast,               d.contrast);
+        assert_eq!(c.saturation,             d.saturation);
+        assert_eq!(c.source_kelvin,          d.source_kelvin);
+        assert_eq!(c.source_kelvin_detected, d.source_kelvin_detected);
+        assert_eq!(c.target_kelvin,          d.target_kelvin);
+        assert_eq!(c.tint,                   d.tint);
+        assert_eq!(c.lut_strength,           d.lut_strength);
+        assert!(c.lut.is_none());
+        assert!(c.lut_path.is_none());
+        assert!(c.lut_name.is_none());
+    }
+
+    /// Applies `json` to `mgr` as a preset (no `videofile` key), asserting it really was
+    /// treated as one - otherwise these tests would silently exercise the project path.
+    fn apply_as_preset(mgr: &StabilizationManager, json: &str) {
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        assert!(is_preset, "fixture was not treated as a preset");
+    }
+
+    #[test]
+    fn a_preset_carrying_no_lut_leaves_the_loaded_one_alone() {
+        let url = write_temp_cube("preset_keep", CUBE_2);
+        let mgr = configured_manager(Some(url.clone()));
+
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"color":{"enabled":true,"exposure":-1.5}}"#);
+
+        let c = mgr.color.read();
+        assert_eq!(c.exposure, -1.5, "the preset's own scalars must still be applied");
+        assert!(c.lut.is_some(), "a preset carrying no LUT must not clear the user's");
+        assert_eq!(c.lut_name.as_deref(), Some("round-trip.cube"));
+        assert_eq!(c.lut_path.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn a_preset_whose_lut_does_not_resolve_keeps_the_loaded_one() {
+        let url = write_temp_cube("preset_unresolvable", CUBE_2);
+        let mgr = configured_manager(Some(url.clone()));
+        let before = mgr.color.read().lut.as_ref().unwrap().checksum;
+
+        // Authored on another machine: the path is meaningless here and there's no embedded copy.
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"color":{"lut_path":"file:///nonexistent/elsewhere.cube","lut_name":"elsewhere.cube"}}"#);
+
+        let c = mgr.color.read();
+        assert_eq!(c.lut.as_ref().unwrap().checksum, before, "the user's LUT must survive");
+        assert_eq!(c.lut_name.as_deref(), Some("round-trip.cube"));
+        assert_eq!(c.lut_path.as_deref(), Some(url.as_str()));
+    }
+
+    #[test]
+    fn a_preset_whose_lut_resolves_replaces_the_loaded_one() {
+        let mgr = configured_manager(Some(write_temp_cube("preset_replace_old", CUBE_2)));
+
+        let other = CUBE_2.replace("0.70 0.71 0.72", "0.77 0.78 0.79");
+        let other_url = write_temp_cube("preset_replace_new", &other);
+        apply_as_preset(&mgr, &format!(r#"{{"title":"Gyroflow data file","version":4,"color":{{"lut_path":"{other_url}","lut_name":"elsewhere.cube"}}}}"#));
+
+        let c = mgr.color.read();
+        assert_eq!(c.lut_name.as_deref(), Some("elsewhere.cube"));
+        assert_eq!(c.lut_path.as_deref(), Some(other_url.as_str()));
+        assert_eq!(c.lut.as_ref().unwrap().data, color::parse_cube(&other).unwrap().data);
+    }
+
+    // ---------------------------------------------------------------------
+    // Embedded-LUT validation. A blob that decompresses and decodes cleanly but
+    // whose contents are self-inconsistent must not reach the renderer: a `size`
+    // that disagrees with `data.len()` indexes out of bounds in `sample_trilinear`
+    // and reads past the GPU coefficient buffer. Every case below must import
+    // successfully with the LUT simply absent - a corrupt project still opens.
+    // ---------------------------------------------------------------------
+
+    fn zeros(size: u32) -> Vec<f32> { vec![0.0; (size as usize).pow(3) * 3] }
+
+    /// Imports a minimal project whose `lut_data` blob is built from exactly these
+    /// values, however malformed. Panics if the import itself fails.
+    fn import_lut_data(size: u32, domain_min: f32, domain_max: f32, data: &[f32]) -> StabilizationManager {
+        let blob = util::compress_to_base91_cbor(&(size, domain_min, domain_max, data)).unwrap();
+        let json = serde_json::json!({
+            "title": "Gyroflow data file", "version": 4, "videofile": "x.mp4",
+            "color": { "enabled": true, "lut_name": "handcrafted.cube", "lut_data": blob }
+        }).to_string();
+
+        let mgr = StabilizationManager::default();
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+        mgr
+    }
+
+    #[test]
+    fn a_well_formed_embedded_lut_is_still_accepted() {
+        // Guards the validation against being over-strict: without this, "reject
+        // everything" would pass every other test in this group.
+        let mgr = import_lut_data(2, 0.0, 1.0, &zeros(2));
+        assert_eq!(mgr.color.read().lut.as_ref().unwrap().size, 2);
+    }
+
+    #[test]
+    fn embedded_lut_with_size_below_range_is_rejected() {
+        assert!(import_lut_data(1, 0.0, 1.0, &zeros(1)).color.read().lut.is_none());
+        assert!(import_lut_data(0, 0.0, 1.0, &[]).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_size_above_range_is_rejected() {
+        assert!(import_lut_data(65, 0.0, 1.0, &zeros(65)).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_too_little_data_is_rejected() {
+        // The exact shape that panics `sample_trilinear`: a plausible size, no data.
+        assert!(import_lut_data(64, 0.0, 1.0, &[]).color.read().lut.is_none());
+        assert!(import_lut_data(2, 0.0, 1.0, &vec![0.0; 8 * 3 - 3]).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_too_much_data_is_rejected() {
+        assert!(import_lut_data(2, 0.0, 1.0, &vec![0.0; 8 * 3 + 3]).color.read().lut.is_none());
+    }
+
+    #[test]
+    fn embedded_lut_with_a_non_finite_value_is_rejected() {
+        // No panic, but every graded pixel would silently become NaN.
+        let mut data = zeros(2);
+        data[5] = f32::NAN;
+        assert!(import_lut_data(2, 0.0, 1.0, &data).color.read().lut.is_none());
+
+        let mut data = zeros(2);
+        data[0] = f32::INFINITY;
+        assert!(import_lut_data(2, 0.0, 1.0, &data).color.read().lut.is_none());
+
+        assert!(import_lut_data(2, f32::NAN,      1.0,           &zeros(2)).color.read().lut.is_none());
+        assert!(import_lut_data(2, 0.0,      f32::INFINITY,      &zeros(2)).color.read().lut.is_none());
+    }
+
+    /// Anti-drift guard: the embedded path must accept exactly what `parse_cube`
+    /// accepts. If either side's rules change without the other, this fails.
+    #[test]
+    fn embedded_lut_validation_agrees_with_parse_cube() {
+        fn cube_text(size: u32, data: &[f32]) -> String {
+            let mut s = format!("LUT_3D_SIZE {size}\n");
+            for e in data.chunks(3) { s.push_str(&format!("{} {} {}\n", e[0], e[1], e[2])); }
+            s
+        }
+        let mut nan_2 = zeros(2); nan_2[4] = f32::NAN;
+        let mut inf_3 = zeros(3); inf_3[7] = f32::NEG_INFINITY;
+
+        let cases: Vec<(u32, Vec<f32>)> = vec![
+            (1,  zeros(1)),               // size below range
+            (2,  zeros(2)),               // smallest valid
+            (3,  zeros(3)),               // valid
+            (2,  vec![0.0; 8 * 3 - 3]),   // short
+            (2,  vec![0.0; 8 * 3 + 3]),   // long
+            (2,  nan_2),                  // NaN entry
+            (3,  inf_3),                  // -inf entry
+        ];
+        for (size, data) in cases {
+            let by_parse_cube = color::parse_cube(&cube_text(size, &data)).is_ok();
+            let by_embedded   = import_lut_data(size, 0.0, 1.0, &data).color.read().lut.is_some();
+            assert_eq!(by_embedded, by_parse_cube, "size {size}, {} values: parse_cube says {by_parse_cube}, embedded says {by_embedded}", data.len());
+        }
+    }
+
+    /// A hand-edited or corrupted project must not be able to push a scalar
+    /// outside the range the rest of the code considers valid. `exposure` is the
+    /// one that bites: nothing downstream clamps it, so `1e6` becomes an infinite
+    /// gain and a white frame with no diagnostic.
+    #[test]
+    fn out_of_range_scalars_are_clamped_on_import() {
+        let json = r#"{"title":"Gyroflow data file","version":4,"videofile":"x.mp4","color":{
+            "enabled":true,"exposure":1e6,"contrast":-9.0,"saturation":42.0,
+            "source_kelvin":1.0,"target_kelvin":1e9,"tint":-7.0,"lut_strength":5.0}}"#;
+        let mgr = StabilizationManager::default();
+        let mut is_preset = false;
+        mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+
+        let c = mgr.color.read();
+        assert_eq!(c.exposure,      5.0);
+        assert_eq!(c.contrast,     -1.0);
+        assert_eq!(c.saturation,    1.0);
+        assert_eq!(c.source_kelvin, 1667.0);
+        assert_eq!(c.target_kelvin, 25000.0);
+        assert_eq!(c.tint,         -1.0);
+        assert_eq!(c.lut_strength,  1.0);
+        assert!(c.to_kernel_params(c.exposure, c.contrast, c.saturation, c.target_kelvin, c.tint, c.lut_strength).exposure_gain.is_finite());
+    }
+
+    #[test]
+    fn in_range_scalars_survive_the_clamp_untouched() {
+        let mgr = configured_manager(None);
+        let restored = round_trip(&mgr);
+        assert_scalars_match(&mgr.color.read(), &restored.color.read());
+    }
+
+    /// The six colour keyframe variants ride the existing `"keyframes"` section
+    /// for free — `KeyframeType` derives Serialize/Deserialize in the
+    /// `define_keyframes!` macro. This test is the evidence.
+    #[test]
+    fn color_keyframes_round_trip_through_the_keyframes_section() {
+        let mgr = StabilizationManager::default();
+        mgr.keyframes.write().set(&KeyframeType::ColorExposure,  1_000_000, 1.5);
+        mgr.keyframes.write().set(&KeyframeType::ColorLutStrength, 2_000_000, 0.25);
+
+        let restored = round_trip(&mgr);
+        let kf = restored.keyframes.read();
+        assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorExposure,    1000.0), Some(1.5));
+        assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorLutStrength, 2000.0), Some(0.25));
+    }
 }

@@ -14,6 +14,229 @@ pub mod wgpu_interop;
 pub mod drawing;
 use std::hash::Hasher;
 
+/// The rust-gpu colour stage must be arithmetically identical to `crate::color::apply_color`.
+/// `stabilize_spirv` is a path dependency with `crate-type = ["lib", "dylib"]`, so the very
+/// same source that is compiled to SPIR-V also compiles for the host and can be called here.
+#[cfg(test)]
+mod spirv_color_tests {
+    use crate::color::{ ColorKernelParams, Lut3D, apply_color };
+    use stabilize_spirv::glam::{ Vec4, vec4 };
+    use stabilize_spirv::KernelParams as SpirvParams;
+
+    const COLOR_ENABLED: i32 = 1 << 12;
+    const HAS_LUT: i32 = 1 << 13;
+
+    /// A deliberately non-identity 3x3x3 LUT: channel-swapped, gamma-ish and offset, so a
+    /// wrong index order, a wrong interpolation fraction or a `mix()`-style lerp all show up.
+    fn test_lut() -> Lut3D {
+        let n = 3usize;
+        let mut data = Vec::with_capacity(n * n * n * 3);
+        for b in 0..n {
+            for g in 0..n {
+                for r in 0..n {
+                    let (rf, gf, bf) = (r as f32 / 2.0, g as f32 / 2.0, b as f32 / 2.0);
+                    data.push(bf * 0.9 + 0.05);
+                    data.push(rf * rf);
+                    data.push(1.0 - gf * 0.7);
+                }
+            }
+        }
+        Lut3D { size: n as u32, domain_min: 0.0, domain_max: 1.0, data, checksum: 1 }
+    }
+
+    fn params_and_spirv(cp: &ColorKernelParams, has_lut: bool, max_pixel_value: f32) -> SpirvParams {
+        let mut p = SpirvParams::default();
+        p.flags = COLOR_ENABLED | if has_lut { HAS_LUT } else { 0 };
+        p.max_pixel_value = max_pixel_value;
+        p.color_params_1 = vec4(cp.exposure_gain, cp.contrast_factor, cp.saturation_factor, cp.lut_strength);
+        p.color_params_2 = vec4(cp.wb_gains[0], cp.wb_gains[1], cp.wb_gains[2], cp.lut_size as f32);
+        p.color_params_3 = vec4(cp.domain_min, cp.domain_max, 0.0, 0.0);
+        p
+    }
+
+    fn kernel_params(lut: Option<&Lut3D>, exposure: f64, contrast: f64, saturation: f64, target_kelvin: f64, tint: f64, lut_strength: f64) -> ColorKernelParams {
+        let mut adj = crate::color::ColorAdjustments::default();
+        adj.lut = lut.map(|l| std::sync::Arc::new(l.clone()));
+        adj.to_kernel_params(exposure, contrast, saturation, target_kelvin, tint, lut_strength)
+    }
+
+    /// Exact f32 equality. Any tolerance here would mean the expressions diverged.
+    #[track_caller]
+    fn assert_identical(got: Vec4, expected: [f32; 3], alpha: f32) {
+        assert_eq!(got.x.to_bits(), expected[0].to_bits(), "red: {} != {}", got.x, expected[0]);
+        assert_eq!(got.y.to_bits(), expected[1].to_bits(), "green: {} != {}", got.y, expected[1]);
+        assert_eq!(got.z.to_bits(), expected[2].to_bits(), "blue: {} != {}", got.z, expected[2]);
+        assert_eq!(got.w.to_bits(), alpha.to_bits(), "alpha must pass through untouched");
+    }
+
+    const PROBES: &[[f32; 3]] = &[
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [0.5, 0.5, 0.5],
+        [0.25, 0.5, 0.75],
+        [0.9, 0.1, 0.6],
+        [0.123456, 0.789012, 0.345678],
+        // Outside the 0..1 domain, on both sides - exercises the clamps.
+        [-0.5, 1.5, 0.5],
+        [-2.0, -0.001, 3.0],
+        [2.0, 2.0, 2.0],
+    ];
+
+    #[test]
+    fn matches_reference_without_lut() {
+        for &(exposure, contrast, saturation, kelvin, tint) in &[
+            (0.0, 0.0, 0.0, 5500.0, 0.0),
+            (1.5, 0.4, -0.3, 7200.0, 0.25),
+            (-2.25, -0.8, 0.9, 3200.0, -0.4),
+        ] {
+            let cp = kernel_params(None, exposure, contrast, saturation, kelvin, tint, 1.0);
+            let sp = params_and_spirv(&cp, false, 1.0);
+            for probe in PROBES {
+                let expected = apply_color(*probe, &cp, None);
+                let got = stabilize_spirv::color::apply_color(vec4(probe[0], probe[1], probe[2], 0.75), &[], &sp);
+                assert_identical(got, expected, 0.75);
+            }
+        }
+    }
+
+    #[test]
+    fn matches_reference_with_a_real_lut() {
+        let lut = test_lut();
+        let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
+        assert_eq!(coeffs.len(), crate::stabilization::LUT_DATA_OFFSET + 27 * 3);
+
+        for strength in [0.0f64, 0.5, 1.0] {
+            for &(exposure, contrast, saturation) in &[(0.0, 0.0, 0.0), (0.75, 0.3, -0.5)] {
+                let cp = kernel_params(Some(&lut), exposure, contrast, saturation, 6500.0, 0.1, strength);
+                let sp = params_and_spirv(&cp, true, 1.0);
+                for probe in PROBES {
+                    // The reference skips the LUT entirely at strength 0, which is what the
+                    // kernel's `lut_strength > 0.0` guard reproduces.
+                    let expected = apply_color(*probe, &cp, Some(&lut));
+                    let got = stabilize_spirv::color::apply_color(vec4(probe[0], probe[1], probe[2], 1.0), &coeffs, &sp);
+                    assert_identical(got, expected, 1.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_reference_with_a_non_unit_lut_domain() {
+        let mut lut = test_lut();
+        lut.domain_min = -0.5;
+        lut.domain_max = 2.0;
+        let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
+        let cp = kernel_params(Some(&lut), 0.25, 0.2, 0.35, 4800.0, -0.2, 1.0);
+        let sp = params_and_spirv(&cp, true, 1.0);
+        for probe in PROBES {
+            let expected = apply_color(*probe, &cp, Some(&lut));
+            let got = stabilize_spirv::color::apply_color(vec4(probe[0], probe[1], probe[2], 1.0), &coeffs, &sp);
+            assert_identical(got, expected, 1.0);
+        }
+    }
+
+    /// The kernel works in raw pixel units and normalises by `max_pixel_value`, exactly the
+    /// way `cpu_undistort::apply_color_stage` does.
+    #[test]
+    fn normalises_by_max_pixel_value_like_the_cpu_path() {
+        let lut = test_lut();
+        let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
+        let cp = kernel_params(Some(&lut), 0.5, -0.25, 0.4, 6000.0, 0.15, 0.75);
+        let max = 255.0f32;
+        let sp = params_and_spirv(&cp, true, max);
+        let inv_max = 1.0 / max;
+        for probe in PROBES {
+            let raw = [probe[0] * max, probe[1] * max, probe[2] * max];
+            let expected_norm = apply_color([raw[0] * inv_max, raw[1] * inv_max, raw[2] * inv_max], &cp, Some(&lut));
+            let expected = [expected_norm[0] * max, expected_norm[1] * max, expected_norm[2] * max];
+            let got = stabilize_spirv::color::apply_color(vec4(raw[0], raw[1], raw[2], 200.0), &coeffs, &sp);
+            assert_identical(got, expected, 200.0);
+        }
+    }
+
+    /// Without HAS_LUT the coeffs buffer must never be read, even when one is bound.
+    #[test]
+    fn has_lut_flag_gates_the_lut() {
+        let lut = test_lut();
+        let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
+        let cp = kernel_params(Some(&lut), 0.0, 0.0, 0.0, 5500.0, 0.0, 1.0);
+        let sp = params_and_spirv(&cp, false, 1.0);
+        for probe in PROBES {
+            let expected = apply_color(*probe, &cp, None);
+            let got = stabilize_spirv::color::apply_color(vec4(probe[0], probe[1], probe[2], 1.0), &coeffs, &sp);
+            assert_identical(got, expected, 1.0);
+        }
+    }
+
+    /// glam's `Vec3::lerp` is `self * (1.0 - s) + rhs * s`, which is NOT bit-identical to the
+    /// reference's `a + (b - a) * t`. This pins the difference so nobody "simplifies" the
+    /// kernel into using it.
+    #[test]
+    fn glam_lerp_is_not_the_reference_expression() {
+        use stabilize_spirv::glam::Vec3;
+        let mut disagreements = 0;
+        for a in [0.1f32, 0.333333, 0.7, 0.987654] {
+            for b in [0.2f32, 0.456789, 0.8, 1.234567] {
+                for t in [0.1f32, 0.3, 0.5, 0.618034, 0.9] {
+                    let reference = Vec3::splat(a) + (Vec3::splat(b) - Vec3::splat(a)) * t;
+                    let glam_lerp = Vec3::splat(a).lerp(Vec3::splat(b), t);
+                    if reference.x.to_bits() != glam_lerp.x.to_bits() { disagreements += 1; }
+                }
+            }
+        }
+        assert!(disagreements > 0, "if these ever agree everywhere, the rationale in color.rs needs revisiting");
+    }
+}
+
+/// Source-text checks on the OpenCL kernel. The kernel itself is only compiled by an
+/// OpenCL driver at runtime (and `opencl.rs` only exists under `--features use-opencl`),
+/// so these run unconditionally to catch the two things that would otherwise fail
+/// silently on a user's machine: a stale LUT offset, and a kernel-argument index that no
+/// longer matches the host-side `set_arg` order.
+#[cfg(test)]
+mod opencl_source_tests {
+    const CL: &str = include_str!("opencl_undistort.cl");
+    const HOST: &str = include_str!("opencl.rs");
+
+    /// The offset the kernel reads LUT data at must match the Rust constant it mirrors.
+    #[test]
+    fn lut_data_offset_matches_rust() {
+        let expected = format!("#define LUT_DATA_OFFSET {}", crate::stabilization::LUT_DATA_OFFSET);
+        assert!(CL.contains(&expected), "opencl_undistort.cl must contain `{expected}`");
+    }
+
+    /// A kernel-argument index mismatch is a silent runtime failure, so pin both sides.
+    #[test]
+    fn kernel_argument_order_matches_host() {
+        let device_side = "__kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstptr, __global const void *params_buf, __global const float *matrices, __global const uchar *drawing, __global const float *mesh_data, __global const float *lut_coeffs)";
+        assert!(CL.contains(device_side), "undistort_image signature changed; update the host-side arg order in opencl.rs too:\n{device_side}");
+
+        // Host side: the `.arg()` calls must appear in exactly this order, because kernel
+        // argument indices are positional. Presence alone is not enough - two swapped
+        // `.arg()` calls would still bind, just to the wrong parameters.
+        let mut prev: Option<(&str, usize)> = None;
+        for (idx, name) in ["source_buffer", "dest_buffer", "buf_params", "buf_matrices", "buf_drawing", "buf_mesh_data", "buf_coeffs"].iter().enumerate() {
+            let expected = format!(".arg(&{name})");
+            let at = HOST.find(&expected).unwrap_or_else(|| panic!("opencl.rs must bind `{name}` as kernel argument {idx} via `{expected}`"));
+            if let Some((prev_name, prev_at)) = prev {
+                assert!(at > prev_at, "`{name}` must be bound after `{prev_name}`: kernel argument {idx} is positional, and opencl_undistort.cl expects this exact order");
+            }
+            prev = Some((name, at));
+        }
+    }
+
+    /// The colour arithmetic must stay bit-identical to `crate::color::apply_color`;
+    /// `mix()` and `dot()` are not (see the comment block in the .cl).
+    #[test]
+    fn colour_stage_avoids_non_identical_builtins() {
+        let start = CL.find("float3 lerp3(").expect("colour block missing from opencl_undistort.cl");
+        let end = CL.find("float map_coord(").expect("colour block end marker missing");
+        let block = &CL[start..end];
+        assert!(!block.contains("mix("), "the OpenCL colour stage must not use mix()");
+        assert!(!block.contains("dot("), "the OpenCL colour stage must not use dot()");
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct BufferDescription<'a> {
     pub size: (usize, usize, usize), // width, height, stride

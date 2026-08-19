@@ -54,6 +54,9 @@ layout(std140, binding = 2) uniform KernelParams {
     float reserved2;                // 16
     vec4 ewa_coefs_p;               // 16
     vec4 ewa_coefs_q;               // 16
+    vec4 color_params_1;            // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
+    vec4 color_params_2;            // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
+    vec4 color_params_3;            // 16 - lut_domain_min, lut_domain_max, unused, unused
 } params;
 
 LENS_MODEL_FUNCTIONS;
@@ -61,6 +64,123 @@ LENS_MODEL_FUNCTIONS;
 layout(binding = 3) uniform sampler2D texParams;
 layout(binding = 4) uniform sampler2D texCanvas;
 layout(binding = 5) uniform sampler2D texMeshData;
+layout(binding = 6) uniform sampler2D texLut;
+
+////////////////////////////// Colour adjustments //////////////////////////////
+// This arithmetic is a deliberate, ratified duplicate of `crate::color::apply_color`
+// (src/core/color/mod.rs) and `crate::color::sample_trilinear` (src/core/color/lut.rs).
+// Every operation, and their order, must stay identical to the Rust reference - the
+// explicit `a + (b - a) * t` lerps below mirror the Rust source exactly and must not be
+// rewritten as `mix()`, which evaluates `a * (1 - t) + b * t` and is not bit-identical.
+// Likewise the luma sum must stay an explicit left-associated sum, not `dot()`, which may
+// contract to an FMA chain with different rounding.
+//
+// Unlike the OpenCL and wgpu kernels, this backend does not carry the LUT in the coeffs
+// buffer - it has none. The LUT is a 2D-tiled RGBA32F texture instead: the `size³` entries
+// are uploaded verbatim in .cube order (red fastest, then green, then blue) into an image
+// `size*size` wide and `size` tall. A row-major image `n*n` wide puts texel (x, y) at linear
+// entry `y*n*n + x`, and `sample_trilinear` wants entry `b*n*n + g*n + r` (lut.rs:107), so
+// the blue index selects the ROW and (g, r) select the column: entry (r, g, b) lives at
+// texel `(g*size + r, b)`.
+//
+// Note this is not the (b*size + r, g) addressing one might expect from a "blue selects the
+// tile column" layout - that would need the upload to be reordered, and it is not.
+//
+// The sampler is Nearest/ClampToEdge and every read goes through texelFetch, because the
+// trilinear interpolation below is done by hand - any hardware filtering would make the
+// preview diverge from the export.
+vec3 lerp3(vec3 a, vec3 b, float t) {
+    return a + (b - a) * t;
+}
+
+vec3 lut_fetch(int r, int g, int b, int n) {
+    int rc = clamp(r, 0, n - 1);
+    int gc = clamp(g, 0, n - 1);
+    int bc = clamp(b, 0, n - 1);
+    // Belt and braces: apply_color() already refuses to call this unless the texture size
+    // agrees with `n`, so the min() below never bites. It stays because an out-of-range
+    // texelFetch is undefined behaviour and this is the only place that could produce one.
+    ivec2 sz = textureSize(texLut, 0);
+    return texelFetch(texLut, min(ivec2(gc * n + rc, bc), sz - ivec2(1)), 0).rgb;
+}
+
+vec3 lut_sample(vec3 rgb, int n, float domain_min, float domain_max) {
+    float scale = 1.0 / max(domain_max - domain_min, 1e-9);
+    vec3 normalized = clamp((rgb - vec3(domain_min)) * scale, vec3(0.0), vec3(1.0));
+    vec3 pos = normalized * float(n - 1);
+    ivec3 base = clamp(ivec3(floor(pos)), ivec3(0), ivec3(n - 1));
+    vec3 f = pos - vec3(base);
+
+    vec3 c000 = lut_fetch(base.x,     base.y,     base.z,     n);
+    vec3 c100 = lut_fetch(base.x + 1, base.y,     base.z,     n);
+    vec3 c010 = lut_fetch(base.x,     base.y + 1, base.z,     n);
+    vec3 c110 = lut_fetch(base.x + 1, base.y + 1, base.z,     n);
+    vec3 c001 = lut_fetch(base.x,     base.y,     base.z + 1, n);
+    vec3 c101 = lut_fetch(base.x + 1, base.y,     base.z + 1, n);
+    vec3 c011 = lut_fetch(base.x,     base.y + 1, base.z + 1, n);
+    vec3 c111 = lut_fetch(base.x + 1, base.y + 1, base.z + 1, n);
+
+    vec3 c00 = lerp3(c000, c100, f.x);
+    vec3 c10 = lerp3(c010, c110, f.x);
+    vec3 c01 = lerp3(c001, c101, f.x);
+    vec3 c11 = lerp3(c011, c111, f.x);
+    vec3 c0  = lerp3(c00, c10, f.y);
+    vec3 c1  = lerp3(c01, c11, f.y);
+    return lerp3(c0, c1, f.z);
+}
+
+vec4 apply_color(vec4 px) {
+    float max_value = params.max_pixel_value;
+    float inv_max = max_value > 0.0 ? 1.0 / max_value : 1.0;
+    vec3 c = px.rgb * inv_max;
+
+    // 1. LUT, blended by strength
+    int lut_size = int(params.color_params_2.w);
+    float lut_strength = params.color_params_1.w;
+    // `lut_size` arrives in the uniform block, baked into KernelParams when the frame
+    // transform was computed, while the texture is uploaded from an independently acquired
+    // read of the colour state. The two can disagree for a single frame after the LUT
+    // changes. Skipping the LUT for that frame is strictly better than grading with
+    // clamped-garbage LUT values; the next frame corrects itself either way.
+    ivec2 lut_tex_size = textureSize(texLut, 0);
+    bool lut_usable = lut_tex_size.x == lut_size * lut_size && lut_tex_size.y == lut_size;
+    if (bool(params.flags & 8192) && lut_size >= 2 && lut_strength > 0.0 && lut_usable) {
+        vec3 graded = lut_sample(c, lut_size, params.color_params_3.x, params.color_params_3.y);
+        c = c + (graded - c) * lut_strength;
+    }
+
+    // 2. Exposure
+    c = c * params.color_params_1.x;
+
+    // 3. White balance
+    c = c * params.color_params_2.xyz;
+
+    // 4. Contrast around mid grey
+    c = (c - vec3(0.5)) * params.color_params_1.y + vec3(0.5);
+
+    // 5. Saturation around luma
+    float luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    c = vec3(luma) + (c - vec3(luma)) * params.color_params_1.z;
+
+    return vec4(c * max_value, px.a);
+}
+
+// Called at every site that finishes a fragment through the sampling path, always before
+// the drawing and safe-area overlays are composited - the overlays are UI, not image, and
+// must never be graded. Background pixels produced by that path are graded along with image
+// pixels, which matches the wgpu kernel where the background is part of the accumulated sum
+// that apply_color() receives.
+//
+// The FILL_WITH_BACKGROUND (flags & 4) early-out in main() is deliberately NOT graded: it
+// never enters the accumulation path at all, and both approved sibling backends skip colour
+// there too - wgpu_undistort.wgsl returns the background before reaching apply_color, and
+// cpu_undistort.rs early-returns the background before apply_color_stage.
+void apply_color_if_enabled(inout vec4 out_pix) {
+    if (bool(params.flags & 4096)) {
+        out_pix = apply_color(out_pix);
+    }
+}
+////////////////////////////// Colour adjustments //////////////////////////////
 
 const vec4 colors[9] = vec4[9](
     vec4(0.0,   0.0,   0.0,     0.0), // None
@@ -276,6 +396,7 @@ void main() {
             if (!((pt2.x >= 0 && pt2.x < params.width) && (pt2.y >= 0 && pt2.y < params.height))) {
                 fragColor = params.background;
             }
+            apply_color_if_enabled(fragColor);
             draw_pixel(fragColor, uv.x, uv.y, true);
             draw_pixel(fragColor, outPos.x, outPos.y, false);
             draw_safe_area(fragColor, outPos.x, outPos.y);
@@ -284,6 +405,7 @@ void main() {
 
         if ((uv.x >= 0 && uv.x < frame_size.x) && (uv.y >= 0 && uv.y < frame_size.y)) {
             fragColor = texture(texIn, vec2(uv.x / frame_size.x, uv.y / frame_size.y));
+            apply_color_if_enabled(fragColor);
             draw_pixel(fragColor, uv.x, uv.y, true);
             draw_pixel(fragColor, outPos.x, outPos.y, false);
             draw_safe_area(fragColor, outPos.x, outPos.y);
@@ -292,6 +414,7 @@ void main() {
     }
 
     fragColor = params.background;
+    apply_color_if_enabled(fragColor);
     draw_pixel(fragColor, outPos.x, outPos.y, false);
     draw_safe_area(fragColor, outPos.x, outPos.y);
 }

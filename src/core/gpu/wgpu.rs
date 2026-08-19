@@ -5,7 +5,6 @@ use std::borrow::Cow;
 use std::sync::atomic::{ AtomicUsize, Ordering::SeqCst };
 use wgpu::Adapter;
 use wgpu::BufferUsages;
-use wgpu::util::DeviceExt;
 use parking_lot::{ RwLock, Mutex };
 use crate::gpu:: { Buffers, BufferSource };
 use crate::stabilization::KernelParams;
@@ -17,6 +16,26 @@ pub enum WgpuError {
     RequestDevice(wgpu::RequestDeviceError),
     ParamCheck,
     NoAvailableAdapter,
+}
+
+/// Turns the templated `wgpu_undistort.wgsl` source into a real WGSL module.
+/// Extracted so the offline shader-validation tests exercise the exact same
+/// substitutions the runtime does.
+pub fn preprocess_kernel(lens_model_functions: &str, scalar: &str, uses_textures: bool) -> String {
+    let mut kernel = include_str!("wgpu_undistort.wgsl").to_string();
+    kernel = kernel.replace("LENS_MODEL_FUNCTIONS;", lens_model_functions);
+    kernel = kernel.replace("SCALAR", scalar);
+
+    if uses_textures {
+        while let Some(pos) = kernel.find("{buffer_input}") {
+            kernel.replace_range(pos..kernel.find("{/buffer_input}").unwrap() + 15, "");
+        }
+    } else {
+        while let Some(pos) = kernel.find("{texture_input}") {
+            kernel.replace_range(pos..kernel.find("{/texture_input}").unwrap() + 16, "");
+        }
+    }
+    kernel
 }
 
 enum PipelineType {
@@ -144,7 +163,7 @@ impl WgpuWrapper {
         Some((name, list_name))
     }
 
-    pub fn new(params: &KernelParams, wgpu_format: (wgpu::TextureFormat, &str, bool), distortion_model: DistortionModel, digital_lens: Option<DistortionModel>, buffers: &Buffers, mut drawing_len: usize) -> Result<Self, WgpuError> {
+    pub fn new(params: &KernelParams, wgpu_format: (wgpu::TextureFormat, &str, bool), distortion_model: DistortionModel, digital_lens: Option<DistortionModel>, buffers: &Buffers, mut drawing_len: usize, lut: Option<std::sync::Arc<crate::color::Lut3D>>) -> Result<Self, WgpuError> {
         let max_matrix_count = 14 * if (params.flags & 16) == 16 { params.width } else { params.height } as usize;
 
         if params.height < 4 || params.output_height < 4 || buffers.input.size.0 < 16 || buffers.input.size.2 < 16 || buffers.output.size.0 < 16 || buffers.output.size.2 < 16 || params.width > 16384 || params.output_width > 16384 {
@@ -259,15 +278,10 @@ impl WgpuWrapper {
                 log::error!("Uncaptured device error: {e:?}");
             }));
 
-            let mut kernel = include_str!("wgpu_undistort.wgsl").to_string();
-            //let mut kernel = std::fs::read_to_string("D:/programowanie/projekty/Rust/gyroflow/src/core/gpu/wgpu_undistort.wgsl").unwrap();
-
             let mut lens_model_functions = distortion_model.wgsl_functions().to_string();
             let default_digital_lens = "fn digital_undistort_point(uv: vec2<f32>) -> vec2<f32> { return uv; }
                                         fn digital_distort_point  (uv: vec2<f32>) -> vec2<f32> { return uv; }";
             lens_model_functions.push_str(digital_lens.as_ref().map(|x| x.wgsl_functions()).unwrap_or(default_digital_lens));
-            kernel = kernel.replace("LENS_MODEL_FUNCTIONS;", &lens_model_functions);
-            kernel = kernel.replace("SCALAR", wgpu_format.1);
 
             if !drawing_enabled {
                 drawing_len = 16;
@@ -278,15 +292,7 @@ impl WgpuWrapper {
             let out_texture = init_texture(&device, backend, &buffers.output, wgpu_format.0, false);
 
             let uses_textures = in_texture.wgpu_texture.is_some();
-            if uses_textures {
-                while let Some(pos) = kernel.find("{buffer_input}") {
-                    kernel.replace_range(pos..kernel.find("{/buffer_input}").unwrap() + 15, "");
-                }
-            } else {
-                while let Some(pos) = kernel.find("{texture_input}") {
-                    kernel.replace_range(pos..kernel.find("{/texture_input}").unwrap() + 16, "");
-                }
-            }
+            let kernel = preprocess_kernel(&lens_model_functions, wgpu_format.1, uses_textures);
             // log::info!("Using kernel: {kernel}");
 
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -303,7 +309,13 @@ impl WgpuWrapper {
             let buf_matrices  = device.create_buffer(&wgpu::BufferDescriptor { size: params_size, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
             let buf_params = device.create_buffer(&wgpu::BufferDescriptor { size: std::mem::size_of::<KernelParams>() as u64, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
             let buf_drawing = device.create_buffer(&wgpu::BufferDescriptor { size: drawing_len as u64, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
-            let buf_coeffs  = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&crate::stabilization::COEFFS), usage: wgpu::BufferUsages::STORAGE });
+            let coeffs_data = crate::stabilization::build_coeffs_buffer(lut.as_deref());
+            let buf_coeffs = device.create_buffer(&wgpu::BufferDescriptor {
+                size: (coeffs_data.len() * std::mem::size_of::<f32>()) as u64,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                label: None, mapped_at_creation: false
+            });
+            queue.write_buffer(&buf_coeffs, 0, bytemuck::cast_slice(&coeffs_data));
             let buf_mesh_data = device.create_buffer(&wgpu::BufferDescriptor { size: (crate::gyro_source::splines::MAX_BUFFER_SIZE * std::mem::size_of::<f32>()).max(4096) as _, usage: BufferUsages::STORAGE | BufferUsages::COPY_DST, label: None, mapped_at_creation: false });
 
             let bind_group_layout = if uses_textures {
@@ -574,5 +586,47 @@ pub fn is_buffer_supported(buffers: &Buffers) -> bool {
         BufferSource::CUDABuffer{ .. } => true,
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         BufferSource::Metal { .. } | BufferSource::MetalBuffer { .. } => true,
+    }
+}
+
+/// Parses and validates `wgpu_undistort.wgsl` with naga, offline, with no GPU and no
+/// running app. Every substitution variant the runtime can produce is covered, so a
+/// syntax or type error in the shader fails `cargo test` instead of only showing up as a
+/// runtime shader-compilation error once a video is loaded.
+#[cfg(test)]
+mod wgsl_validation_tests {
+    use super::*;
+
+    fn validate(scalar: &str, uses_textures: bool) {
+        let mut lens_model_functions = DistortionModel::default().wgsl_functions().to_string();
+        lens_model_functions.push_str("fn digital_undistort_point(uv: vec2<f32>) -> vec2<f32> { return uv; }
+                                       fn digital_distort_point  (uv: vec2<f32>) -> vec2<f32> { return uv; }");
+
+        let source = preprocess_kernel(&lens_model_functions, scalar, uses_textures);
+
+        let module = match wgpu::naga::front::wgsl::parse_str(&source) {
+            Ok(m) => m,
+            Err(e) => panic!("WGSL parse failed (scalar={scalar}, textures={uses_textures}):\n{}", e.emit_to_string(&source)),
+        };
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        );
+        if let Err(e) = validator.validate(&module) {
+            panic!("WGSL validation failed (scalar={scalar}, textures={uses_textures}):\n{}", e.emit_to_string(&source));
+        }
+    }
+
+    #[test] fn wgsl_validates_f32_texture_input() { validate("f32", true); }
+    #[test] fn wgsl_validates_f32_buffer_input()  { validate("f32", false); }
+    #[test] fn wgsl_validates_u32_texture_input() { validate("u32", true); }
+    #[test] fn wgsl_validates_u32_buffer_input()  { validate("u32", false); }
+
+    /// The offset the shader reads LUT data at must match the Rust constant it mirrors.
+    #[test]
+    fn lut_data_offset_matches_rust() {
+        let src = include_str!("wgpu_undistort.wgsl");
+        let expected = format!("const LUT_DATA_OFFSET: u32 = {}u;", crate::stabilization::LUT_DATA_OFFSET);
+        assert!(src.contains(&expected), "wgpu_undistort.wgsl must contain `{expected}`");
     }
 }

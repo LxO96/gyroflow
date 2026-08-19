@@ -143,6 +143,7 @@ Item {
                 window.advanced.loadGyroflow(obj);
                 window.sync.loadGyroflow(obj);
                 window.lensProfile.loadGyroflow(obj);
+                window.colorAdjustments.loadGyroflow(obj);
                 Qt.callLater(window.exportSettings.loadGyroflow, obj);
 
                 if (obj.hasOwnProperty("image_sequence_start") && +obj.image_sequence_start > 0) {
@@ -266,6 +267,15 @@ Item {
                     vidInfo.infoList.model = model;
                     vidInfo.infoList.modelChanged();
                 }
+
+                // Source exposure/white-balance readout, and the temperature anchor (spec R9).
+                // Task 14's controller has already seeded `source_kelvin` in the core from the
+                // same metadata; this only brings the UI into step. Absent fields arrive as
+                // `undefined`, never `null` - `serde_json_to_qt_object` drops nulls.
+                const se = controller.get_source_exposure();
+                window.colorAdjustments.sourceExposure = se;
+                window.colorAdjustments.setTemperatureAnchor(
+                    typeof se.white_balance_k !== "undefined"? +se.white_balance_k : 5500);
             }
             if (+additional_data.sample_rate > 0.0 && Math.round(+additional_data.sample_rate) < 50) {
                 messageBox(Modal.Warning, qsTr("Motion data sampling rate is too low (%1 Hz).\n50 Hz is an absolute minimum and we recommend at least 200 Hz.").arg(additional_data.sample_rate.toFixed(0)), [ { "text": qsTr("Ok") } ]);

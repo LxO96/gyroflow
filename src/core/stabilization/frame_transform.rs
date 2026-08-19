@@ -2,7 +2,7 @@
 // Copyright © 2021-2022 Adrian <adrian.eddy at gmail>
 
 use nalgebra::Matrix3;
-use super::{ ComputeParams, KernelParams };
+use super::{ ComputeParams, KernelParams, KernelParamsFlags };
 use rayon::iter::{ ParallelIterator, IntoParallelIterator };
 use crate::gyro_source::FileMetadata;
 use crate::keyframes::KeyframeType;
@@ -173,6 +173,22 @@ impl FrameTransform {
 
         let light_refraction_coefficient = params.keyframes.value_at_video_timestamp(&KeyframeType::LightRefractionCoeff, timestamp_ms).unwrap_or(params.light_refraction_coefficient);
 
+        let color = &params.color;
+        // `is_active` only sees the static scalars, so a project whose colour lives entirely
+        // in keyframes would be gated off before the keyframes below are ever read.
+        let color_kernel = if color.enabled && (color.is_active() || params.keyframes.is_any_color_keyframed()) {
+            Some(color.to_kernel_params(
+                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorExposure,    timestamp_ms).unwrap_or(color.exposure),
+                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorContrast,    timestamp_ms).unwrap_or(color.contrast),
+                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorSaturation,  timestamp_ms).unwrap_or(color.saturation),
+                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTemperature, timestamp_ms).unwrap_or(color.target_kelvin),
+                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTint,        timestamp_ms).unwrap_or(color.tint),
+                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorLutStrength, timestamp_ms).unwrap_or(color.lut_strength),
+            ))
+        } else {
+            None
+        };
+
         // let additional_translation_x = params.keyframes.value_at_video_timestamp(&KeyframeType::AdditionalTranslationX, timestamp_ms).unwrap_or(params.additional_translation.0) as f32;
         // let additional_translation_y = params.keyframes.value_at_video_timestamp(&KeyframeType::AdditionalTranslationY, timestamp_ms).unwrap_or(params.additional_translation.1) as f32;
         // let additional_translation_z = params.keyframes.value_at_video_timestamp(&KeyframeType::AdditionalTranslationZ, timestamp_ms).unwrap_or(params.additional_translation.2) as f32;
@@ -319,7 +335,7 @@ impl FrameTransform {
             adaptive_zoom_center_y *= -1.0;
         }
 
-        let kernel_params = KernelParams {
+        let mut kernel_params = KernelParams {
             matrix_count:  matrices.len() as i32,
             f:             [scaled_k[(0, 0)] as f32, scaled_k[(1, 1)] as f32],
             c:             [scaled_k[(0, 2)] as f32, scaled_k[(1, 2)] as f32],
@@ -338,6 +354,14 @@ impl FrameTransform {
             light_refraction_coefficient: light_refraction_coefficient as f32,
             ..Default::default()
         };
+
+        if let Some(c) = color_kernel {
+            kernel_params.color_params_1 = [c.exposure_gain, c.contrast_factor, c.saturation_factor, c.lut_strength];
+            kernel_params.color_params_2 = [c.wb_gains[0], c.wb_gains[1], c.wb_gains[2], c.lut_size as f32];
+            kernel_params.color_params_3 = [c.domain_min, c.domain_max, 0.0, 0.0];
+            kernel_params.flags |= KernelParamsFlags::COLOR_ENABLED.bits();
+            if c.lut_size > 0 { kernel_params.flags |= KernelParamsFlags::HAS_LUT.bits(); }
+        }
 
         Self {
             matrices,

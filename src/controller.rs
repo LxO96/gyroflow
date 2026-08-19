@@ -78,6 +78,12 @@ pub struct Controller {
     get_smoothing_max_angles: qt_method!(fn(&self) -> QJsonArray),
     get_smoothing_status: qt_method!(fn(&self) -> QJsonArray),
     set_smoothing_param: qt_method!(fn(&self, name: QString, val: f64)),
+    set_color_param: qt_method!(fn(&self, name: QString, val: f64)),
+    set_color_enabled: qt_method!(fn(&self, enabled: bool, bake_in_render: bool)),
+    load_lut: qt_method!(fn(&mut self, url: QUrl) -> QString),
+    clear_lut: qt_method!(fn(&mut self)),
+    get_lut_name: qt_method!(fn(&self) -> QString),
+    get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
     set_horizon_lock: qt_method!(fn(&self, lock_percent: f64, roll: f64, lock_pitch: bool, pitch: f64, automatic_lock: bool, turn_threshold: f64, turn_smoothing_ms: f64, turn_multiplier: f64, tilt_accel_limit: f64)),
     get_turn_speed: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
     get_x_angle: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
@@ -846,6 +852,23 @@ impl Controller {
                         gyroflow_core::util::merge_json(&mut additional_data, &md_data);
                     }
 
+                    // Anchor the white balance to what the camera recorded. `source_kelvin` is
+                    // the neutral point the grade is measured from, so it always follows the
+                    // file. `target_kelvin` only follows it along while the user hasn't turned
+                    // colour adjustments on - once they have, their chosen temperature is theirs
+                    // and loading another file must not move it.
+                    if let Some(settings) = md_data.get("recording_settings") {
+                        let src = core::color::SourceExposure::from_recording_settings(settings);
+                        let mut c = stab.color.write();
+                        let (kelvin, detected) = match src.white_balance_k {
+                            Some(k) => (k, true),
+                            None    => (core::color::DEFAULT_KELVIN, false),
+                        };
+                        c.set_param("source_kelvin", kelvin);
+                        c.source_kelvin_detected = detected;
+                        if !c.enabled { c.set_param("target_kelvin", kelvin); }
+                    }
+
                     additional_data.as_object_mut().unwrap().insert("frame_readout_time".to_owned(), serde_json::to_value(stab.params.read().frame_readout_time.abs()).unwrap());
                     additional_data.as_object_mut().unwrap().insert("frame_readout_direction".to_owned(), serde_json::to_value(stab.params.read().frame_readout_direction).unwrap());
 
@@ -1213,6 +1236,87 @@ impl Controller {
     fn get_smoothing_max_angles(&self) -> QJsonArray {
         let max_angles = self.stabilizer.get_smoothing_max_angles();
         util::serde_json_to_qt_array(&serde_json::json!([max_angles.0, max_angles.1, max_angles.2]))
+    }
+
+    // Colour adjustments don't touch the stabilization maths - no smoothing, no zooming, no
+    // undistortion mesh - so `chart_data_changed()` has nothing to say about them. They do
+    // have to reach `ComputeParams` (compute_params.rs, which clones `mgr.color`), and the
+    // only thing that puts a fresh `ComputeParams` into the stabilizer is
+    // `set_compute_params`. `request_recompute()` is the established route to it, and its
+    // smoothing/zooming checksums are unchanged by a colour edit, so both heavy stages are
+    // skipped and it ends up doing just the rebuild. Same signal `set_background_color` uses,
+    // for the same reason: a render-only parameter that still lives in ComputeParams.
+    fn set_color_param(&mut self, name: QString, val: f64) {
+        let name = name.to_string();
+        if !self.stabilizer.color.write().set_param(&name, val) {
+            ::log::warn!("Rejected colour parameter: {name} = {val}");
+            return;
+        }
+        self.request_recompute();
+    }
+
+    fn set_color_enabled(&mut self, enabled: bool, bake_in_render: bool) {
+        {
+            let mut c = self.stabilizer.color.write();
+            c.enabled = enabled;
+            c.bake_in_render = bake_in_render;
+        }
+        self.request_recompute();
+    }
+
+    /// Returns an empty string on success, or a message for the UI to show.
+    fn load_lut(&mut self, url: QUrl) -> QString {
+        // Kept as a URL, never a path: on Android and Apple this is a content URI or a
+        // security-scoped URL with no filesystem path at all, and `filesystem::read_to_string`
+        // and `get_filename` both take URLs. It's also what gets written to `lut_path` in the
+        // project file, and the importer (lib.rs, `obj.get("color")`) feeds `lut_path` straight
+        // back to `filesystem::read_to_string` when it contains "://".
+        let url = util::qurl_to_encoded(url);
+        let text = match filesystem::read_to_string(&url) {
+            Ok(t) => t,
+            Err(e) => return QString::from(format!("Failed to read file: {e}")),
+        };
+        match core::color::parse_cube(&text) {
+            Ok(lut) => {
+                {
+                    let mut c = self.stabilizer.color.write();
+                    c.lut = Some(Arc::new(lut));
+                    c.lut_name = Some(filesystem::get_filename(&url));
+                    c.lut_path = Some(url);
+                }
+                self.request_recompute();
+                QString::default()
+            }
+            Err(e) => QString::from(e.to_string()),
+        }
+    }
+
+    fn clear_lut(&mut self) {
+        {
+            let mut c = self.stabilizer.color.write();
+            c.lut = None;
+            c.lut_path = None;
+            c.lut_name = None;
+        }
+        self.request_recompute();
+    }
+
+    /// The filename of the currently loaded LUT, or an empty string if there isn't one. The
+    /// QML side treats "" as "no LUT" (`lutName.length > 0`) rather than distinguishing it
+    /// from a `None`, because a LUT with an empty filename isn't a thing `load_lut` can
+    /// produce - `filesystem::get_filename` always yields at least one character.
+    fn get_lut_name(&self) -> QString {
+        QString::from(self.stabilizer.color.read().lut_name.clone().unwrap_or_default())
+    }
+
+    /// What the camera recorded, for the read-only panel readout. Fields the camera didn't
+    /// report are `None` and `serde_json_to_qt_object` drops nulls, so they arrive in QML as
+    /// `undefined` rather than `null`.
+    fn get_source_exposure(&self) -> QJsonObject {
+        let md = self.stabilizer.gyro.read().file_metadata.read().additional_data.clone();
+        let settings = md.get("recording_settings").cloned().unwrap_or(serde_json::Value::Null);
+        let exposure = core::color::SourceExposure::from_recording_settings(&settings);
+        util::serde_json_to_qt_object(&serde_json::to_value(&exposure).unwrap_or_default())
     }
 
     fn recompute_threaded(&mut self) {

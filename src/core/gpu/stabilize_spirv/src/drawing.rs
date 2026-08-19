@@ -74,6 +74,12 @@ fn remap_colorrange(px: Vec4, is_y: bool, max_value: f32) -> Vec4 {
 }
 
 pub fn process_final_pixel(mut pixel: Vec4, src_pos: Vec2, out_pos: Vec2, params: &KernelParams, coeffs: &[f32], drawing: &DrawingType, sampler: SamplerType, flags: u32) -> Vec4 {
+    // Colour goes immediately before `remap_colorrange`, following this backend's existing
+    // convention for where colour-range work happens (see the WGSL and CPU paths, which
+    // each place it at their own `remap_colorrange` site).
+    if (flags & 4096) != 0 {
+        pixel = crate::color::apply_color(pixel, coeffs, params);
+    }
     if (flags & 1) == 1 {
         pixel = remap_colorrange(pixel, params.plane_index == 0, params.max_pixel_value);
     }

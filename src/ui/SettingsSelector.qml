@@ -57,6 +57,14 @@ Modal {
             "Video speed":                ["video_speed", "video_speed_affects_smoothing", "video_speed_affects_zooming", "video_speed_affects_zooming_limit"],
             "Focal length smoothing":     ["focal_length_smoothing_enabled", "focal_length_smoothing_strength"],
         },
+        "Color adjustments|color": {
+            "Enable":         ["enabled", "bake_in_render"],
+            "Exposure":       ["exposure"],
+            "Contrast":       ["contrast"],
+            "Saturation":     ["saturation"],
+            "White balance":  ["source_kelvin", "source_kelvin_detected", "target_kelvin", "tint"],
+            "LUT":            ["lut_path", "lut_name", "lut_data", "lut_strength"],
+        },
         "Export settings|output": {
             "Codec":       ["codec", "codec_options", "bitrate", "use_gpu"],
             "Audio":       ["audio"],
@@ -71,7 +79,10 @@ Modal {
         }
     }];
 
-    property var defaultOff: ["trim_ranges_ms", "offsets", "video_infofps_scale", "video_inforotation", "synchronizationdo_autosync", "plugin_disable_stretch"];
+    // "colorlut_path" keeps the LUT out of a preset unless it's asked for: the preset would
+    // otherwise carry the whole LUT embedded as base91 plus a path that only resolves on the
+    // machine it was authored on.
+    property var defaultOff: ["trim_ranges_ms", "offsets", "video_infofps_scale", "video_inforotation", "synchronizationdo_autosync", "plugin_disable_stretch", "colorlut_path"];
 
     text: type == "preset"? qsTr("Select settings you want to include in the preset")
         : type == "apply"? qsTr("Select settings you want to apply to all items in the render queue")

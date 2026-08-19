@@ -87,6 +87,14 @@ pub const COEFFS: [f32; 64+128+256 + 9*4 + 4] = [
 // ];
 // const ALPHAS: [f32; 4] = [ 1.0, 0.75, 0.50, 0.25 ];
 
+fn apply_color_stage(pixel: &mut Vector4<f32>, p: &crate::color::ColorKernelParams, lut: Option<&crate::color::Lut3D>, max_value: f32) {
+    let inv_max = if max_value > 0.0 { 1.0 / max_value } else { 1.0 };
+    let rgb = crate::color::apply_color([pixel[0] * inv_max, pixel[1] * inv_max, pixel[2] * inv_max], p, lut);
+    pixel[0] = rgb[0] * max_value;
+    pixel[1] = rgb[1] * max_value;
+    pixel[2] = rgb[2] * max_value;
+}
+
 impl Stabilization {
     pub fn undistort_image_cpu_spirv<T: PixelType>(buffers: &mut Buffers, params: &KernelParams, distortion_model: &DistortionModel, digital_lens: Option<&DistortionModel>, matrices: &[[f32; 14]], drawing: &[u8]) -> bool {
         if let BufferSource::Cpu { buffer: input } = &mut buffers.input.data {
@@ -230,7 +238,7 @@ impl Stabilization {
     // Adapted from OpenCV: initUndistortRectifyMap + remap
     // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/calib3d/src/fisheye.cpp#L465-L567
     // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/imgproc/src/opencl/remap.cl#L390-L498
-    pub fn undistort_image_cpu<const I: i32, T: PixelType>(buffers: &mut Buffers, params: &KernelParams, distortion_model: &DistortionModel, digital_lens: Option<&DistortionModel>, matrices: &[[f32; 14]], drawing: &[u8], mesh_data: &[f32]) -> bool {
+    pub fn undistort_image_cpu<const I: i32, T: PixelType>(buffers: &mut Buffers, params: &KernelParams, distortion_model: &DistortionModel, digital_lens: Option<&DistortionModel>, matrices: &[[f32; 14]], drawing: &[u8], mesh_data: &[f32], coeffs: &[f32]) -> bool {
         // #[cold]
         // fn draw_pixel(pix: &mut Vector4<f32>, x: i32, y: i32, is_input: bool, width: i32, params: &KernelParams, drawing: &[u8]) {
         //     if drawing.is_empty() || (params.flags & 8) == 0 { return; }
@@ -326,7 +334,7 @@ impl Stabilization {
         }
         ////////////////////////////// EWA (Elliptical Weighted Average) CubicBC sampling //////////////////////////////
 
-        fn sample_input_at<const I: i32, T: PixelType>(uv: Vector2<f32>, jac: &Vector4<f32>, input: &[u8], params: &KernelParams, bg: &Vector4<f32>, _drawing: &[u8]) -> Vector4<f32> {
+        fn sample_input_at<const I: i32, T: PixelType>(uv: Vector2<f32>, jac: &Vector4<f32>, input: &[u8], params: &KernelParams, bg: &Vector4<f32>, _drawing: &[u8], coeffs: &[f32]) -> Vector4<f32> {
             let mut sum = Vector4::from_element(0.0);
             if I > 8 {
                 // find how many pixels we need around that pixel in each direction
@@ -383,8 +391,8 @@ impl Stabilization {
                 let sx = sx0 >> INTER_BITS;
                 let sy = sy0 >> INTER_BITS;
 
-                let coeffs_x = &COEFFS[ind + ((sx0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
-                let coeffs_y = &COEFFS[ind + ((sy0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
+                let coeffs_x = &coeffs[ind + ((sx0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
+                let coeffs_y = &coeffs[ind + ((sy0 as usize & (INTER_TAB_SIZE - 1)) << shift)..];
 
                 let mut src_index = sy as isize * params.stride as isize + sx as isize * params.bytes_per_pixel as isize;
 
@@ -531,6 +539,32 @@ impl Stabilization {
                 let fill_bg = (params.flags & 4) == 4;
                 let fix_range = (params.flags & 1) == 1;
                 let is_y = params.plane_index == 0;
+
+                let color_enabled = (params.flags & 4096) == 4096;
+                let has_lut = (params.flags & 8192) == 8192;
+                let color_params = crate::color::ColorKernelParams {
+                    exposure_gain:     params.color_params_1[0],
+                    contrast_factor:   params.color_params_1[1],
+                    saturation_factor: params.color_params_1[2],
+                    lut_strength:      params.color_params_1[3],
+                    wb_gains:          [params.color_params_2[0], params.color_params_2[1], params.color_params_2[2]],
+                    lut_size:          params.color_params_2[3] as u32,
+                    domain_min:        params.color_params_3[0],
+                    domain_max:        params.color_params_3[1],
+                };
+                // Built once, outside the pixel loop: `Lut3D` owns a copy of the table, so
+                // constructing it per pixel would allocate on every pixel and tank render perf.
+                let lut_view: Option<crate::color::Lut3D> = if color_enabled && has_lut && color_params.lut_size >= 2 {
+                    let count = (color_params.lut_size as usize).pow(3) * 3;
+                    let start = crate::stabilization::LUT_DATA_OFFSET;
+                    coeffs.get(start..start + count).map(|data| crate::color::Lut3D {
+                        size: color_params.lut_size,
+                        domain_min: color_params.domain_min,
+                        domain_max: color_params.domain_max,
+                        data: data.to_vec(),
+                        checksum: 0,
+                    })
+                } else { None };
                 if buffers.output.size.2 <= 0 {
                     log::error!("buffers.output_size: {:?}", buffers.output.size);
                     return false;
@@ -601,10 +635,13 @@ impl Stabilization {
                                     pt2 = Vector2::new(map_coord(pt2.x, 0.0, frame_size.0, params.source_rect[0] as f32, (params.source_rect[0] + params.source_rect[2]) as f32),
                                                        map_coord(pt2.y, 0.0, frame_size.1, params.source_rect[1] as f32, (params.source_rect[1] + params.source_rect[3]) as f32));
 
-                                    let c1 = sample_input_at::<I, T>(uv, &jac, input, params, &bg, drawing);
-                                    let c2 = sample_input_at::<I, T>(pt2, &jac, input, params, &bg, drawing); // FIXME: jac should be adjusted for pt2
+                                    let c1 = sample_input_at::<I, T>(uv, &jac, input, params, &bg, drawing, coeffs);
+                                    let c2 = sample_input_at::<I, T>(pt2, &jac, input, params, &bg, drawing, coeffs); // FIXME: jac should be adjusted for pt2
                                     pixel = c1 * alpha + c2 * (1.0 - alpha);
                                     // draw_pixel(&mut pixel, p.0 as i32, p.1 as i32, false, params.output_width, params, drawing);
+                                    if color_enabled {
+                                        apply_color_stage(&mut pixel, &color_params, lut_view.as_ref(), params.max_pixel_value);
+                                    }
                                     if fix_range {
                                         remap_colorrange(&mut pixel, is_y)
                                     }
@@ -612,10 +649,13 @@ impl Stabilization {
                                     return;
                                 }
 
-                                pixel = sample_input_at::<I, T>(uv, &jac, input, params, &bg, drawing);
+                                pixel = sample_input_at::<I, T>(uv, &jac, input, params, &bg, drawing, coeffs);
                             }
                             // draw_pixel(&mut pixel, p.0 as i32, p.1 as i32, false, params.output_width, params, drawing);
 
+                            if color_enabled {
+                                apply_color_stage(&mut pixel, &color_params, lut_view.as_ref(), params.max_pixel_value);
+                            }
                             if fix_range {
                                 remap_colorrange(&mut pixel, is_y)
                             }
@@ -855,4 +895,161 @@ pub fn undistort_points(distorted: &[(f32, f32)], camera_matrix: Matrix3<f64>, d
             (-1000000.0, -1000000.0)
         }
     }).collect()
+}
+
+#[cfg(test)]
+mod color_stage_tests {
+    use super::*;
+    use crate::color::{ ColorKernelParams, apply_color };
+
+    fn params_from(kp: &KernelParams) -> ColorKernelParams {
+        ColorKernelParams {
+            exposure_gain:     kp.color_params_1[0],
+            contrast_factor:   kp.color_params_1[1],
+            saturation_factor: kp.color_params_1[2],
+            lut_strength:      kp.color_params_1[3],
+            wb_gains:          [kp.color_params_2[0], kp.color_params_2[1], kp.color_params_2[2]],
+            lut_size:          kp.color_params_2[3] as u32,
+            domain_min:        kp.color_params_3[0],
+            domain_max:        kp.color_params_3[1],
+        }
+    }
+
+    #[test]
+    fn kernel_params_round_trip_to_color_params() {
+        let mut kp = KernelParams::default();
+        kp.color_params_1 = [2.0, 1.5, 0.5, 1.0];
+        kp.color_params_2 = [1.1, 1.0, 0.9, 33.0];
+        kp.color_params_3 = [0.0, 1.0, 0.0, 0.0];
+
+        let cp = params_from(&kp);
+        assert_eq!(cp.exposure_gain, 2.0);
+        assert_eq!(cp.lut_size, 33);
+
+        // One stop up on quarter grey lands on half grey.
+        let out = apply_color([0.25, 0.25, 0.25], &ColorKernelParams { contrast_factor: 1.0, saturation_factor: 1.0, wb_gains: [1.0; 3], ..cp }, None);
+        assert!((out[0] - 0.5).abs() < 1e-6, "was {}", out[0]);
+    }
+
+    /// End-to-end pixel-path test: actually calls `undistort_image_cpu` (not just
+    /// `apply_color` directly), with COLOR_ENABLED/HAS_LUT set in `flags`, a real LUT
+    /// sliced out of a `build_coeffs_buffer` result at `LUT_DATA_OFFSET`, and non-neutral
+    /// colour params. Geometry is set up to be a pure identity resample (k=0 distortion,
+    /// f=[1,1], c=[0,0], lens_correction_amount=1.0, r_limit=0, 1:1 rects, background_mode
+    /// 0) so that, before the colour stage, output pixel (x,y) is bit-identical to input
+    /// pixel (x,y) — this isolates what the colour stage itself does to the pixel.
+    #[test]
+    fn color_stage_applied_end_to_end_through_undistort_image_cpu() {
+        use crate::gpu::BufferDescription;
+        use crate::color::Lut3D;
+        use crate::stabilization::RGBAf;
+
+        const W: i32 = 2;
+        const H: i32 = 2;
+        const BPP: i32 = 16; // RGBAf: 4 x f32
+        const STRIDE: i32 = W * BPP;
+
+        // Inverts every channel: sample_trilinear(lut, c) == [1-c0, 1-c1, 1-c2] for any c
+        // in 0..1 (bilinear interpolation of a linear function is exact), corner order
+        // matches lut.rs's documented "red varying fastest" .cube layout.
+        let lut = Lut3D {
+            size: 2,
+            domain_min: 0.0,
+            domain_max: 1.0,
+            data: vec![
+                1.0, 1.0, 1.0,   0.0, 1.0, 1.0,   1.0, 0.0, 1.0,   0.0, 0.0, 1.0,
+                1.0, 1.0, 0.0,   0.0, 1.0, 0.0,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0,
+            ],
+            checksum: 0,
+        };
+        let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
+        assert_eq!(coeffs.len(), crate::stabilization::LUT_DATA_OFFSET + 24, "LUT payload not appended where undistort_image_cpu expects to slice it");
+
+        let color_params_1 = [1.2f32, 1.1, 0.8, 0.5]; // exposure_gain, contrast_factor, saturation_factor, lut_strength
+        let color_params_2 = [1.05f32, 1.0, 0.95, 2.0]; // wb_gain_r/g/b, lut_size
+        let color_params_3 = [0.0f32, 1.0, 0.0, 0.0]; // domain_min, domain_max
+
+        fn base_params(flags: i32, color_params_1: [f32; 4], color_params_2: [f32; 4], color_params_3: [f32; 4]) -> KernelParams {
+            let mut p = KernelParams::default();
+            p.width = W; p.height = H; p.stride = STRIDE;
+            p.output_width = W; p.output_height = H; p.output_stride = STRIDE;
+            p.matrix_count = 1;
+            p.interpolation = 2;
+            p.bytes_per_pixel = BPP;
+            p.pix_element_count = 4;
+            p.f = [1.0, 1.0];
+            p.c = [0.0, 0.0];
+            p.fov = 1.0;
+            p.lens_correction_amount = 1.0; // skips the lens-correction block entirely
+            p.source_rect = [0, 0, W, H];
+            p.output_rect = [0, 0, W, H];
+            p.max_pixel_value = 1.0;
+            p.pixel_value_limit = f32::MAX;
+            p.light_refraction_coefficient = 1.0;
+            p.flags = flags;
+            p.color_params_1 = color_params_1;
+            p.color_params_2 = color_params_2;
+            p.color_params_3 = color_params_3;
+            p
+        }
+
+        // Identity 3x3 rotation/translation block (first 9 of the 14 matrix fields); the
+        // trailing 5 (extra shift/angle fields) stay zero, which disables that adjustment.
+        let matrices: [[f32; 14]; 1] = [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]];
+        let distortion_model = DistortionModel::default(); // OpenCVFisheye with k=0 => identity distort/undistort
+
+        // Four distinct, non-trivial input pixels so the pipeline can't pass by coincidence.
+        let input_pixels: [[f32; 4]; 4] = [
+            [0.10, 0.80, 0.30, 1.0],
+            [0.90, 0.05, 0.60, 1.0],
+            [0.40, 0.40, 0.40, 1.0],
+            [0.75, 0.20, 0.95, 1.0],
+        ];
+        let mut input_bytes = vec![0u8; (STRIDE * H) as usize];
+        for (i, p) in input_pixels.iter().enumerate() {
+            input_bytes[i * 16..i * 16 + 16].copy_from_slice(bytemuck::bytes_of(p));
+        }
+
+        let run = |flags: i32| -> Vec<[f32; 4]> {
+            let params = base_params(flags, color_params_1, color_params_2, color_params_3);
+            let mut input = input_bytes.clone();
+            let mut output = vec![0u8; (STRIDE * H) as usize];
+            let mut buffers = Buffers {
+                input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
+                output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+            };
+            let ok = Stabilization::undistort_image_cpu::<2, RGBAf>(&mut buffers, &params, &distortion_model, None, &matrices, &[], &[], &coeffs);
+            assert!(ok, "undistort_image_cpu returned false");
+            (0..4).map(|i| *bytemuck::from_bytes::<[f32; 4]>(&output[i * 16..i * 16 + 16])).collect()
+        };
+
+        let disabled = run(0);
+        let enabled = run(4096 | 8192); // COLOR_ENABLED | HAS_LUT
+
+        // Half 1 of the constraint: COLOR_ENABLED unset => bit-identical no-op (pure identity resample).
+        for (i, p) in input_pixels.iter().enumerate() {
+            assert_eq!(disabled[i], *p, "pixel {i} not a no-op with colour disabled");
+        }
+
+        // Half 2: COLOR_ENABLED set => differs from the disabled run, and matches apply_color()
+        // called directly with the same params/LUT on the same (identity-resampled) input.
+        let cp = ColorKernelParams {
+            exposure_gain:     color_params_1[0],
+            contrast_factor:   color_params_1[1],
+            saturation_factor: color_params_1[2],
+            lut_strength:      color_params_1[3],
+            wb_gains:          [color_params_2[0], color_params_2[1], color_params_2[2]],
+            lut_size:          color_params_2[3] as u32,
+            domain_min:        color_params_3[0],
+            domain_max:        color_params_3[1],
+        };
+        for (i, p) in input_pixels.iter().enumerate() {
+            assert_ne!(enabled[i], disabled[i], "pixel {i} identical with colour enabled vs disabled");
+            let expected_rgb = apply_color([p[0], p[1], p[2]], &cp, Some(&lut));
+            for c in 0..3 {
+                assert!((enabled[i][c] - expected_rgb[c]).abs() < 1e-5, "channel {c} mismatch on pixel {i}: {} != {}", enabled[i][c], expected_rgb[c]);
+            }
+            assert_eq!(enabled[i][3], p[3], "alpha should pass through the colour stage unaffected on pixel {i}");
+        }
+    }
 }

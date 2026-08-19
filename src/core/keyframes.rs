@@ -53,6 +53,13 @@ define_keyframes! {
     SmoothingParamYaw,           "#88c451", "Yaw smoothness",                   |v| format!("{:.2}", v),
 
     VideoSpeed,                  "#f6e926", "Video speed",                      |v| format!("{:.1}%", v * 100.0),
+
+    ColorExposure,               "#f2a65a", "Exposure",                         |v| format!("{:+.2} EV", v),
+    ColorContrast,               "#f2c14e", "Contrast",                         |v| format!("{:+.0}", v * 100.0),
+    ColorSaturation,             "#e8845a", "Saturation",                       |v| format!("{:+.0}", v * 100.0),
+    ColorTemperature,            "#5ab0f2", "Color temperature",                |v| format!("{:.0} K", v),
+    ColorTint,                   "#c45af2", "Tint",                             |v| format!("{:+.0}", v * 100.0),
+    ColorLutStrength,            "#5af2c4", "LUT strength",                     |v| format!("{:.0}%", v * 100.0),
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, ::serde::Serialize, ::serde::Deserialize)]
@@ -166,6 +173,23 @@ impl KeyframeManager {
         }
         self.is_keyframed_internally(typ)
     }
+    /// Whether any colour parameter is keyframed.
+    ///
+    /// `ColorAdjustments::is_active` can only see the static scalars, but it gates the whole
+    /// colour stage - and the gate is evaluated *before* keyframes are read. Without this,
+    /// a project whose colour is entirely keyframed (every static scalar neutral, no LUT)
+    /// has `COLOR_ENABLED` cleared and every colour keyframe silently ignored.
+    pub fn is_any_color_keyframed(&self) -> bool {
+        [
+            KeyframeType::ColorExposure,
+            KeyframeType::ColorContrast,
+            KeyframeType::ColorSaturation,
+            KeyframeType::ColorTemperature,
+            KeyframeType::ColorTint,
+            KeyframeType::ColorLutStrength,
+        ].iter().any(|t| self.is_keyframed(t))
+    }
+
     pub fn value_at_video_timestamp(&self, typ: &KeyframeType, timestamp_ms: f64) -> Option<f64> {
         if let Some(custom) = &self.custom_provider {
             if let Ok(mut custom) = custom.lock() {
@@ -297,5 +321,44 @@ impl Easing {
         };
 
         a * (1.0 - x) + b * x
+    }
+}
+
+#[cfg(test)]
+mod color_gate_tests {
+    use super::*;
+
+    /// The colour stage is gated on `ColorAdjustments::is_active`, which can only see the
+    /// static scalars — and the gate is evaluated before any keyframe is read. A project
+    /// whose colour lives entirely in keyframes (every static scalar neutral, no LUT) must
+    /// still arm the stage, or every colour keyframe in it is silently ignored.
+    #[test]
+    fn color_keyframes_are_visible_to_the_gate() {
+        let mut km = KeyframeManager::default();
+        assert!(!km.is_any_color_keyframed(), "empty manager must not arm the gate");
+
+        // A non-colour keyframe must not arm it either.
+        km.set(&KeyframeType::Fov, 0, 1.5);
+        assert!(!km.is_any_color_keyframed(), "a non-colour keyframe must not arm the colour gate");
+
+        km.set(&KeyframeType::ColorExposure, 0, 0.0);
+        assert!(km.is_any_color_keyframed(), "a colour keyframe must arm the gate");
+    }
+
+    /// Every colour parameter counts, not just exposure.
+    #[test]
+    fn every_color_keyframe_type_arms_the_gate() {
+        for typ in [
+            KeyframeType::ColorExposure,
+            KeyframeType::ColorContrast,
+            KeyframeType::ColorSaturation,
+            KeyframeType::ColorTemperature,
+            KeyframeType::ColorTint,
+            KeyframeType::ColorLutStrength,
+        ] {
+            let mut km = KeyframeManager::default();
+            km.set(&typ, 0, 1.0);
+            assert!(km.is_any_color_keyframed(), "{typ:?} did not arm the gate");
+        }
     }
 }
