@@ -174,7 +174,9 @@ impl FrameTransform {
         let light_refraction_coefficient = params.keyframes.value_at_video_timestamp(&KeyframeType::LightRefractionCoeff, timestamp_ms).unwrap_or(params.light_refraction_coefficient);
 
         let color = &params.color;
-        let color_kernel = if color.is_active() {
+        // `is_active` only sees the static scalars, so a project whose colour lives entirely
+        // in keyframes would be gated off before the keyframes below are ever read.
+        let color_kernel = if color.enabled && (color.is_active() || params.keyframes.is_any_color_keyframed()) {
             Some(color.to_kernel_params(
                 params.keyframes.value_at_video_timestamp(&KeyframeType::ColorExposure,    timestamp_ms).unwrap_or(color.exposure),
                 params.keyframes.value_at_video_timestamp(&KeyframeType::ColorContrast,    timestamp_ms).unwrap_or(color.contrast),

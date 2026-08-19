@@ -262,7 +262,8 @@ impl Stabilization {
         // The condition mirrors `frame_transform.rs` exactly (`color.is_active()`, and HAS_LUT
         // only when a LUT is present); `at_timestamp` keeps setting them for its direct callers,
         // which have no `Stabilization` to ask, and the two paths agree by construction.
-        let color_active = self.compute_params.color.is_active();
+        let color = &self.compute_params.color;
+        let color_active = color.enabled && (color.is_active() || self.compute_params.keyframes.is_any_color_keyframed());
         kernel_flags.set(KernelParamsFlags::COLOR_ENABLED, color_active);
         kernel_flags.set(KernelParamsFlags::HAS_LUT, color_active && self.compute_params.color.lut.is_some());
 

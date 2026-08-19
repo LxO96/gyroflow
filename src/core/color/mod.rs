@@ -16,6 +16,11 @@ pub const DEFAULT_KELVIN: f64 = 5500.0;
 pub const MIN_KELVIN: f64 = 1667.0;
 pub const MAX_KELVIN: f64 = 25000.0;
 
+/// Exposure bounds, in stops. Shared by `set_param` and `to_kernel_params` so the static
+/// and keyframe paths cannot drift apart.
+pub const MIN_EXPOSURE: f64 = -5.0;
+pub const MAX_EXPOSURE: f64 =  5.0;
+
 #[derive(Debug, Clone)]
 pub struct ColorAdjustments {
     pub enabled: bool,
@@ -86,7 +91,7 @@ impl ColorAdjustments {
     pub fn set_param(&mut self, name: &str, val: f64) -> bool {
         if !val.is_finite() { return false; }
         match name {
-            "exposure"      => self.exposure      = val.clamp(-5.0, 5.0),
+            "exposure"      => self.exposure      = val.clamp(MIN_EXPOSURE, MAX_EXPOSURE),
             "contrast"      => self.contrast      = val.clamp(-1.0, 1.0),
             "saturation"    => self.saturation    = val.clamp(-1.0, 1.0),
             "tint"          => self.tint          = val.clamp(-1.0, 1.0),
@@ -108,9 +113,15 @@ impl ColorAdjustments {
     }
 
     /// Scalars come in already resolved for this frame (keyframes applied by the caller).
+    ///
+    /// Every scalar is clamped here, including exposure. These values arrive from the
+    /// *keyframe* path, which never passes through `set_param`, so the import clamps and the
+    /// slider bounds are both bypassed - a hand-edited `keyframes` section, or a value typed
+    /// into the unbounded `NumberField`, lands here raw. Unclamped, `exposure.exp2()` reaches
+    /// `+inf` around 1024 and renders a white frame with no diagnostic.
     pub fn to_kernel_params(&self, exposure: f64, contrast: f64, saturation: f64, target_kelvin: f64, tint: f64, lut_strength: f64) -> ColorKernelParams {
         ColorKernelParams {
-            exposure_gain:     exposure.exp2() as f32,
+            exposure_gain:     exposure.clamp(MIN_EXPOSURE, MAX_EXPOSURE).exp2() as f32,
             contrast_factor:   (1.0 + contrast.clamp(-1.0, 1.0)) as f32,
             saturation_factor: (1.0 + saturation.clamp(-1.0, 1.0)) as f32,
             lut_strength:      lut_strength.clamp(0.0, 1.0) as f32,
@@ -299,5 +310,37 @@ mod tests {
         let mut with_lut = base.clone();
         with_lut.lut = Some(std::sync::Arc::new(Lut3D { size: 2, domain_min: 0.0, domain_max: 1.0, data: vec![0.5; 24], checksum: 12345 }));
         assert_ne!(base.get_checksum(), with_lut.get_checksum());
+    }
+
+    /// The keyframe path never goes through `set_param`, so a hand-edited project or the
+    /// unbounded numeric field can hand `to_kernel_params` anything at all. Unclamped,
+    /// `exp2` reaches `+inf` around 1024 stops and renders a white frame with no diagnostic.
+    #[test]
+    fn keyframed_exposure_cannot_blow_up_the_gain() {
+        let c = ColorAdjustments::default();
+
+        let huge = c.to_kernel_params(100_000.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        assert!(huge.exposure_gain.is_finite(), "exposure gain was {}", huge.exposure_gain);
+        assert_eq!(huge.exposure_gain, (MAX_EXPOSURE as f32).exp2());
+
+        let tiny = c.to_kernel_params(-100_000.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        assert!(tiny.exposure_gain.is_finite());
+        assert_eq!(tiny.exposure_gain, (MIN_EXPOSURE as f32).exp2());
+
+        // In-range values are untouched: one stop up is exactly a doubling.
+        let one_stop = c.to_kernel_params(1.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        assert_eq!(one_stop.exposure_gain, 2.0);
+    }
+
+    /// `set_param` and `to_kernel_params` must agree on the bounds, or the static and
+    /// keyframe paths clamp differently.
+    #[test]
+    fn static_and_keyframe_exposure_paths_share_bounds() {
+        let mut c = ColorAdjustments::default();
+        c.set_param("exposure", 100.0);
+        assert_eq!(c.exposure, MAX_EXPOSURE);
+        let via_keyframe = c.to_kernel_params(100.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        let via_static = c.to_kernel_params(c.exposure, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        assert_eq!(via_keyframe.exposure_gain, via_static.exposure_gain);
     }
 }
