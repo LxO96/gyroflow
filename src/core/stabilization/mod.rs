@@ -967,6 +967,15 @@ mod cross_backend_color_tests {
         p.lens_correction_amount = 1.0; // skips the lens-correction block entirely
         p.source_rect = [0, 0, W, H];
         p.output_rect = [0, 0, W, H];
+        // Must cover the whole frame, and leaving it at the default [0,0,0,0] is not neutral.
+        // `draw_safe_area` in the wgpu/OpenCL/SPIR-V kernels is *not* behind a flag: it runs on
+        // every pixel and multiplies rgb by 0.5 outside the rect, then by 0.5 again within 5px
+        // of its edge. At [0,0,0,0] every pixel is "outside", and every pixel with x < 5 is also
+        // "border", which is exactly the 1/2-and-1/4 attenuation this harness was measuring and
+        // misreading as a geometric divergence. Production sets this rect from the output size
+        // (see `undistort_image`), so the darkening is inert there - only a hand-built
+        // KernelParams like this one can trip it. The CPU path has no safe-area code at all.
+        p.safe_area_rect = [0.0, 0.0, W as f32, H as f32];
         p.max_pixel_value = 1.0;
         p.pixel_value_limit = f32::MAX;
         p.light_refraction_coefficient = 1.0;
@@ -1024,7 +1033,7 @@ mod cross_backend_color_tests {
     /// while the wgpu *fragment* path feeds `@builtin(position)`, which is the pixel centre
     /// `(x + 0.5, y + 0.5)`. Verified directly by instrumenting the shader to emit
     /// `@builtin(position)` and `undistort_coord`: the coordinate maths is an exact identity
-    /// on both, and the entire divergence is that half pixel — at `uv = 0.5` the sampler
+    /// on both, and the only *geometric* difference is that half pixel — at `uv = 0.5` the sampler
     /// lands on the half-pixel coefficient row and blends two texels, where the CPU lands
     /// exactly on one.
     ///
@@ -1033,6 +1042,14 @@ mod cross_backend_color_tests {
     /// Without it this test would be comparing two different resamplings and could say
     /// nothing about colour. See the note on the backend divergence in the design spec: the
     /// offset itself is a real, pre-existing, non-colour inconsistency between backends.
+    ///
+    /// The offset was necessary but *not sufficient*, and on its own it left the identity
+    /// control still failing. The rest of the original divergence was not geometric at all:
+    /// it was `draw_safe_area` attenuating rgb because `identity_transform` left
+    /// `safe_area_rect` at its default — see the note there. The two were easy to conflate
+    /// because the sampling-map probes decode a position *from channel values*, so a
+    /// multiplicative scale on the values is indistinguishable from one on the position. If
+    /// this control ever regresses, rule out value scaling before re-deriving the geometry.
     fn run_wgpu(flags: i32, lut: Option<Arc<Lut3D>>) -> Result<Vec<[f32; 4]>, String> {
         if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() {
             return Err("UNAVAILABLE: no usable wgpu adapter".into());
@@ -1288,7 +1305,7 @@ mod cross_backend_color_tests {
     /// Until it passes, no cross-backend colour claim can be made - which is exactly what
     /// this test existing and failing is for. Run it with `cargo test -- --ignored`.
     #[test]
-    #[ignore = "needs a GPU, and the wgpu identity control is not yet solved - see the note above"]
+    #[ignore = "needs a GPU; run with: cargo test -- --ignored"]
     fn identity_geometry_is_bit_exact_on_every_backend() {
         let mut ran_any = false;
 
@@ -1304,13 +1321,12 @@ mod cross_backend_color_tests {
         assert!(ran_any, "no backend was available, so this test asserted nothing");
     }
 
-    /// **Blocked on `identity_geometry_is_bit_exact_on_every_backend`.** Any number this
-    /// produces while the control fails is measuring wgpu's resampling, not its colour
-    /// stage, so treat a failure here as unread until the control passes. It is committed
-    /// now because the harness, the reference comparison and the tolerance are the settled
-    /// parts; only the geometry fixture is open.
+    /// **Read `identity_geometry_is_bit_exact_on_every_backend` first.** It is the control:
+    /// while it fails, any number this test produces is measuring wgpu's resampling rather
+    /// than its colour stage, and must be treated as unread. It currently passes bit-exactly,
+    /// so the figure below is a genuine measurement of the colour kernel.
     #[test]
-    #[ignore = "needs a GPU, and is blocked on the identity control above"]
+    #[ignore = "needs a GPU; run with: cargo test -- --ignored"]
     fn color_stage_matches_the_reference_on_every_backend() {
         let expected = reference();
         let lut = Some(Arc::new(inverting_lut()));
