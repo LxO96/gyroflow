@@ -1193,6 +1193,13 @@ impl RenderQueue {
                 if let Ok(mut render_options) = serde_json::from_value(out.clone()) as serde_json::Result<RenderOptions> {
                     render_options.update_from_json(out);
                     let smoothing = stabilizer.smoothing.read().clone();
+                    // Inherited from the UI for the same reason as `smoothing` and the params
+                    // below: a file added to the queue picks up the settings currently on
+                    // screen. Without this the job renders with a default (ungraded) colour
+                    // state while the preview still shows the grade. Any project or preset
+                    // imported for this file further down overrides it, which is correct -
+                    // the file's own saved grade should win over the ambient UI one.
+                    let color = stabilizer.color.read().clone();
                     let params = stabilizer.params.read();
 
                     let stab = StabilizationManager {
@@ -1222,6 +1229,7 @@ impl RenderQueue {
                     };
 
                     *stab.smoothing.write() = smoothing;
+                    *stab.color.write() = color;
 
                     let stab = Arc::new(stab);
 

@@ -1175,6 +1175,7 @@ impl StabilizationManager {
             lens:   Arc::new(RwLock::new(self.lens.read().clone())),
             keyframes:  Arc::new(RwLock::new(self.keyframes.read().clone())),
             smoothing:  Arc::new(RwLock::new(self.smoothing.read().clone())),
+            color:      Arc::new(RwLock::new(self.color.read().clone())),
             input_file: Arc::new(RwLock::new(self.input_file.read().clone())),
             lens_profile_db: self.lens_profile_db.clone(),
 
@@ -2631,5 +2632,39 @@ DOMAIN_MAX 1.0 1.0 1.0
         let kf = restored.keyframes.read();
         assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorExposure,    1000.0), Some(1.5));
         assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorLutStrength, 2000.0), Some(0.25));
+    }
+
+    /// `get_cloned` is what the Export button renders with: `RenderQueue::add`
+    /// (`render_queue.rs`) clones the live manager and hands the clone to `render`, which
+    /// reads `stab.color` to decide whether to bake. A field missing here is therefore not a
+    /// cosmetic omission - it silently un-grades every export while the preview, which uses
+    /// the live manager, still shows the grade. There is no warning, because the "not baking"
+    /// warnings only fire once `bake_color` is already true.
+    #[test]
+    fn get_cloned_preserves_the_colour_grade() {
+        let mgr = configured_manager(Some("C:/luts/round-trip.cube".into()));
+        let cloned = mgr.get_cloned();
+
+        let (a, b) = (mgr.color.read(), cloned.color.read());
+        assert!(b.is_active(),      "clone must still be active - this is what gates baking");
+        assert!(b.bake_in_render,   "clone lost bake_in_render, so render() would skip baking");
+        assert!(b.lut.is_some(),    "clone lost the LUT, which is the whole grade for a log clip");
+        assert_eq!(b.lut_name, a.lut_name);
+        assert_eq!(b.lut_path, a.lut_path);
+        assert_scalars_match(&a, &b);
+    }
+
+    /// The clone must be a *snapshot*, not a shared handle. `color` is an `Arc<RwLock<..>>`,
+    /// so cloning the `Arc` instead of the value would make a render in progress follow later
+    /// slider moves. Distinct from the test above: that one fails when the field is dropped,
+    /// this one fails when it is shared.
+    #[test]
+    fn get_cloned_snapshots_colour_rather_than_sharing_it() {
+        let mgr = configured_manager(None);
+        let cloned = mgr.get_cloned();
+
+        mgr.color.write().exposure = -3.0;
+
+        assert_eq!(cloned.color.read().exposure, 0.75, "clone followed a later edit to the original");
     }
 }
