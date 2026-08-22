@@ -1,5 +1,18 @@
 # Colour / LUT — open threads
 
+> **2026-08-22: §1 is RESOLVED — Gyroflow was not wrong.** The exported file, decoded
+> honouring its own `color_range=pc` tag, matches the preview to within 0.0007 mean and
+> 0.0008 std (fit: `file = 0.954 × preview + 0.022`). Decoded *as if limited-range*, it
+> reproduces the reported difference exactly: `1.108 × preview − 0.047`, pivot 0.433, against
+> `1.133 / 0.417` measured independently from the user's own screenshots. The viewer was
+> expanding a full-range file.
+>
+> The real defect is that the export is **under-described**. `color_range=pc` is written, but
+> `color_space`, `color_transfer` and `color_primaries` are all `unknown`, inherited from the
+> source (`ffmpeg_video.rs:128-137`, `548-551`). With no matrix declared, players fall back to
+> defaults and many assume limited range for 10-bit YUV, ignoring the range tag. Fix is a
+> tagging policy decision, not a colour-maths change — see §1 below.
+
 Handoff note, 2026-08-20. Branch `wgpu-identity-investigation`, 7 commits on top of `master`.
 `master` (`beb392a5`) already carries the merged colour work and is 50 commits ahead of
 `origin/master` — nothing here has been pushed.
@@ -99,20 +112,40 @@ stuck at 0 because the compute-params snapshot never refreshed), the preview dro
 permanently while still applying exposure, contrast, saturation and white balance. A user with
 both a LUT and slider adjustments would see exactly a partial, weaker-looking grade.
 
-### Next step
+### Resolution
 
-**The diagnostic that settles it, and it needs eyes on the app.** Load a clip, load the LUT, and
-leave *every slider neutral* so the LUT is the only thing acting.
+Settled by rendering `C3147.MP4` with the grade the user actually had on screen (LUT at 100%,
+every scalar neutral, target 6000 K = source 6000 K, so white balance a no-op), screen-capturing
+the preview, and fitting the decoded file against it:
 
-- If the preview **does not change at all** — the preview is skipping the LUT entirely, and the
-  reported "weaker" is really "only the sliders are being applied". Instrument `lut_size` and
-  `lut_tex_size` at `undistort.frag:147` (or log them from the Rust side in `qrhi_undistort.rs`)
-  and find which snapshot is stale.
-- If the preview **does change, but less than the export** — the LUT is being applied at partial
-  strength. Check `lut_strength` (`color_params_1.w`) as the preview sees it, including the
-  keyframe path, and confirm the preview is not blending toward the ungraded image somewhere.
+| decode of the export | fit vs preview | mean (prev / file) | std (prev / file) |
+|---|---|---|---|
+| honouring `color_range=pc` | `0.954 × preview + 0.022` | 0.4558 / 0.4565 | 0.2104 / 0.2112 |
+| as limited-range | `1.108 × preview − 0.047`, pivot 0.433 | — | 0.2104 / 0.2456 |
 
-Do not re-test the input-values theory; the table above already closes it.
+Decoded correctly the file *is* the preview. Decoded as limited-range it reproduces the reported
+difference, matching the `1.133 / 0.417` fit taken independently from the user's screenshots. The
+colour maths, on both sides, was right the whole time.
+
+### What to actually fix: output colour tagging
+
+The export writes `color_range=pc` but leaves `color_space`, `color_transfer` and
+`color_primaries` at `unknown`, copied from the source (`ffmpeg_video.rs:128-137`, `548-551`).
+An undeclared matrix is what sends players to their defaults, and for 10-bit YUV many default to
+limited range and ignore the range tag.
+
+This is a policy decision, not a bug fix, so it is left for a human:
+
+1. **Declare the matrix, keep full range.** Write BT.709 primaries/transfer/matrix when the
+   source leaves them unspecified. Most players assume BT.709 for HD/UHD anyway, so this mostly
+   removes the ambiguity that makes them guess. Does not *guarantee* they honour `pc`.
+2. **Encode limited range.** Convert full→limited on output. Virtually every player assumes
+   limited for video, so this is the most interoperable, but it is a real behaviour change for
+   every user and costs a little headroom.
+3. **Tag from the LUT.** Tempting after baking a log→709 LUT, but Gyroflow cannot know what a
+   given `.cube` outputs — a Rec.2020 LUT would be mistagged. Only sound if the user declares it.
+
+Option 1 is the conservative one and fixes the reported symptom for most players.
 
 ---
 
