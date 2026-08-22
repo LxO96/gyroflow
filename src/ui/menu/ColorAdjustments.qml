@@ -162,6 +162,7 @@ MenuItem {
             value: 1.0; defaultValue: 1.0;
             scaler: 100.0;
             unit: "%"; precision: 0;
+            showOrigin: true;
             keyframe: "ColorLutStrength";
             onValueChanged: controller.set_color_param("lut_strength", value);
         }
@@ -175,6 +176,7 @@ MenuItem {
             from: -5; to: 5;               // matches ColorAdjustments::set_param
             value: 0; defaultValue: 0;
             unit: " EV"; precision: 2;
+            showOrigin: true;
             keyframe: "ColorExposure";
             onValueChanged: controller.set_color_param("exposure", value);
         }
@@ -189,6 +191,7 @@ MenuItem {
             value: 0; defaultValue: 0;
             scaler: 100.0;
             precision: 0;
+            showOrigin: true;
             keyframe: "ColorContrast";
             onValueChanged: controller.set_color_param("contrast", value);
         }
@@ -203,6 +206,7 @@ MenuItem {
             value: 0; defaultValue: 0;
             scaler: 100.0;
             precision: 0;
+            showOrigin: true;
             keyframe: "ColorSaturation";
             onValueChanged: controller.set_color_param("saturation", value);
         }
@@ -219,6 +223,15 @@ MenuItem {
             width: parent.width;
             from: 1667; to: 25000;         // MIN_KELVIN .. MAX_KELVIN
             value: 5500; defaultValue: 5500;
+            // Kelvin is a reciprocal-ish scale: 2000->3000 K is a large visible shift while
+            // 20000->21000 K is invisible. On a linear track the entire range people actually
+            // grade in (roughly 2500-8000 K) is crammed into the left fifth. Log spreads it
+            // out. Strictly, mireds (10^6/K) are the perceptually even unit, but log is very
+            // close over this range and keeps the axis readable in Kelvin.
+            logarithmic: true;
+            // The camera's own white balance, so the offset being applied is visible.
+            showOrigin: true;
+            originValue: defaultValue;
             unit: " K"; precision: 0;
             keyframe: "ColorTemperature";
             onValueChanged: controller.set_color_param("target_kelvin", value);
@@ -234,6 +247,7 @@ MenuItem {
             value: 0; defaultValue: 0;
             scaler: 100.0;
             precision: 0;
+            showOrigin: true;
             keyframe: "ColorTint";
             onValueChanged: controller.set_color_param("tint", value);
         }
