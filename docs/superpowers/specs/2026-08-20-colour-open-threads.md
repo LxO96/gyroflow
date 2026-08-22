@@ -45,40 +45,74 @@ Each of these was a live candidate. None of them is the cause — do not re-trea
   normalise to 0–1 before grading and rescale after.
 - **Preview LUT precision fallback.** `qrhi_undistort.cpp:137-165` has a
   RGBA32F → RGBA16F → RGBA8 ladder, and rung 2 silently refuses real LUT data. This machine is
-  D3D11, which supports RGBA32F, so it sits on rung 0 at full precision. Worth re-checking on a
-  different GPU or backend, because rung 2 would present as "no LUT in preview at all".
+  D3D11, which supports RGBA32F, so it sits on rung 0 at full precision. **Still worth confirming
+  on the affected machine** — rung 2 presents as "no LUT in the preview at all", which is one of
+  the two shapes the next step below is trying to distinguish. It logs when it drops to rung 1 or
+  2, and rung 0 logs nothing, so absence of a message is weak evidence either way.
 - **`remap_colorrange`.** This fit the symptom well — it compresses contrast by 0.859, exactly a
   "flatter preview" signature. But the preview shader does not contain it at all, and
   `FIX_COLOR_RANGE` is only ever set for prores/NV12 (`rendering/mod.rs:619`).
 
-### Leading hypothesis
+### The "different input values" theory — measured, and dead
 
-The divergence is in **the input to the colour stage, not the colour stage**.
+The obvious theory was that the two paths grade *different pixels*: the preview grades an RGBA8
+texture from **MDK**, the export grades RGB from **swscale**, and the clips are `color_range=pc`
+with `color_space=unknown`, so a disagreement about range or transfer looked likely.
 
-The preview grades an RGBA8 texture produced by **MDK**. The export grades RGB produced by
-**swscale**. The test clips are `color_range=pc` (full range), `color_space=unknown`.
+It was measured on the real frame rather than argued, and **it does not hold**. Every variant
+fails on *direction* — each one makes the grade equal or **stronger**, never weaker:
 
-The export explicitly honours that flag — that is what
-`convert_pixel_format_color_aware` (`rendering/ffmpeg_video_converter.rs:62`) exists to do. If MDK
-sees `unknown` and assumes limited range, it expands 64–940 to full, so the *ungraded* preview is
-already contrast-stretched, and a LUT whose job is adding contrast has visibly less left to do.
-That reads exactly as "the grade is weaker in the preview".
+| input the LUT is handed | grade magnitude, mean LSB16 | vs correct |
+|---|---|---|
+| correct full-range log (what the export gets) | 6763 | — |
+| wrongly range-expanded (full read as limited) | 7217 | 1.07× |
+| already de-logged (as if MDK tone-mapped it) | 9314 | 1.38× |
+| 8-bit quantised log | 6763 | 1.00× |
 
-This is unconfirmed. `MDKPlayer` is only forward-declared in our tree
-(`qt_gpu/qrhi_undistort.cpp:18`); the implementation is in the MDK SDK under `ext/`. The preview
-framebuffer also could not be captured headlessly.
+So a range mismatch shifts grade strength by 7% *upward*, an already-converted input by 38%
+*upward*, and 8-bit preview quantisation not at all. None of them produces a weaker preview.
+
+Also checked and clean: the export preserves the source's `color_range=pc` tag, so this is not a
+player misreading an untagged file; `lut_sample` in `undistort.frag:106` matches `sample_trilinear`
+(`core/color/lut.rs:111`) operation for operation, including the `(g*n + r, b)` texel addressing;
+and `uploadLut` (`qrhi_undistort.cpp:284`) writes .cube order verbatim in all three format rungs.
+
+### Where this points instead
+
+The export is a provably correct, single, full-strength LUT application. For the preview to look
+*weaker* than that, the preview must be applying **less than the full LUT** — not grading
+different pixels. That inverts the search.
+
+The concrete mechanism to check first is the `lut_usable` guard in `undistort.frag:147`:
+
+```glsl
+bool lut_usable = lut_tex_size.x == lut_size * lut_size && lut_tex_size.y == lut_size;
+if (bool(params.flags & 8192) && lut_size >= 2 && lut_strength > 0.0 && lut_usable) { … }
+```
+
+`lut_size` arrives inside `KernelParams` (`color_params_2.w`), baked when the frame transform was
+computed; the *texture* is uploaded separately from an independent read of `stab.color`
+(`qt_gpu/qrhi_undistort.rs`, the `lut_ptr` / `lut_size` / `lut_checksum` block). The two come from
+different snapshots. The shader is written to skip the LUT for a frame when they disagree, which is
+right for a one-frame transient — but if they disagree *persistently* (e.g. `color_params_2.w`
+stuck at 0 because the compute-params snapshot never refreshed), the preview drops the LUT
+permanently while still applying exposure, contrast, saturation and white balance. A user with
+both a LUT and slider adjustments would see exactly a partial, weaker-looking grade.
 
 ### Next step
 
-**The diagnostic that settles it, and it needs eyes on the app:** with the colour panel disabled
-entirely, compare the ungraded preview against an ungraded export of the same frame.
+**The diagnostic that settles it, and it needs eyes on the app.** Load a clip, load the LUT, and
+leave *every slider neutral* so the LUT is the only thing acting.
 
-- If they **already differ** (preview punchier, less flat) — the colour code is innocent and this
-  is a decode-range bug in the preview path. Investigate what MDK is told about range and
-  colourspace, and whether Gyroflow can pass the source's `color_range` through to it.
-- If they **match** — the hypothesis is wrong. Move to the LUT sampling path: compare
-  `lut_sample` in `undistort.frag` against `sample_trilinear` in `core/color/lut.rs`, and check the
-  domain values in `color_params_3` and the 8-bit RGBA staging of the preview LUT upload.
+- If the preview **does not change at all** — the preview is skipping the LUT entirely, and the
+  reported "weaker" is really "only the sliders are being applied". Instrument `lut_size` and
+  `lut_tex_size` at `undistort.frag:147` (or log them from the Rust side in `qrhi_undistort.rs`)
+  and find which snapshot is stale.
+- If the preview **does change, but less than the export** — the LUT is being applied at partial
+  strength. Check `lut_strength` (`color_params_1.w`) as the preview sees it, including the
+  keyframe path, and confirm the preview is not blending toward the ungraded image somewhere.
+
+Do not re-test the input-values theory; the table above already closes it.
 
 ---
 
