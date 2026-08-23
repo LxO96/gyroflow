@@ -49,6 +49,7 @@ MenuItem {
         } else {
             root.lutName = controller.get_lut_name();
             outputSpace.syncFromCore();
+            outputRange.syncFromCore();
         }
     }
 
@@ -79,6 +80,7 @@ MenuItem {
         const actual = controller.get_lut_name();
         root.lutName = actual;
         outputSpace.syncFromCore();
+        outputRange.syncFromCore();
         if (c.lut_name && c.lut_name !== actual) {
             window.showNotification(Modal.Warning,
                 actual.length > 0
@@ -301,6 +303,45 @@ MenuItem {
             onCurrentIndexChanged: {
                 if (!preventChange && currentIndex >= 0 && currentIndex < ids.length) {
                     controller.set_output_color_space(ids[currentIndex]);
+                }
+            }
+            Component.onCompleted: reload();
+        }
+    }
+
+    Label {
+        visible: root.colorEnabled && root.bakeInRender;
+        text: qsTr("Output range");
+        tooltip: qsTr("Limited range is what almost every player assumes for video, so it is the safe choice for a file you are going to watch or share directly. Full range keeps every code value - better if the file is going back into a grading suite.");
+        ComboBox {
+            id: outputRange;
+            width: parent.width;
+            font.pixelSize: 12 * dpiScale;
+            currentIndex: 0;
+            property var ids: [];
+            property bool preventChange: false;
+
+            function reload(): void {
+                const list = controller.get_output_ranges();
+                let newIds = [], labels = [];
+                for (let i = 0; i < list.length; ++i) { newIds.push(list[i].id); labels.push(list[i].label); }
+                ids = newIds;
+                model = labels;
+                syncFromCore();
+            }
+            // As with the colour space, the core is the authority: loading a display-referred
+            // LUT moves this to Limited on its own, and the dropdown has to follow.
+            function syncFromCore(): void {
+                const idx = ids.indexOf(controller.get_output_range());
+                if (idx >= 0 && idx !== currentIndex) {
+                    preventChange = true;
+                    currentIndex = idx;
+                    preventChange = false;
+                }
+            }
+            onCurrentIndexChanged: {
+                if (!preventChange && currentIndex >= 0 && currentIndex < ids.length) {
+                    controller.set_output_range(ids[currentIndex]);
                 }
             }
             Component.onCompleted: reload();

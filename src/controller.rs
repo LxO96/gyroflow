@@ -86,6 +86,9 @@ pub struct Controller {
     get_output_color_space: qt_method!(fn(&self) -> QString),
     set_output_color_space: qt_method!(fn(&mut self, id: QString)),
     get_output_color_spaces: qt_method!(fn(&self) -> QJsonArray),
+    get_output_range: qt_method!(fn(&self) -> QString),
+    set_output_range: qt_method!(fn(&mut self, id: QString)),
+    get_output_ranges: qt_method!(fn(&self) -> QJsonArray),
     get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
     set_horizon_lock: qt_method!(fn(&self, lock_percent: f64, roll: f64, lock_pitch: bool, pitch: f64, automatic_lock: bool, turn_threshold: f64, turn_smoothing_ms: f64, turn_multiplier: f64, tilt_accel_limit: f64)),
     get_turn_speed: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
@@ -1287,7 +1290,17 @@ impl Controller {
                     // Only a first guess, and only when the user has not already chosen.
                     // Loading a second LUT must not silently overwrite a deliberate pick.
                     if c.output_color_space == core::color::OutputColorSpace::Unspecified {
-                        c.output_color_space = core::color::OutputColorSpace::from_lut_name(&name);
+                        let guess = core::color::OutputColorSpace::from_lut_name(&name);
+                        c.output_color_space = guess;
+                        // A LUT that names a *display* space is a deliverable-grade LUT, and a
+                        // deliverable is usually watched rather than re-graded - so seed video
+                        // range with it, which is what players assume and what stops the export
+                        // reading hotter than the preview. Same rules as the guess above: only
+                        // while untouched, and visible in the dropdown before anyone exports.
+                        if guess != core::color::OutputColorSpace::Unspecified
+                            && c.output_range == core::color::OutputRange::SameAsSource {
+                            c.output_range = core::color::OutputRange::Limited;
+                        }
                     }
                     c.lut = Some(Arc::new(lut));
                     c.lut_name = Some(name);
@@ -1338,6 +1351,29 @@ impl Controller {
             let mut o = QJsonObject::default();
             o.insert("id",    QString::from(s.id()).into());
             o.insert("label", QString::from(s.label()).into());
+            arr.push(o.into());
+        }
+        arr
+    }
+
+    /// The range the exported file is encoded in. This one *does* change pixels, but only in
+    /// the encoder - the stabilization kernels never see it - so like the colour space it must
+    /// not `request_recompute`: the preview is unaffected and re-rendering it would be waste.
+    fn get_output_range(&self) -> QString {
+        QString::from(self.stabilizer.color.read().output_range.id())
+    }
+    fn set_output_range(&mut self, id: QString) {
+        if let Some(r) = core::color::OutputRange::from_id(&id.to_string()) {
+            self.stabilizer.color.write().output_range = r;
+        }
+    }
+    /// `[{ id, label }, ...]` in declaration order, as for the colour spaces.
+    fn get_output_ranges(&self) -> QJsonArray {
+        let mut arr = QJsonArray::default();
+        for r in core::color::OutputRange::ALL {
+            let mut o = QJsonObject::default();
+            o.insert("id",    QString::from(r.id()).into());
+            o.insert("label", QString::from(r.label()).into());
             arr.push(o.into());
         }
         arr

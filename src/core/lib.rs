@@ -1300,6 +1300,7 @@ impl StabilizationManager {
                 "lut_path":               c.lut_path,
                 "lut_name":               c.lut_name,
                 "output_color_space":     c.output_color_space,
+                "output_range":           c.output_range,
                 // Embedded fallback, so the project still grades identically if the
                 // .cube file moves, is deleted, or the project travels to another machine.
                 // The checksum is deliberately not stored - it's recomputed from the data
@@ -1789,6 +1790,9 @@ impl StabilizationManager {
                 // the source, which is exactly what happened before this field existed.
                 if let Some(v) = obj.get("output_color_space").and_then(|x| x.as_str()) {
                     if let Some(s) = color::OutputColorSpace::from_id(v) { c.output_color_space = s; }
+                }
+                if let Some(v) = obj.get("output_range").and_then(|x| x.as_str()) {
+                    if let Some(r) = color::OutputRange::from_id(v) { c.output_range = r; }
                 }
                 let new_lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
                 let new_lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
@@ -2327,6 +2331,56 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_eq!(b.tint,                   a.tint);
         assert_eq!(b.lut_strength,           a.lut_strength);
         assert_eq!(b.lut_name,               a.lut_name);
+        assert_eq!(b.output_color_space,     a.output_color_space);
+        assert_eq!(b.output_range,           a.output_range);
+    }
+
+    /// Both output-declaration fields are stored as stable string ids rather than as numbers,
+    /// so a round trip is the only thing that proves the id tables on the two sides agree.
+    #[test]
+    fn output_space_and_range_round_trip_for_every_value() {
+        for space in color::OutputColorSpace::ALL {
+            for range in color::OutputRange::ALL {
+                let mgr = configured_manager(None);
+                {
+                    let mut c = mgr.color.write();
+                    c.output_color_space = space;
+                    c.output_range = range;
+                }
+                let restored = round_trip(&mgr);
+                let b = restored.color.read();
+                assert_eq!(b.output_color_space, space, "space {:?} with range {:?}", space, range);
+                assert_eq!(b.output_range,       range, "range {:?} with space {:?}", range, space);
+            }
+        }
+    }
+
+    /// An id written by a newer build, or typed by hand, must leave the value alone rather than
+    /// resetting it - the whole point of the fallback comment at the import site.
+    #[test]
+    fn unknown_output_ids_leave_the_current_value_alone() {
+        let mgr = configured_manager(None);
+        {
+            let mut c = mgr.color.write();
+            c.output_color_space = color::OutputColorSpace::Rec709;
+            c.output_range = color::OutputRange::Limited;
+        }
+        let mut json = mgr.export_gyroflow_data(GyroflowProjectType::WithGyroData, "{}", None).unwrap();
+        json = json.replace("\"output_color_space\": \"rec709\"", "\"output_color_space\": \"rec2100_future\"")
+                   .replace("\"output_range\": \"limited\"",     "\"output_range\": \"narrow_future\"");
+
+        let restored = StabilizationManager::default();
+        {
+            let mut c = restored.color.write();
+            c.output_color_space = color::OutputColorSpace::Srgb;
+            c.output_range = color::OutputRange::Full;
+        }
+        let mut is_preset = false;
+        restored.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+
+        let b = restored.color.read();
+        assert_eq!(b.output_color_space, color::OutputColorSpace::Srgb);
+        assert_eq!(b.output_range,       color::OutputRange::Full);
     }
 
     #[test]

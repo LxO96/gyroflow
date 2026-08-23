@@ -2,11 +2,13 @@
 // Copyright © 2026 Adrian <adrian.eddy at gmail>
 
 pub mod lut;
+pub mod output_range;
 pub mod output_space;
 pub mod source_metadata;
 pub mod white_balance;
 
 pub use lut::{ Lut3D, LutError, parse_cube, sample_trilinear };
+pub use output_range::OutputRange;
 pub use output_space::OutputColorSpace;
 pub use source_metadata::SourceExposure;
 pub use white_balance::kelvin_to_rgb_gains;
@@ -42,6 +44,11 @@ pub struct ColorAdjustments {
     /// and deliberately absent from `get_checksum` so changing it cannot invalidate the
     /// preview or trigger a recompute.
     pub output_color_space: OutputColorSpace,
+    /// What range the *exported file* is encoded in. Unlike `output_color_space` this one does
+    /// change pixels - but only during encoding, never in the stabilization kernels, so it is
+    /// likewise absent from `get_checksum`: the preview is unaffected and must not be
+    /// invalidated by it.
+    pub output_range: OutputRange,
 }
 
 impl Default for ColorAdjustments {
@@ -61,6 +68,7 @@ impl Default for ColorAdjustments {
             lut_path: None,
             lut_name: None,
             output_color_space: OutputColorSpace::default(),
+            output_range: OutputRange::default(),
         }
     }
 }

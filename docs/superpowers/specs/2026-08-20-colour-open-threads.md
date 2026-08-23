@@ -169,8 +169,51 @@ The field is deliberately absent from `get_checksum`, so changing it cannot inva
 it has no effect on any pixel to invalidate. It round-trips through the `.gyroflow` project file
 under `"output_color_space"`.
 
-Option 1 remains available as a future default for the untagged-source case, and is not ruled out by
-this; option 2 was rejected as too large a behaviour change for every user.
+**Then option 2 as well, because option 3 did not fix the symptom.** Declaring the matrix removed
+a real ambiguity but left the actual mechanism untouched: `color_range=pc` was already being
+written and is precisely the field players ignore for YUV. Measured on a fresh export of C3147
+with the LUT baked - luma spans codes 31..1016 with 0.65% of pixels *below* 64, so the file
+genuinely uses the full range, and a player assuming video range applies a gain of 1023/876 =
+1.168 about a pivot at code 445. That matches the `1.133 / 0.417` fit from the user's screenshots
+and the `1.108 / 0.433` fit from decoding the file as limited-range: three independent numbers,
+one mechanism.
+
+`OutputRange` (`src/core/color/output_range.rs`) is therefore a second field on
+`ColorAdjustments`, with an "Output range" dropdown beside the colour-space one: *Same as source*
+(default, the old behaviour), *Limited (video, 16-235)*, *Full (0-255)*. It is deliberately a
+separate module from `output_space.rs` so that file's "only the tags change, never a pixel"
+invariant stays literally true - this one *does* convert.
+
+The conversion is free: swscale already applies range as part of the RGB->YUV matrix if the
+destination frame declares it, which is the same mechanism
+`tag_limited_range_for_prores_videotoolbox` relies on, so `set_output_range` is a one-line
+`set_color_range` on the output frame. It runs *before* the prores workaround, so that
+encoder-bug fix still wins over a user asking for Full.
+
+Baking-only, and here that is a hard technical limit rather than a policy choice: without baking
+the frame never becomes RGB, swscale never builds an RGB->YUV matrix, and the only range
+machinery in play is the kernels' own `remap_colorrange` behind `FIX_COLOR_RANGE` - routing
+through that would mean touching all five hand-maintained kernels.
+
+Seeding ties the two together: a LUT whose name resolves to a *display* colour space is a
+deliverable-grade LUT, so `load_lut` seeds range to Limited alongside the space. Verified in the
+GUI - loading `SL3SG3Ctos709.cube` moves both dropdowns on its own, to Rec. 709 and
+Limited (video, 16-235). Both stay overridable, and neither overwrites a deliberate choice.
+
+Measured end to end on C3147:
+
+| | tags | Y min | Y max | % below 64 |
+|---|---|---|---|---|
+| before | `pc` + `unknown`x3 | 31 | 1016 | 0.65 |
+| space only | `pc` + `bt709`x3 | 31 | 1016 | 0.65 |
+| space + limited range | `tv` + `bt709`x3 | 90 | 934 | 0.00 |
+
+And decoded the way a player actually decodes each: the new limited-range file reads back as
+`0.997x` the intended picture (offset -0.007), against `1.163x / -0.079` for the old one. The
+disagreement is gone.
+
+Option 1 remains available as a future default for the untagged-source case, and is not ruled out
+by this.
 
 ---
 

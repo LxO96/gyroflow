@@ -20,7 +20,7 @@ pub use self::video_processor::VideoProcessor;
 pub use self::ffmpeg_processor::{ FfmpegProcessor, FFmpegError };
 use render_queue::RenderOptions;
 use crate::core::{ StabilizationManager, stabilization::* };
-use crate::core::color::OutputColorSpace;
+use crate::core::color::{ OutputColorSpace, OutputRange };
 use ffmpeg_next::{ format::Pixel, frame::Video, codec, Error, ffi };
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -304,6 +304,42 @@ fn tag_output_color_space(out_frame: &mut Video, space: OutputColorSpace) {
     out_frame.set_color_space(matrix);
 }
 
+/// Chooses the range the output is encoded in, converting the pixels to match.
+///
+/// This is the one place in this file that changes samples rather than tags, and the mechanism
+/// is the same one `tag_limited_range_for_prores_videotoolbox` relies on: swscale applies the
+/// range as part of the RGB->YUV matrix, but only if the destination frame declares it, so
+/// declaring it here is what performs the conversion. `ffmpeg_video.rs` then reads the range
+/// back off the frame and tags the encoder to match, so the file describes what it holds.
+///
+/// Why anyone would want it: a baked log-to-display LUT expands contrast into the full code
+/// range, and a great many players ignore `color_range=pc` for YUV and assume video range
+/// anyway - stretching the picture by 1023/876 about a pivot at code 445, which reads as
+/// crushed blacks and clipped highlights. Encoding video range instead means those players are
+/// right by construction. The cost is ~15% of the code range, which matters if the file is
+/// going back into a grading suite and does not if it is going to a viewer.
+///
+/// Baking-only, and unlike the colour-space tag that is a hard technical limit rather than a
+/// policy: without baking the frame never becomes RGB, swscale never builds an RGB->YUV matrix,
+/// and the only range machinery in play is the kernels' own `remap_colorrange`, which is driven
+/// by `FIX_COLOR_RANGE` per plane. Routing this through that instead would mean touching all
+/// five hand-maintained kernels. The UI gates on baking for the same reason.
+///
+/// Called before the first conversion, next to the other two, because the swscale contexts read
+/// the frame's range when they are built and are cached from then on - and *before*
+/// `tag_limited_range_for_prores_videotoolbox`, deliberately: that one works around an encoder
+/// bug and has to win, so a user asking for `Full` on prores NV12 still gets the limited-range
+/// samples that encoder requires rather than a broken file.
+fn set_output_range(out_frame: &mut Video, range: OutputRange) {
+    use ffmpeg_next::util::color::Range;
+    match range {
+        // Keep whatever the decoded source carried, which is what happened before this existed.
+        OutputRange::SameAsSource => { },
+        OutputRange::Limited => out_frame.set_color_range(Range::MPEG),
+        OutputRange::Full    => out_frame.set_color_range(Range::JPEG),
+    }
+}
+
 /// The colour stage is RGB-only, so it must never run on a plane that cannot carry RGB:
 /// a single-channel `Luma8` / `Luma16` / `R32f` plane or a two-channel `UV8` / `UV16` one.
 /// This is applied to every plane `create_planes_proc!` builds, so no dispatch arm can
@@ -562,6 +598,10 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     // Read once, next to `bake_color`, because the two must describe the same decision: the
     // tag is only ever written where the grade was actually baked in.
     let output_color_space = stab.color.read().output_color_space;
+    // Same reasoning, and the same gate: converting range is only possible on the baking path,
+    // because that is the only one that produces a full-range RGB intermediate for swscale to
+    // convert *from*. See `set_output_range`.
+    let output_range = stab.color.read().output_range;
     // The packed RGB format the source must be converted to for the colour stage, decided
     // once when the planes are built and reused by the per-frame dispatch below, so the two
     // cannot disagree about the layout the closures were built for.
@@ -746,6 +786,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 ::log::info!("Baking colour adjustments: converting {:?} to {:?}", format, target);
                 // Must happen before the first conversion: the swscale contexts read the
                 // frame's range when they are built, and they are cached from then on.
+                set_output_range(output_frame, output_range);
                 tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
                 tag_output_color_space(output_frame, output_color_space);
                 converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
@@ -862,6 +903,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             // The plane closures above were built for this converted packed RGB frame, so
             // the frame handed to them must go through the same conversion. `color_convert_to`
             // is the one value both decisions read, so they cannot disagree.
+            set_output_range(output_frame, output_range);
             tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
             tag_output_color_space(output_frame, output_color_space);
             converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
