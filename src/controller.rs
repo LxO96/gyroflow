@@ -83,6 +83,9 @@ pub struct Controller {
     load_lut: qt_method!(fn(&mut self, url: QUrl) -> QString),
     clear_lut: qt_method!(fn(&mut self)),
     get_lut_name: qt_method!(fn(&self) -> QString),
+    get_output_color_space: qt_method!(fn(&self) -> QString),
+    set_output_color_space: qt_method!(fn(&mut self, id: QString)),
+    get_output_color_spaces: qt_method!(fn(&self) -> QJsonArray),
     get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
     set_horizon_lock: qt_method!(fn(&self, lock_percent: f64, roll: f64, lock_pitch: bool, pitch: f64, automatic_lock: bool, turn_threshold: f64, turn_smoothing_ms: f64, turn_multiplier: f64, tilt_accel_limit: f64)),
     get_turn_speed: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
@@ -1280,8 +1283,14 @@ impl Controller {
             Ok(lut) => {
                 {
                     let mut c = self.stabilizer.color.write();
+                    let name = filesystem::get_filename(&url);
+                    // Only a first guess, and only when the user has not already chosen.
+                    // Loading a second LUT must not silently overwrite a deliberate pick.
+                    if c.output_color_space == core::color::OutputColorSpace::Unspecified {
+                        c.output_color_space = core::color::OutputColorSpace::from_lut_name(&name);
+                    }
                     c.lut = Some(Arc::new(lut));
-                    c.lut_name = Some(filesystem::get_filename(&url));
+                    c.lut_name = Some(name);
                     c.lut_path = Some(url);
                 }
                 self.request_recompute();
@@ -1307,6 +1316,31 @@ impl Controller {
     /// produce - `filesystem::get_filename` always yields at least one character.
     fn get_lut_name(&self) -> QString {
         QString::from(self.stabilizer.color.read().lut_name.clone().unwrap_or_default())
+    }
+
+    /// The colour space the exported file will declare. Tags only - this never changes a
+    /// pixel, so it deliberately does not `request_recompute`.
+    fn get_output_color_space(&self) -> QString {
+        QString::from(self.stabilizer.color.read().output_color_space.id())
+    }
+    fn set_output_color_space(&mut self, id: QString) {
+        // An unrecognised id is ignored rather than reset to the default: QML should never
+        // send one, and silently clearing the user's choice would be worse than doing nothing.
+        if let Some(s) = core::color::OutputColorSpace::from_id(&id.to_string()) {
+            self.stabilizer.color.write().output_color_space = s;
+        }
+    }
+    /// `[{ id, label }, ...]` in declaration order, so the dropdown is built from the Rust
+    /// list and cannot drift out of step with `OutputColorSpace`.
+    fn get_output_color_spaces(&self) -> QJsonArray {
+        let mut arr = QJsonArray::default();
+        for s in core::color::OutputColorSpace::ALL {
+            let mut o = QJsonObject::default();
+            o.insert("id",    QString::from(s.id()).into());
+            o.insert("label", QString::from(s.label()).into());
+            arr.push(o.into());
+        }
+        arr
     }
 
     /// What the camera recorded, for the read-only panel readout. Fields the camera didn't

@@ -20,6 +20,7 @@ pub use self::video_processor::VideoProcessor;
 pub use self::ffmpeg_processor::{ FfmpegProcessor, FFmpegError };
 use render_queue::RenderOptions;
 use crate::core::{ StabilizationManager, stabilization::* };
+use crate::core::color::OutputColorSpace;
 use ffmpeg_next::{ format::Pixel, frame::Video, codec, Error, ffi };
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -272,6 +273,35 @@ fn tag_limited_range_for_prores_videotoolbox(out_frame: &mut Video, is_prores_vi
     if is_prores_videotoolbox && out_frame.format() == Pixel::NV12 {
         out_frame.set_color_range(ffmpeg_next::util::color::Range::MPEG);
     }
+}
+
+/// Declares on the output what the baked grade actually produced.
+///
+/// Only the tags change - not one pixel. The export otherwise inherits the source's colour
+/// tags verbatim (`ffmpeg_video.rs`, which reads all four off the output frame), and Sony XAVC
+/// leaves matrix, transfer and primaries unspecified at the container level. The result was a
+/// file declaring `color_range=pc` and nothing else; with no matrix declared, players fall back
+/// to their own defaults and enough of them assume limited range for 10-bit YUV that a correct
+/// full-range export gets visibly stretched on playback.
+///
+/// Called only from the baking path, and that is the point: the tag describes what the LUT
+/// produced, so it may only be written when the grade was actually baked in. Tagging Rec.709
+/// on a file whose pixels are still S-Log3 would be a worse lie than saying nothing.
+fn tag_output_color_space(out_frame: &mut Video, space: OutputColorSpace) {
+    use ffmpeg_next::util::color::{ Primaries, TransferCharacteristic, Space };
+    let (primaries, transfer, matrix) = match space {
+        // The user has not said, so keep inheriting the source as before.
+        OutputColorSpace::Unspecified => return,
+        OutputColorSpace::Rec709      => (Primaries::BT709,    TransferCharacteristic::BT709,        Space::BT709),
+        OutputColorSpace::Srgb        => (Primaries::BT709,    TransferCharacteristic::IEC61966_2_1, Space::BT709),
+        // P3 D65 shares the 709 transfer and matrix; only the primaries differ.
+        OutputColorSpace::DciP3D65    => (Primaries::SMPTE432, TransferCharacteristic::BT709,        Space::BT709),
+        OutputColorSpace::Rec2020Pq   => (Primaries::BT2020,   TransferCharacteristic::SMPTE2084,    Space::BT2020NCL),
+        OutputColorSpace::Rec2020Hlg  => (Primaries::BT2020,   TransferCharacteristic::ARIB_STD_B67, Space::BT2020NCL),
+    };
+    out_frame.set_color_primaries(primaries);
+    out_frame.set_color_transfer_characteristic(transfer);
+    out_frame.set_color_space(matrix);
 }
 
 /// The colour stage is RGB-only, so it must never run on a plane that cannot carry RGB:
@@ -529,6 +559,9 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
         let c = stab.color.read();
         c.is_active() && c.bake_in_render
     };
+    // Read once, next to `bake_color`, because the two must describe the same decision: the
+    // tag is only ever written where the grade was actually baked in.
+    let output_color_space = stab.color.read().output_color_space;
     // The packed RGB format the source must be converted to for the colour stage, decided
     // once when the planes are built and reused by the per-frame dispatch below, so the two
     // cannot disagree about the layout the closures were built for.
@@ -714,6 +747,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 // Must happen before the first conversion: the swscale contexts read the
                 // frame's range when they are built, and they are cached from then on.
                 tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
+                tag_output_color_space(output_frame, output_color_space);
                 converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
                     if target == Pixel::RGBA {
                         create_planes_proc!(planes, (RGBA8,  converted_frame, converted_output, 0, [], 255.0), );
@@ -829,6 +863,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             // the frame handed to them must go through the same conversion. `color_convert_to`
             // is the one value both decisions read, so they cannot disagree.
             tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
+            tag_output_color_space(output_frame, output_color_space);
             converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
                 undistort_frame(converted_frame, converted_output);
             })?;

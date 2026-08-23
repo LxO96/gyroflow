@@ -2,10 +2,12 @@
 // Copyright © 2026 Adrian <adrian.eddy at gmail>
 
 pub mod lut;
+pub mod output_space;
 pub mod source_metadata;
 pub mod white_balance;
 
 pub use lut::{ Lut3D, LutError, parse_cube, sample_trilinear };
+pub use output_space::OutputColorSpace;
 pub use source_metadata::SourceExposure;
 pub use white_balance::kelvin_to_rgb_gains;
 
@@ -36,6 +38,10 @@ pub struct ColorAdjustments {
     pub lut: Option<Arc<Lut3D>>,
     pub lut_path: Option<String>,
     pub lut_name: Option<String>,
+    /// What the *exported file* declares itself to be. Tags only - never affects a pixel,
+    /// and deliberately absent from `get_checksum` so changing it cannot invalidate the
+    /// preview or trigger a recompute.
+    pub output_color_space: OutputColorSpace,
 }
 
 impl Default for ColorAdjustments {
@@ -54,6 +60,7 @@ impl Default for ColorAdjustments {
             lut: None,
             lut_path: None,
             lut_name: None,
+            output_color_space: OutputColorSpace::default(),
         }
     }
 }

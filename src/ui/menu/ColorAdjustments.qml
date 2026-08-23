@@ -48,6 +48,7 @@ MenuItem {
             messageBox(Modal.Error, qsTr("Failed to load the LUT file:") + "\n" + err, [ { text: qsTr("Ok"), accent: true } ]);
         } else {
             root.lutName = controller.get_lut_name();
+            outputSpace.syncFromCore();
         }
     }
 
@@ -77,6 +78,7 @@ MenuItem {
         // the user gets told about it.
         const actual = controller.get_lut_name();
         root.lutName = actual;
+        outputSpace.syncFromCore();
         if (c.lut_name && c.lut_name !== actual) {
             window.showNotification(Modal.Warning,
                 actual.length > 0
@@ -258,6 +260,51 @@ MenuItem {
         text: qsTr("Apply to rendered video");
         checked: false;
         onCheckedChanged: { root.bakeInRender = checked; root.applyEnabled(); }
+    }
+
+    // Only shown when the grade is actually baked in: the tag describes what the LUT
+    // produced, so declaring it on an export whose pixels were never converted would be a
+    // worse lie than saying nothing. The render side applies the same rule.
+    Label {
+        visible: root.colorEnabled && root.bakeInRender;
+        text: qsTr("Output color space");
+        tooltip: qsTr("What the exported file declares itself to be. This writes tags only - it never changes a pixel. Guessed from the LUT's name; correct it here if the guess is wrong.");
+        ComboBox {
+            id: outputSpace;
+            width: parent.width;
+            font.pixelSize: 12 * dpiScale;
+            currentIndex: 0;
+            // Ids parallel to `model`, kept out of the visible labels so the labels stay
+            // translatable and the ids stay stable. Both come from OutputColorSpace::ALL, so
+            // the dropdown cannot drift out of step with the Rust enum.
+            property var ids: [];
+            property bool preventChange: false;
+
+            function reload(): void {
+                const list = controller.get_output_color_spaces();
+                let newIds = [], labels = [];
+                for (let i = 0; i < list.length; ++i) { newIds.push(list[i].id); labels.push(list[i].label); }
+                ids = newIds;
+                model = labels;
+                syncFromCore();
+            }
+            // The core is the authority: the value moves on its own when a LUT is loaded
+            // (the name-based guess) or a project is opened, and the dropdown follows.
+            function syncFromCore(): void {
+                const idx = ids.indexOf(controller.get_output_color_space());
+                if (idx >= 0 && idx !== currentIndex) {
+                    preventChange = true;
+                    currentIndex = idx;
+                    preventChange = false;
+                }
+            }
+            onCurrentIndexChanged: {
+                if (!preventChange && currentIndex >= 0 && currentIndex < ids.length) {
+                    controller.set_output_color_space(ids[currentIndex]);
+                }
+            }
+            Component.onCompleted: reload();
+        }
     }
 
     InfoMessageSmall {

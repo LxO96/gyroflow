@@ -1299,6 +1299,7 @@ impl StabilizationManager {
                 "lut_strength":           c.lut_strength,
                 "lut_path":               c.lut_path,
                 "lut_name":               c.lut_name,
+                "output_color_space":     c.output_color_space,
                 // Embedded fallback, so the project still grades identically if the
                 // .cube file moves, is deleted, or the project travels to another machine.
                 // The checksum is deliberately not stored - it's recomputed from the data
@@ -1783,6 +1784,12 @@ impl StabilizationManager {
                     if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { c.set_param(key, v); }
                 }
                 if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
+                // Unknown ids (an older build, a hand-edited file) fall back to the current
+                // value rather than failing the import - worst case is an export tagged like
+                // the source, which is exactly what happened before this field existed.
+                if let Some(v) = obj.get("output_color_space").and_then(|x| x.as_str()) {
+                    if let Some(s) = color::OutputColorSpace::from_id(v) { c.output_color_space = s; }
+                }
                 let new_lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
                 let new_lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
                 let has_lut_data = obj.get("lut_data").and_then(|x| x.as_str()).is_some_and(|x| !x.is_empty());

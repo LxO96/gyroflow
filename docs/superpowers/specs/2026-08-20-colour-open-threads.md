@@ -134,7 +134,9 @@ The export writes `color_range=pc` but leaves `color_space`, `color_transfer` an
 An undeclared matrix is what sends players to their defaults, and for 10-bit YUV many default to
 limited range and ignore the range tag.
 
-This is a policy decision, not a bug fix, so it is left for a human:
+**Resolved: option 3 was chosen and is implemented** (see the note under the list).
+
+The options as they stood:
 
 1. **Declare the matrix, keep full range.** Write BT.709 primaries/transfer/matrix when the
    source leaves them unspecified. Most players assume BT.709 for HD/UHD anyway, so this mostly
@@ -145,7 +147,30 @@ This is a policy decision, not a bug fix, so it is left for a human:
 3. **Tag from the LUT.** Tempting after baking a log→709 LUT, but Gyroflow cannot know what a
    given `.cube` outputs — a Rec.2020 LUT would be mistagged. Only sound if the user declares it.
 
-Option 1 is the conservative one and fixes the reported symptom for most players.
+**What was built.** Option 3, with the objection above answered by making it the user's
+declaration rather than an inference. `OutputColorSpace` (`src/core/color/output_space.rs`) is a
+new field on `ColorAdjustments`, exposed in the Color adjustments panel as an "Output color space"
+dropdown offering *Same as source* (the default, i.e. the old behaviour), Rec. 709, sRGB,
+DCI-P3 D65, Rec. 2020 PQ and Rec. 2020 HLG. `from_lut_name` supplies the initial guess from the
+LUT's filename - `SL3SG3Ctos709.cube` lands on Rec. 709 - and the dropdown shows that guess before
+the user exports, so a wrong guess is visible and one click from being corrected. The guess is only
+seeded when the value is still *Same as source*, so it never overwrites a deliberate choice.
+
+Two rules keep the tag honest:
+
+- It is written only when the grade is actually baked (`bake_color`). Declaring a conversion on an
+  export whose pixels were never converted would be worse than saying nothing, so the render side
+  and the UI both gate on it.
+- It writes tags only. Verified: the YUV sample hash of a render is byte-identical before and after
+  tagging (`2B02EE18...`), while `ffprobe` goes from `unknown` on all three fields to
+  `bt709/bt709/bt709` alongside the `color_range=pc` that was already being written.
+
+The field is deliberately absent from `get_checksum`, so changing it cannot invalidate the preview -
+it has no effect on any pixel to invalidate. It round-trips through the `.gyroflow` project file
+under `"output_color_space"`.
+
+Option 1 remains available as a future default for the untagged-source case, and is not ruled out by
+this; option 2 was rejected as too large a behaviour change for every user.
 
 ---
 
