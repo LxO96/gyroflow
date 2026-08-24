@@ -32,6 +32,11 @@ Row {
     // as the number changes - "+0 K" and "+100 K" are different widths, and a Row that sizes
     // itself to its content would shuffle the buttons sideways on every click.
     anchors.horizontalCenter: parent.horizontalCenter;
+    // ...on the *track*, not on the row. SliderWithField puts the number field to the right of
+    // the slider, so the enclosing Column is wider than the track by the field plus the gap,
+    // and centring on the Column would sit the buttons half that distance too far right.
+    // Derived from the target rather than hardcoded, so it follows if the field is resized.
+    anchors.horizontalCenterOffset: target? -(target.field.width + target.spacing) / 2 : 0;
     spacing: 8 * dpiScale;
     height: 16 * dpiScale;
 
