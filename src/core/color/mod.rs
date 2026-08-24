@@ -107,13 +107,13 @@ impl Default for ResolvedScalars {
     }
 }
 
-/// How far a full-scale shadows or highlights slider moves its own end of the tone range.
+/// How far a full-scale shadows or highlights slider bends the tone curve.
 ///
-/// The sliders are +/-1 like contrast and saturation, but a full +/-1 *added* to a pixel would
-/// be a far more violent move than the other controls make, so the stored value is halved on
-/// the way to the kernels. Mirrored in all five kernels only in the sense that they receive
-/// the already-scaled number - the scaling itself happens here, once.
-pub const TONE_REGION_SCALE: f64 = 0.5;
+/// **Must stay below 1/3.** The curve is monotonic for any strength up to exactly 1/3 and folds
+/// back on itself above it - at 0.35 a brighter input already comes out darker than a dimmer
+/// one by 6e-4, which is a visible solarisation artefact on a large smooth gradient like a sky.
+/// `the_tone_curve_never_inverts` is the guard; do not raise this without re-reading it.
+pub const TONE_REGION_STRENGTH: f64 = 0.30;
 
 /// Ready-to-multiply values handed to every kernel. No colour science here —
 /// it has all been done in Rust by the time this struct is built.
@@ -122,7 +122,8 @@ pub struct ColorKernelParams {
     pub exposure_gain: f32,
     pub contrast_factor: f32,
     pub saturation_factor: f32,
-    /// Already scaled by `TONE_REGION_SCALE`, so the kernels just add.
+    /// Bezier control weights, already multiplied by 3 * `TONE_REGION_STRENGTH`. The kernels
+    /// form `1 + shadows*(1-l)^2 + highlights*l*(1-l)` and multiply by it.
     pub shadows: f32,
     pub highlights: f32,
     pub lut_strength: f32,
@@ -187,8 +188,8 @@ impl ColorAdjustments {
             exposure_gain:     s.exposure.clamp(MIN_EXPOSURE, MAX_EXPOSURE).exp2() as f32,
             contrast_factor:   (1.0 + s.contrast.clamp(-1.0, 1.0)) as f32,
             saturation_factor: (1.0 + s.saturation.clamp(-1.0, 1.0)) as f32,
-            shadows:           (s.shadows.clamp(-1.0, 1.0)    * TONE_REGION_SCALE) as f32,
-            highlights:        (s.highlights.clamp(-1.0, 1.0) * TONE_REGION_SCALE) as f32,
+            shadows:           (s.shadows.clamp(-1.0, 1.0)    * 3.0 * TONE_REGION_STRENGTH) as f32,
+            highlights:        (s.highlights.clamp(-1.0, 1.0) * 3.0 * TONE_REGION_STRENGTH) as f32,
             lut_strength:      s.lut_strength.clamp(0.0, 1.0) as f32,
             wb_gains:          kelvin_to_rgb_gains(self.source_kelvin, s.target_kelvin, s.tint),
             lut_size:          self.lut.as_ref().map(|l| l.size).unwrap_or(0),
@@ -234,24 +235,37 @@ pub fn apply_color(rgb: [f32; 3], p: &ColorKernelParams, lut: Option<&Lut3D>) ->
     // 4. Contrast around mid grey
     for i in 0..3 { c[i] = (c[i] - 0.5) * p.contrast_factor + 0.5; }
 
-    // 5. Shadows / highlights, each weighted to its own end of the tone range.
+    // 5. Shadows / highlights: a cubic tone curve on luma, applied as a single gain.
     //
-    // The weights are cubic so that each slider owns one end and hands mid grey back nearly
-    // untouched: at luma 0.5 both are exactly 0.125, so the two controls neither fight each
-    // other nor undo the contrast set above. Computed on the post-contrast pixel on purpose -
-    // the mask has to describe the image the user is actually looking at, or the sliders stop
-    // feeling predictable.
+    // The curve is `l + shadows*3l(1-l)^2 + highlights*3l^2(1-l)` - the two middle Bernstein
+    // basis functions, i.e. a cubic Bezier whose endpoints are pinned at 0 and 1. Both terms
+    // carry a factor of `l`, so dividing through to get the gain removes it analytically and
+    // leaves the expression below: no division, no singularity at black, and exactly 1.0 when
+    // both sliders are centred.
     //
-    // Clamped at zero because the input is not guaranteed to be in 0..1: a LUT or an exposure
-    // push can carry a channel negative, and an unclamped cube would flip the weight's sign
-    // and *invert* the correction exactly where it is least expected.
-    let tone_luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-    let sw = (1.0 - tone_luma).max(0.0);
-    let hw = tone_luma.max(0.0);
-    let shadow_w    = sw * sw * sw;
-    let highlight_w = hw * hw * hw;
-    let tone = p.shadows * shadow_w + p.highlights * highlight_w;
-    for i in 0..3 { c[i] += tone; }
+    // Three properties follow from that shape, and all three are what "natural" means here:
+    //
+    // - *Black stays black and white stays white.* The endpoints are pinned, so no setting can
+    //   lift the black point off zero or pull white off one. An earlier version added a
+    //   luma-weighted offset instead; it raised black to 0.5 at full shadows, which is exactly
+    //   what a washed-out, milky picture is.
+    // - *Saturation is untouched.* One scalar multiplies all three channels, so their ratios -
+    //   and therefore the saturation - come out bit-identical. The offset version dragged the
+    //   channels together: a dark blue at saturation 0.72 came out at 0.22, which is what
+    //   "dull" was.
+    // - *Each slider owns its end.* The deltas peak at l = 1/3 and l = 2/3 respectively, the
+    //   textbook placement, and fall to zero at both extremes.
+    //
+    // Luma is clamped to 0..1 first because the input is not guaranteed to be in range - a LUT
+    // or an exposure push can carry a channel past either end - and an unclamped basis
+    // function would change sign there and invert the correction.
+    //
+    // Computed on the post-contrast pixel on purpose: the curve has to describe the image the
+    // user is looking at, or the sliders stop feeling predictable.
+    let tone_luma = (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]).clamp(0.0, 1.0);
+    let inv_luma = 1.0 - tone_luma;
+    let tone = 1.0 + p.shadows * inv_luma * inv_luma + p.highlights * tone_luma * inv_luma;
+    for i in 0..3 { c[i] *= tone; }
 
     // 6. Saturation around luma
     let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
@@ -380,29 +394,107 @@ mod tests {
         let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows: 1.0, ..Default::default() });
         let toe      = apply_color([0.05, 0.05, 0.05], &p, None);
         let shoulder = apply_color([0.95, 0.95, 0.95], &p, None);
-        assert!(toe[0] > 0.05 + 0.3, "toe should lift hard, was {}", toe[0]);
+        assert!(toe[0] > 0.05 * 1.5, "toe should lift hard, was {}", toe[0]);
         assert!((shoulder[0] - 0.95).abs() < 0.01, "shoulder should barely move, was {}", shoulder[0]);
+        assert_eq!(apply_color([1.0, 1.0, 1.0], &p, None)[0], 1.0, "white is pinned");
     }
 
     #[test]
     fn highlights_pull_the_shoulder_and_leave_the_toe_alone() {
         let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { highlights: -1.0, ..Default::default() });
-        let toe      = apply_color([0.05, 0.05, 0.05], &p, None);
-        let shoulder = apply_color([0.95, 0.95, 0.95], &p, None);
-        assert!(shoulder[0] < 0.95 - 0.3, "shoulder should come down hard, was {}", shoulder[0]);
+        // Probed at 2/3, where the highlight term peaks - not at 0.95, because white is pinned
+        // and the correction necessarily falls back to nothing as it approaches it.
+        let toe   = apply_color([0.05, 0.05, 0.05], &p, None);
+        let upper = apply_color([0.667, 0.667, 0.667], &p, None);
+        assert!(upper[0] < 0.667 * 0.85, "upper mids should come down hard, was {}", upper[0]);
         assert!((toe[0] - 0.05).abs() < 0.01, "toe should barely move, was {}", toe[0]);
+        assert_eq!(apply_color([1.0, 1.0, 1.0], &p, None)[0], 1.0, "white is pinned");
     }
 
-    /// The number that decides whether these sliders feel controllable: a full-scale move
-    /// shifts its own end by TONE_REGION_SCALE and mid grey by one eighth of that, because
-    /// the cubic weight at luma 0.5 is exactly 0.125.
+    /// The numbers that decide whether these sliders feel controllable. At full scale the
+    /// shadow term reaches `3 * TONE_REGION_STRENGTH` of extra gain as luma approaches zero,
+    /// and a quarter of that at mid grey, where `(1-l)^2` is 0.25.
     #[test]
-    fn a_full_slider_moves_mid_grey_by_one_eighth_of_its_own_end() {
+    fn a_full_slider_reaches_its_declared_strength() {
         let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows: 1.0, ..Default::default() });
-        let at_black = apply_color([0.0, 0.0, 0.0], &p, None)[0];
-        let at_mid   = apply_color([0.5, 0.5, 0.5], &p, None)[0] - 0.5;
-        assert!((at_black - TONE_REGION_SCALE as f32).abs() < 1e-6, "was {at_black}");
-        assert!((at_mid - TONE_REGION_SCALE as f32 / 8.0).abs() < 1e-6, "was {at_mid}");
+        let gain = |v: f32| apply_color([v, v, v], &p, None)[0] / v;
+        let k = (3.0 * TONE_REGION_STRENGTH) as f32;
+        assert!((gain(0.001) - (1.0 + k)).abs() < 1e-2, "near black: {}", gain(0.001));
+        assert!((gain(0.5)   - (1.0 + k * 0.25)).abs() < 1e-6, "mid grey: {}", gain(0.5));
+        assert!((gain(1.0)   - 1.0).abs() < 1e-6, "white: {}", gain(1.0));
+    }
+
+    /// Where each control does its most work. The textbook placement, and the thing that makes
+    /// them read as "shadows" and "highlights" rather than two more exposure sliders.
+    #[test]
+    fn the_two_deltas_peak_at_one_third_and_two_thirds() {
+        for (name, scalars) in [
+            ("shadows",    ResolvedScalars { shadows: 1.0, ..Default::default() }),
+            ("highlights", ResolvedScalars { highlights: 1.0, ..Default::default() }),
+        ] {
+            let p = ColorAdjustments::default().to_kernel_params(scalars);
+            let mut best = (0.0f32, 0.0f32);
+            for i in 1..1000 {
+                let v = i as f32 / 1000.0;
+                let d = apply_color([v, v, v], &p, None)[0] - v;
+                if d > best.1 { best = (v, d); }
+            }
+            let expected = if name == "shadows" { 1.0 / 3.0 } else { 2.0 / 3.0 };
+            assert!((best.0 - expected).abs() < 0.02, "{name} peaked at {} not {expected}", best.0);
+        }
+    }
+
+    /// Half of why this is a gain and not an offset. Adding a constant to R, G and B drags the
+    /// channels together and washes the picture out; multiplying leaves their ratios, and so
+    /// the saturation, exactly where they were.
+    #[test]
+    fn tone_regions_preserve_saturation_exactly() {
+        let sat = |c: [f32; 3]| {
+            let mx = c[0].max(c[1]).max(c[2]);
+            let mn = c[0].min(c[1]).min(c[2]);
+            if mx == 0.0 { 0.0 } else { (mx - mn) / mx }
+        };
+        for (shadows, highlights) in [(1.0, 0.0), (0.0, -1.0), (-0.6, 0.8)] {
+            let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows, highlights, ..Default::default() });
+            for probe in [[0.05f32, 0.07, 0.18], [0.22, 0.15, 0.12], [0.18, 0.30, 0.14], [0.9, 0.7, 0.2]] {
+                let out = apply_color(probe, &p, None);
+                assert!((sat(out) - sat(probe)).abs() < 1e-6,
+                    "saturation moved: {:?} -> {:?} at ({shadows}, {highlights})", sat(probe), sat(out));
+            }
+        }
+    }
+
+    /// The other half: an offset lifts the black point off zero, which is what reads as milky.
+    /// A gain cannot, at any setting.
+    #[test]
+    fn the_endpoints_are_pinned_however_hard_the_sliders_are_pushed() {
+        for shadows in [0.25, 0.5, 1.0] {
+            for highlights in [-1.0, 0.0, 1.0] {
+                let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows, highlights, ..Default::default() });
+                assert_eq!(apply_color([0.0, 0.0, 0.0], &p, None), [0.0, 0.0, 0.0],
+                    "black lifted at ({shadows}, {highlights})");
+                assert_eq!(apply_color([1.0, 1.0, 1.0], &p, None), [1.0, 1.0, 1.0],
+                    "white moved at ({shadows}, {highlights})");
+            }
+        }
+    }
+
+    /// A tone curve that folds back on itself makes a brighter input come out darker than a
+    /// dimmer one - solarisation, most visible on a large smooth gradient like a sky. The
+    /// curve is monotonic for any `TONE_REGION_STRENGTH` up to exactly 1/3; this is the guard
+    /// on that bound, and it is why the constant is 0.30 rather than something rounder.
+    #[test]
+    fn the_tone_curve_never_inverts() {
+        for (shadows, highlights) in [(1.0, 1.0), (-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0)] {
+            let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows, highlights, ..Default::default() });
+            let mut prev = f32::NEG_INFINITY;
+            for i in 0..=1000 {
+                let v = i as f32 / 1000.0;
+                let out = apply_color([v, v, v], &p, None)[0];
+                assert!(out >= prev - 1e-7, "inverted at {v} with ({shadows}, {highlights}): {out} < {prev}");
+                prev = out;
+            }
+        }
     }
 
     /// Equal and opposite pushes cancel exactly at mid grey - the weights are symmetric

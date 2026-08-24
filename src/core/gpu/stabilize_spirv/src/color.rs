@@ -102,16 +102,13 @@ pub fn apply_color(px: Vec4, coeffs: &[f32], params: &KernelParams) -> Vec4 {
     // 4. Contrast around mid grey
     c = (c - Vec3::splat(0.5)) * params.color_params_1.y + Vec3::splat(0.5);
 
-    // 5. Shadows / highlights, each weighted to its own end of the tone range.
-    // Cubic weights, clamped at zero - see `crate::color::apply_color`, of which this is a
-    // step-for-step duplicate. Operation order must not be rearranged.
-    let tone_luma = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
-    let sw = (1.0 - tone_luma).max(0.0);
-    let hw = tone_luma.max(0.0);
-    let shadow_w = sw * sw * sw;
-    let highlight_w = hw * hw * hw;
-    let tone = params.color_params_3.z * shadow_w + params.color_params_3.w * highlight_w;
-    c = c + Vec3::splat(tone);
+    // 5. Shadows / highlights: a cubic Bezier tone curve on luma, applied as a single gain.
+    // A step-for-step duplicate of `apply_color` in src/core/color/mod.rs, which carries the
+    // derivation and the monotonicity bound. Operation order must not be rearranged.
+    let tone_luma = (0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z).clamp(0.0, 1.0);
+    let inv_luma = 1.0 - tone_luma;
+    let tone = 1.0 + params.color_params_3.z * inv_luma * inv_luma + params.color_params_3.w * tone_luma * inv_luma;
+    c = c * tone;
 
     // 6. Saturation around luma
     let luma = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;

@@ -158,16 +158,13 @@ vec4 apply_color(vec4 px) {
     // 4. Contrast around mid grey
     c = (c - vec3(0.5)) * params.color_params_1.y + vec3(0.5);
 
-    // 5. Shadows / highlights, each weighted to its own end of the tone range.
-    // Cubic weights, clamped at zero - a step-for-step duplicate of `apply_color` in
-    // src/core/color/mod.rs. Operation order must not be rearranged.
-    float tone_luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-    float sw = max(1.0 - tone_luma, 0.0);
-    float hw = max(tone_luma, 0.0);
-    float shadow_w = sw * sw * sw;
-    float highlight_w = hw * hw * hw;
-    float tone = params.color_params_3.z * shadow_w + params.color_params_3.w * highlight_w;
-    c = c + vec3(tone);
+    // 5. Shadows / highlights: a cubic Bezier tone curve on luma, applied as a single gain.
+    // A step-for-step duplicate of `apply_color` in src/core/color/mod.rs, which carries the
+    // derivation and the monotonicity bound. Operation order must not be rearranged.
+    float tone_luma = clamp(0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b, 0.0, 1.0);
+    float inv_luma = 1.0 - tone_luma;
+    float tone = 1.0 + params.color_params_3.z * inv_luma * inv_luma + params.color_params_3.w * tone_luma * inv_luma;
+    c = c * tone;
 
     // 6. Saturation around luma
     float luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;

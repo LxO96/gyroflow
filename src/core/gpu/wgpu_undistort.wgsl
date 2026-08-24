@@ -191,16 +191,13 @@ fn apply_color(px: vec4<f32>, max_value: f32) -> vec4<f32> {
     // 4. Contrast around mid grey
     c = (c - vec3<f32>(0.5)) * params.color_params_1.y + vec3<f32>(0.5);
 
-    // 5. Shadows / highlights, each weighted to its own end of the tone range.
-    // Cubic weights, clamped at zero - a step-for-step duplicate of `apply_color` in
-    // src/core/color/mod.rs. Operation order must not be rearranged.
-    let tone_luma = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
-    let sw = max(1.0 - tone_luma, 0.0);
-    let hw = max(tone_luma, 0.0);
-    let shadow_w = sw * sw * sw;
-    let highlight_w = hw * hw * hw;
-    let tone = params.color_params_3.z * shadow_w + params.color_params_3.w * highlight_w;
-    c = c + vec3<f32>(tone);
+    // 5. Shadows / highlights: a cubic Bezier tone curve on luma, applied as a single gain.
+    // A step-for-step duplicate of `apply_color` in src/core/color/mod.rs, which carries the
+    // derivation and the monotonicity bound. Operation order must not be rearranged.
+    let tone_luma = clamp(0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z, 0.0, 1.0);
+    let inv_luma = 1.0 - tone_luma;
+    let tone = 1.0 + params.color_params_3.z * inv_luma * inv_luma + params.color_params_3.w * tone_luma * inv_luma;
+    c = c * tone;
 
     // 6. Saturation around luma
     let luma = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;

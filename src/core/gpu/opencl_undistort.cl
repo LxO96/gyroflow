@@ -245,16 +245,13 @@ float4 apply_color(float4 px, __global const float *lut_coeffs, __global KernelP
     // 4. Contrast around mid grey
     c = (c - (float3)(0.5f)) * params->color_params_1.y + (float3)(0.5f);
 
-    // 5. Shadows / highlights, each weighted to its own end of the tone range.
-    // Cubic weights, clamped at zero - a step-for-step duplicate of `apply_color` in
-    // src/core/color/mod.rs. Operation order must not be rearranged.
-    float tone_luma = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
-    float sw = fmax(1.0f - tone_luma, 0.0f);
-    float hw = fmax(tone_luma, 0.0f);
-    float shadow_w = sw * sw * sw;
-    float highlight_w = hw * hw * hw;
-    float tone = params->color_params_3.z * shadow_w + params->color_params_3.w * highlight_w;
-    c = c + (float3)(tone);
+    // 5. Shadows / highlights: a cubic Bezier tone curve on luma, applied as a single gain.
+    // A step-for-step duplicate of `apply_color` in src/core/color/mod.rs, which carries the
+    // derivation and the monotonicity bound. Operation order must not be rearranged.
+    float tone_luma = clamp(0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z, 0.0f, 1.0f);
+    float inv_luma = 1.0f - tone_luma;
+    float tone = 1.0f + params->color_params_3.z * inv_luma * inv_luma + params->color_params_3.w * tone_luma * inv_luma;
+    c = c * tone;
 
     // 6. Saturation around luma
     float luma = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
