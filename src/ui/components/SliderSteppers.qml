@@ -28,8 +28,17 @@ Row {
     // camera's own reading, which is the whole point of the buttons on those two sliders.
     property string note: "";
 
+    // Centred under the slider, and the note below is a fixed width, so neither button moves
+    // as the number changes - "+0 K" and "+100 K" are different widths, and a Row that sizes
+    // itself to its content would shuffle the buttons sideways on every click.
+    anchors.horizontalCenter: parent.horizontalCenter;
     spacing: 8 * dpiScale;
     height: 16 * dpiScale;
+
+    // Fixed, and deliberately narrow. The row must stay inside the enclosing Column: the menu
+    // clips, and a child that overflows its parent stops receiving mouse events, so an
+    // over-wide note silently makes the buttons unclickable rather than merely ugly.
+    property real noteWidth: 72 * dpiScale;
 
     function nudge(direction: int): void {
         if (!target) return;
@@ -51,6 +60,9 @@ Row {
     BasicText {
         text: root.note;
         visible: text.length > 0;
+        width: root.noteWidth;
+        horizontalAlignment: Text.AlignHCenter;
+        elide: Text.ElideRight;
         opacity: 0.6;
         font.pixelSize: 11 * dpiScale;
         anchors.verticalCenter: parent.verticalCenter;

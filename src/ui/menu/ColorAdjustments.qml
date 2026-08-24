@@ -29,15 +29,17 @@ MenuItem {
     // it was - and temperature is relative because the core keeps the offset when a new clip's
     // white balance arrives (ColorAdjustments::reanchor_source_kelvin). Spelling the offset out
     // here is what makes that legible, and it is the same number that travels to a batch.
+    // Just the signed offset. What it is measured *from* is already on screen twice - the
+    // "Source:" line above and the origin tick on the track - and spelling it out again made
+    // the row wider than the panel, which pushed the buttons outside their parent and stopped
+    // them receiving clicks at all.
     readonly property string evNote: {
         const v = exposureSlider.field.value;
-        const s = root.sourceExposure;
-        const from = (s && typeof s.ev !== "undefined")? qsTr("from %1 EV").arg(s.ev.toFixed(1)) : qsTr("from source");
-        return (v >= 0? "+" : "") + v.toFixed(2) + " EV " + from;
+        return (v >= 0? "+" : "") + v.toFixed(2) + " EV";
     }
     readonly property string kelvinNote: {
         const d = temperatureSlider.field.value - temperatureSlider.defaultValue;
-        return (d >= 0? "+" : "") + Math.round(d) + " K " + qsTr("from source");
+        return (d >= 0? "+" : "") + Math.round(d) + " K";
     }
 
     // Every slider below uses SliderWithField's `scaler`: `from`/`to` are in *display* units
