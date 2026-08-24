@@ -45,9 +45,17 @@ Row {
     // over-wide note silently makes the buttons unclickable rather than merely ugly.
     property real noteWidth: 72 * dpiScale;
 
+    // Steps onto the grid of multiples of `step`, rather than adding `step` to what is there.
+    //
+    // NumberField rounds every value it stores to its own `precision`, so plain addition drifts:
+    // three clicks of a third of a stop landed on 0.99 EV, because each 0.3333 was stored as
+    // 0.33 before the next was added. Thirds exist precisely so that three of them make a stop,
+    // and a stepper that cannot reach one is not much use. Snapping also gives the buttons the
+    // behaviour of a camera dial - a value dragged to 37 steps to 40, not 42.
     function nudge(direction: int): void {
-        if (!target) return;
-        const next = target.field.value + (direction * root.step);
+        if (!target || !(root.step > 0)) return;
+        const index = Math.round(target.field.value / root.step) + direction;
+        const next = index * root.step;
         target.field.value = Math.max(target.from, Math.min(target.to, next));
     }
 

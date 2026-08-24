@@ -234,7 +234,8 @@ MenuItem {
             }
             SliderSteppers {
                 target: exposureSlider;
-                step: 0.1;
+                // A third of a stop, the increment every camera and light meter uses.
+                step: 1/3;
                 note: root.evNote;
             }
         }

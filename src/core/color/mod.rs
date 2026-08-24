@@ -25,6 +25,21 @@ pub const MAX_KELVIN: f64 = 25000.0;
 pub const MIN_EXPOSURE: f64 = -5.0;
 pub const MAX_EXPOSURE: f64 =  5.0;
 
+/// The transfer function the colour stage assumes its input carries, used to turn a slider
+/// reading in stops into a gain on the encoded signal.
+///
+/// The stage works on display-referred RGB, so a channel value is roughly `linear^(1/2.2)`.
+/// Multiplying an encoded value by `g` therefore multiplies *light* by `g^2.2`, which is why
+/// applying `2^EV` directly made one slider stop worth 2.2 photographic stops: at +1 EV a
+/// quarter of a typical frame clipped to flat white, which is what read as a sudden loss of
+/// contrast. Dividing the stops by the gamma first makes a stop a stop.
+///
+/// It is an assumption, and it is only right for display-referred input. On ungraded log
+/// footage a multiply acts as a gamma change rather than an exposure change whatever constant
+/// is used; fixing that means reading the source's transfer function, which the recording
+/// metadata does carry ("Gamma equation") but nothing here reads yet.
+pub const DISPLAY_GAMMA: f64 = 2.2;
+
 #[derive(Debug, Clone)]
 pub struct ColorAdjustments {
     pub enabled: bool,
@@ -211,11 +226,11 @@ impl ColorAdjustments {
     /// Every scalar is clamped here, including exposure. These values arrive from the
     /// *keyframe* path, which never passes through `set_param`, so the import clamps and the
     /// slider bounds are both bypassed - a hand-edited `keyframes` section, or a value typed
-    /// into the unbounded `NumberField`, lands here raw. Unclamped, `exposure.exp2()` reaches
-    /// `+inf` around 1024 and renders a white frame with no diagnostic.
+    /// into the unbounded `NumberField`, lands here raw. Unclamped, the exposure gain reaches
+    /// `+inf` around 2250 stops and renders a white frame with no diagnostic.
     pub fn to_kernel_params(&self, s: ResolvedScalars) -> ColorKernelParams {
         ColorKernelParams {
-            exposure_gain:     s.exposure.clamp(MIN_EXPOSURE, MAX_EXPOSURE).exp2() as f32,
+            exposure_gain:     (s.exposure.clamp(MIN_EXPOSURE, MAX_EXPOSURE) / DISPLAY_GAMMA).exp2() as f32,
             contrast_factor:   (1.0 + s.contrast.clamp(-1.0, 1.0)) as f32,
             saturation_factor: (1.0 + s.saturation.clamp(-1.0, 1.0)) as f32,
             shadows:           (s.shadows.clamp(-1.0, 1.0)    * 3.0 * TONE_REGION_STRENGTH) as f32,
@@ -321,11 +336,29 @@ mod tests {
         }
     }
 
+    /// One slider stop is one *photographic* stop - linear light doubles. On a display-referred
+    /// signal that is a gain of 2^(1/2.2) on the encoded value, not 2.
     #[test]
-    fn one_stop_exposure_doubles_linear_value() {
+    fn one_stop_exposure_doubles_linear_light() {
         let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { exposure: 1.0, ..Default::default() });
-        let out = apply_color([0.25, 0.25, 0.25], &p, None);
-        assert!((out[0] - 0.5).abs() < 1e-6, "was {}", out[0]);
+        let encoded = 0.25f32;
+        let out = apply_color([encoded, encoded, encoded], &p, None)[0];
+
+        let g = DISPLAY_GAMMA as f32;
+        let ratio = out.powf(g) / encoded.powf(g);
+        assert!((ratio - 2.0).abs() < 1e-4, "linear light went up {ratio}x, expected 2x");
+    }
+
+    /// The symptom that prompted the calibration: at a raw `2^EV`, +1 EV multiplied the encoded
+    /// signal by 2, so everything above 0.5 - about a quarter of a real frame - slammed into
+    /// pure white and lost all detail.
+    #[test]
+    fn one_stop_does_not_clip_the_upper_midtones() {
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { exposure: 1.0, ..Default::default() });
+        for probe in [0.6f32, 0.7, 0.72] {
+            let out = apply_color([probe, probe, probe], &p, None)[0];
+            assert!(out < 1.0, "{probe} clipped to {out}");
+        }
     }
 
     #[test]
@@ -635,15 +668,16 @@ mod tests {
 
         let huge = c.to_kernel_params(ResolvedScalars { exposure: 100_000.0, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
         assert!(huge.exposure_gain.is_finite(), "exposure gain was {}", huge.exposure_gain);
-        assert_eq!(huge.exposure_gain, (MAX_EXPOSURE as f32).exp2());
+        assert_eq!(huge.exposure_gain, ((MAX_EXPOSURE / DISPLAY_GAMMA) as f32).exp2());
 
         let tiny = c.to_kernel_params(ResolvedScalars { exposure: -100_000.0, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
         assert!(tiny.exposure_gain.is_finite());
-        assert_eq!(tiny.exposure_gain, (MIN_EXPOSURE as f32).exp2());
+        assert_eq!(tiny.exposure_gain, ((MIN_EXPOSURE / DISPLAY_GAMMA) as f32).exp2());
 
-        // In-range values are untouched: one stop up is exactly a doubling.
+        // In-range values are untouched: one stop up is a doubling of light, which on the
+        // encoded signal is 2^(1/2.2).
         let one_stop = c.to_kernel_params(ResolvedScalars { exposure: 1.0, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
-        assert_eq!(one_stop.exposure_gain, 2.0);
+        assert_eq!(one_stop.exposure_gain, ((1.0 / DISPLAY_GAMMA) as f32).exp2());
     }
 
     /// `set_param` and `to_kernel_params` must agree on the bounds, or the static and
