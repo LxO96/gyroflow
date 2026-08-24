@@ -1355,6 +1355,26 @@ impl RenderQueue {
                                     }
                                 }
 
+                                // The grade was inherited from whatever clip was on screen,
+                                // `source_kelvin` included. Re-anchor it to *this* file's own
+                                // reading so the user's temperature offset is measured from the
+                                // right neutral; without this a batch of mixed-white-balance
+                                // clips is every one of them graded against the first clip's
+                                // camera. See `ColorAdjustments::reanchor_source_kelvin`.
+                                {
+                                    let settings = stab.gyro.read().file_metadata.read()
+                                        .additional_data.get("recording_settings").cloned();
+                                    if let Some(settings) = settings {
+                                        let src = core::color::SourceExposure::from_recording_settings(&settings);
+                                        let (kelvin, detected) = match src.white_balance_k {
+                                            Some(k) => (k, true),
+                                            None    => (core::color::DEFAULT_KELVIN, false),
+                                        };
+                                        ::log::debug!("Re-anchoring white balance to this file: {kelvin} K (detected: {detected})");
+                                        stab.color.write().reanchor_source_kelvin(kelvin, detected);
+                                    }
+                                }
+
                                 let camera_id = stab.camera_id.read();
 
                                 let has_builtin_profile = {

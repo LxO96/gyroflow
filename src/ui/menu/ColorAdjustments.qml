@@ -24,6 +24,22 @@ MenuItem {
 
     function applyEnabled(): void { controller.set_color_enabled(root.colorEnabled, root.bakeInRender); }
 
+    // What the two metadata-anchored sliders are offset *from*. Exposure is already relative -
+    // the grade is a gain, so +0.5 EV means half a stop brighter than this clip was, whatever
+    // it was - and temperature is relative because the core keeps the offset when a new clip's
+    // white balance arrives (ColorAdjustments::reanchor_source_kelvin). Spelling the offset out
+    // here is what makes that legible, and it is the same number that travels to a batch.
+    readonly property string evNote: {
+        const v = exposureSlider.field.value;
+        const s = root.sourceExposure;
+        const from = (s && typeof s.ev !== "undefined")? qsTr("from %1 EV").arg(s.ev.toFixed(1)) : qsTr("from source");
+        return (v >= 0? "+" : "") + v.toFixed(2) + " EV " + from;
+    }
+    readonly property string kelvinNote: {
+        const d = temperatureSlider.field.value - temperatureSlider.defaultValue;
+        return (d >= 0? "+" : "") + Math.round(d) + " K " + qsTr("from source");
+    }
+
     // Every slider below uses SliderWithField's `scaler`: `from`/`to` are in *display* units
     // and `root.value` is in *core* units (SliderWithField.qml:118 divides by the scaler).
     // That matters because the keyframe machinery stores `root.value` verbatim
@@ -91,10 +107,10 @@ MenuItem {
         }
     }
 
-    // Called from VideoArea.qml's telemetry_loaded handler. Task 14's controller already put
-    // the detected white balance into the core (`source_kelvin`, and `target_kelvin` too while
-    // colour is off); this keeps the slider in step, under the same `!enabled` guard so a grade
-    // the user has already dialled in survives loading a second file.
+    // Called from VideoArea.qml's telemetry_loaded handler. The controller has already put the
+    // detected white balance into the core via `reanchor_source_kelvin`, which moves
+    // `source_kelvin` to this clip's reading and carries the user's offset along with it. This
+    // keeps the slider in step with both halves of that.
     //
     // `defaultValue` is moved unconditionally so the context menu's "Reset value" returns to
     // the *source* temperature rather than a hardcoded 5500 K. `value` needs its own explicit
@@ -105,15 +121,32 @@ MenuItem {
     function setTemperatureAnchor(kelvin: real): void {
         const k = +kelvin;
         if (!isFinite(k) || k <= 0) return;
+        const previous = temperatureSlider.defaultValue;
         temperatureSlider.defaultValue = k;
-        if (!root.colorEnabled) temperatureSlider.value = k;
+        if (!root.colorEnabled) {
+            // No grade dialled in, so the offset is zero and the target sits on the source.
+            temperatureSlider.value = k;
+        } else if (isFinite(previous) && previous > 0) {
+            // Mirror what the core just did: shift the target by the same distance the source
+            // moved, so the offset the user chose is what survives. Mirrored rather than read
+            // back because there is no getter for `target_kelvin`; the slider's own bounds are
+            // MIN_KELVIN..MAX_KELVIN, the same clamp the core applies, so the two agree.
+            temperatureSlider.value = temperatureSlider.value + (k - previous);
+        }
     }
 
     CheckBox {
         id: enableCb;
         text: qsTr("Enable");
         checked: false;
-        onCheckedChanged: { root.colorEnabled = checked; root.applyEnabled(); }
+        onCheckedChanged: {
+            root.colorEnabled = checked;
+            root.applyEnabled();
+            // Turning the section on with no LUT loaded is almost always a prelude to picking
+            // one, so offer the file dialog straight away. Cancelling costs nothing: the panel
+            // stays enabled and every other control still works without a LUT.
+            if (checked && root.lutName.length === 0) lutDialog.open2();
+        }
     }
 
     // What the camera recorded, for reference. Every field of SourceExposure is an Option and
@@ -161,60 +194,93 @@ MenuItem {
     Label {
         text: qsTr("LUT strength");
         visible: root.lutName.length > 0;
-        SliderWithField {
-            id: lutStrengthSlider;
+        Column {
             width: parent.width;
-            from: 0; to: 100;              // core: 0 .. 1
-            value: 1.0; defaultValue: 1.0;
-            scaler: 100.0;
-            unit: "%"; precision: 0;
-            showOrigin: true;
-            keyframe: "ColorLutStrength";
-            onValueChanged: controller.set_color_param("lut_strength", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: lutStrengthSlider;
+                width: parent.width;
+                from: 0; to: 100;              // core: 0 .. 1
+                value: 1.0; defaultValue: 1.0;
+                scaler: 100.0;
+                unit: "%"; precision: 0;
+                showOrigin: true;
+                keyframe: "ColorLutStrength";
+                onValueChanged: controller.set_color_param("lut_strength", value);
+            }
+            SliderSteppers {
+                target: lutStrengthSlider;
+                step: 5;
+            }
         }
     }
 
     Label {
         text: qsTr("Exposure");
-        SliderWithField {
-            id: exposureSlider;
+        Column {
             width: parent.width;
-            from: -5; to: 5;               // matches ColorAdjustments::set_param
-            value: 0; defaultValue: 0;
-            unit: " EV"; precision: 2;
-            showOrigin: true;
-            keyframe: "ColorExposure";
-            onValueChanged: controller.set_color_param("exposure", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: exposureSlider;
+                width: parent.width;
+                from: -5; to: 5;               // matches ColorAdjustments::set_param
+                value: 0; defaultValue: 0;
+                unit: " EV"; precision: 2;
+                showOrigin: true;
+                keyframe: "ColorExposure";
+                onValueChanged: controller.set_color_param("exposure", value);
+            }
+            SliderSteppers {
+                target: exposureSlider;
+                step: 0.1;
+                note: root.evNote;
+            }
         }
     }
 
     Label {
         text: qsTr("Contrast");
-        SliderWithField {
-            id: contrastSlider;
+        Column {
             width: parent.width;
-            from: -100; to: 100;           // core: -1 .. 1
-            value: 0; defaultValue: 0;
-            scaler: 100.0;
-            precision: 0;
-            showOrigin: true;
-            keyframe: "ColorContrast";
-            onValueChanged: controller.set_color_param("contrast", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: contrastSlider;
+                width: parent.width;
+                from: -100; to: 100;           // core: -1 .. 1
+                value: 0; defaultValue: 0;
+                scaler: 100.0;
+                precision: 0;
+                showOrigin: true;
+                keyframe: "ColorContrast";
+                onValueChanged: controller.set_color_param("contrast", value);
+            }
+            SliderSteppers {
+                target: contrastSlider;
+                step: 5;
+            }
         }
     }
 
     Label {
         text: qsTr("Saturation");
-        SliderWithField {
-            id: saturationSlider;
+        Column {
             width: parent.width;
-            from: -100; to: 100;           // core: -1 .. 1
-            value: 0; defaultValue: 0;
-            scaler: 100.0;
-            precision: 0;
-            showOrigin: true;
-            keyframe: "ColorSaturation";
-            onValueChanged: controller.set_color_param("saturation", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: saturationSlider;
+                width: parent.width;
+                from: -100; to: 100;           // core: -1 .. 1
+                value: 0; defaultValue: 0;
+                scaler: 100.0;
+                precision: 0;
+                showOrigin: true;
+                keyframe: "ColorSaturation";
+                onValueChanged: controller.set_color_param("saturation", value);
+            }
+            SliderSteppers {
+                target: saturationSlider;
+                step: 5;
+            }
         }
     }
 
@@ -223,32 +289,48 @@ MenuItem {
     Label {
         text: qsTr("Shadows");
         tooltip: qsTr("Lifts or deepens the darkest part of the image. The falloff is weighted to the toe, so mid grey moves about an eighth as far and the highlights barely move at all.");
-        SliderWithField {
-            id: shadowsSlider;
+        Column {
             width: parent.width;
-            from: -100; to: 100;           // core: -1 .. 1
-            value: 0; defaultValue: 0;
-            scaler: 100.0;
-            precision: 0;
-            showOrigin: true;
-            keyframe: "ColorShadows";
-            onValueChanged: controller.set_color_param("shadows", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: shadowsSlider;
+                width: parent.width;
+                from: -100; to: 100;           // core: -1 .. 1
+                value: 0; defaultValue: 0;
+                scaler: 100.0;
+                precision: 0;
+                showOrigin: true;
+                keyframe: "ColorShadows";
+                onValueChanged: controller.set_color_param("shadows", value);
+            }
+            SliderSteppers {
+                target: shadowsSlider;
+                step: 5;
+            }
         }
     }
 
     Label {
         text: qsTr("Highlights");
         tooltip: qsTr("Recovers or pushes the brightest part of the image. Weighted to the shoulder the same way Shadows is weighted to the toe, so the two do not fight each other.");
-        SliderWithField {
-            id: highlightsSlider;
+        Column {
             width: parent.width;
-            from: -100; to: 100;           // core: -1 .. 1
-            value: 0; defaultValue: 0;
-            scaler: 100.0;
-            precision: 0;
-            showOrigin: true;
-            keyframe: "ColorHighlights";
-            onValueChanged: controller.set_color_param("highlights", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: highlightsSlider;
+                width: parent.width;
+                from: -100; to: 100;           // core: -1 .. 1
+                value: 0; defaultValue: 0;
+                scaler: 100.0;
+                precision: 0;
+                showOrigin: true;
+                keyframe: "ColorHighlights";
+                onValueChanged: controller.set_color_param("highlights", value);
+            }
+            SliderSteppers {
+                target: highlightsSlider;
+                step: 5;
+            }
         }
     }
 
@@ -258,38 +340,55 @@ MenuItem {
         // The full MIN_KELVIN..MAX_KELVIN range from core/color/mod.rs, not a narrower
         // "usable" range: a Slider clamps its value to [from, to], so a project legitimately
         // carrying 1800 K would be silently rewritten to the slider's floor on load.
-        SliderWithField {
-            id: temperatureSlider;
+        Column {
             width: parent.width;
-            from: 1667; to: 25000;         // MIN_KELVIN .. MAX_KELVIN
-            value: 5500; defaultValue: 5500;
-            // Kelvin is a reciprocal-ish scale: 2000->3000 K is a large visible shift while
-            // 20000->21000 K is invisible. On a linear track the entire range people actually
-            // grade in (roughly 2500-8000 K) is crammed into the left fifth. Log spreads it
-            // out. Strictly, mireds (10^6/K) are the perceptually even unit, but log is very
-            // close over this range and keeps the axis readable in Kelvin.
-            logarithmic: true;
-            // The camera's own white balance, so the offset being applied is visible.
-            showOrigin: true;
-            originValue: defaultValue;
-            unit: " K"; precision: 0;
-            keyframe: "ColorTemperature";
-            onValueChanged: controller.set_color_param("target_kelvin", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: temperatureSlider;
+                width: parent.width;
+                from: 1667; to: 25000;         // MIN_KELVIN .. MAX_KELVIN
+                value: 5500; defaultValue: 5500;
+                // Kelvin is a reciprocal-ish scale: 2000->3000 K is a large visible shift while
+                // 20000->21000 K is invisible. On a linear track the entire range people actually
+                // grade in (roughly 2500-8000 K) is crammed into the left fifth. Log spreads it
+                // out. Strictly, mireds (10^6/K) are the perceptually even unit, but log is very
+                // close over this range and keeps the axis readable in Kelvin.
+                logarithmic: true;
+                // The camera's own white balance, so the offset being applied is visible.
+                showOrigin: true;
+                originValue: defaultValue;
+                unit: " K"; precision: 0;
+                keyframe: "ColorTemperature";
+                onValueChanged: controller.set_color_param("target_kelvin", value);
+            }
+            SliderSteppers {
+                target: temperatureSlider;
+                step: 100;
+                note: root.kelvinNote;
+            }
         }
     }
 
     Label {
         text: qsTr("Tint");
-        SliderWithField {
-            id: tintSlider;
+        Column {
             width: parent.width;
-            from: -100; to: 100;           // core: -1 .. 1
-            value: 0; defaultValue: 0;
-            scaler: 100.0;
-            precision: 0;
-            showOrigin: true;
-            keyframe: "ColorTint";
-            onValueChanged: controller.set_color_param("tint", value);
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: tintSlider;
+                width: parent.width;
+                from: -100; to: 100;           // core: -1 .. 1
+                value: 0; defaultValue: 0;
+                scaler: 100.0;
+                precision: 0;
+                showOrigin: true;
+                keyframe: "ColorTint";
+                onValueChanged: controller.set_color_param("tint", value);
+            }
+            SliderSteppers {
+                target: tintSlider;
+                step: 5;
+            }
         }
     }
 

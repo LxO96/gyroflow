@@ -166,6 +166,36 @@ impl ColorAdjustments {
         true
     }
 
+    /// Point the white balance at a new clip's own neutral, keeping the correction the user
+    /// chose rather than the number it happened to produce.
+    ///
+    /// `target_kelvin` is stored absolute, but what the user actually chose is the *offset*
+    /// from this clip's neutral - "400 K warmer than the camera saw it". Carrying the absolute
+    /// number to a clip the camera metered differently applies a different correction, which
+    /// is what made a batch of mixed-white-balance clips come out inconsistent: every queued
+    /// job inherited the on-screen clip's `source_kelvin` and graded against the wrong anchor.
+    ///
+    /// Shifting the target by the same delta as the source keeps the offset and moves the
+    /// result, which is what travels correctly across files.
+    ///
+    /// With a zero offset - the common case, colour switched off or temperature untouched -
+    /// the target lands exactly on the new source, which is what this did before it preserved
+    /// anything. An offset that was clamped at either Kelvin bound does not survive a round
+    /// trip through the bound; that is a deliberate consequence of storing the value absolute.
+    pub fn reanchor_source_kelvin(&mut self, new_source: f64, detected: bool) {
+        if !new_source.is_finite() { return; }
+        let previous = self.source_kelvin;
+        self.set_param("source_kelvin", new_source);
+        self.source_kelvin_detected = detected;
+
+        // Read back rather than using `new_source`: `set_param` clamps, and the target has to
+        // move by the distance the source actually moved.
+        let delta = self.source_kelvin - previous;
+        if delta != 0.0 {
+            self.set_param("target_kelvin", self.target_kelvin + delta);
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         self.enabled && (
             self.lut.is_some()
@@ -338,6 +368,52 @@ mod tests {
         let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { lut_strength: 0.5, ..Default::default() });
         let out = apply_color([0.8, 0.8, 0.8], &p, Some(&black));
         assert!((out[0] - 0.4).abs() < 1e-6, "was {}", out[0]);
+    }
+
+    #[test]
+    fn reanchoring_keeps_the_users_offset_not_the_number() {
+        let mut c = ColorAdjustments::default();
+        c.set_param("source_kelvin", 6000.0);
+        c.set_param("target_kelvin", 6400.0);   // the user asked for +400 K
+
+        c.reanchor_source_kelvin(3200.0, true); // a tungsten clip from the same shoot
+
+        assert_eq!(c.source_kelvin, 3200.0);
+        assert_eq!(c.target_kelvin, 3600.0, "the +400 K offset should have travelled");
+        assert!(c.source_kelvin_detected);
+    }
+
+    /// The case that must not regress: with no temperature offset the target follows the
+    /// source exactly, which is what happened before re-anchoring preserved anything.
+    #[test]
+    fn reanchoring_with_no_offset_lands_on_the_new_source() {
+        let mut c = ColorAdjustments::default();
+        c.set_param("source_kelvin", 6000.0);
+        c.set_param("target_kelvin", 6000.0);
+
+        c.reanchor_source_kelvin(4300.0, true);
+
+        assert_eq!(c.source_kelvin, 4300.0);
+        assert_eq!(c.target_kelvin, 4300.0);
+    }
+
+    #[test]
+    fn reanchoring_clamps_and_survives_a_missing_reading() {
+        let mut c = ColorAdjustments::default();
+        c.set_param("source_kelvin", 6000.0);
+        c.set_param("target_kelvin", 6000.0);
+
+        // A camera that reported nothing: the caller passes the default, still anchored.
+        c.reanchor_source_kelvin(DEFAULT_KELVIN, false);
+        assert_eq!(c.source_kelvin, DEFAULT_KELVIN);
+        assert!(!c.source_kelvin_detected);
+
+        // Way out of range, and a non-finite reading must change nothing at all.
+        c.reanchor_source_kelvin(1e9, true);
+        assert_eq!(c.source_kelvin, MAX_KELVIN);
+        let before = (c.source_kelvin, c.target_kelvin);
+        c.reanchor_source_kelvin(f64::NAN, true);
+        assert_eq!((c.source_kelvin, c.target_kelvin), before, "a NaN reading must be ignored");
     }
 
     #[test]

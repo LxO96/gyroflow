@@ -36,6 +36,7 @@ ResizablePanel 1.0 ResizablePanel.qml
 SearchField 1.0 SearchField.qml
 SidePanel 1.0 SidePanel.qml
 Slider 1.0 Slider.qml
+SliderSteppers 1.0 SliderSteppers.qml
 SliderWithField 1.0 SliderWithField.qml
 SplitButton 1.0 SplitButton.qml
 TabbedPopup 1.0 TabbedPopup.qml

@@ -860,19 +860,16 @@ impl Controller {
 
                     // Anchor the white balance to what the camera recorded. `source_kelvin` is
                     // the neutral point the grade is measured from, so it always follows the
-                    // file. `target_kelvin` only follows it along while the user hasn't turned
-                    // colour adjustments on - once they have, their chosen temperature is theirs
-                    // and loading another file must not move it.
+                    // file, and the user's offset from it travels along - see
+                    // `reanchor_source_kelvin`. Loading a warmer or cooler clip therefore keeps
+                    // "400 K warmer than the camera saw it" rather than keeping the number.
                     if let Some(settings) = md_data.get("recording_settings") {
                         let src = core::color::SourceExposure::from_recording_settings(settings);
-                        let mut c = stab.color.write();
                         let (kelvin, detected) = match src.white_balance_k {
                             Some(k) => (k, true),
                             None    => (core::color::DEFAULT_KELVIN, false),
                         };
-                        c.set_param("source_kelvin", kelvin);
-                        c.source_kelvin_detected = detected;
-                        if !c.enabled { c.set_param("target_kelvin", kelvin); }
+                        stab.color.write().reanchor_source_kelvin(kelvin, detected);
                     }
 
                     additional_data.as_object_mut().unwrap().insert("frame_readout_time".to_owned(), serde_json::to_value(stab.params.read().frame_readout_time.abs()).unwrap());
