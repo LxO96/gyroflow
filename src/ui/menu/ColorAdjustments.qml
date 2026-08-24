@@ -63,6 +63,8 @@ MenuItem {
         if (typeof c.exposure     !== "undefined") exposureSlider   .value = +c.exposure;
         if (typeof c.contrast     !== "undefined") contrastSlider   .value = +c.contrast;
         if (typeof c.saturation   !== "undefined") saturationSlider .value = +c.saturation;
+        if (typeof c.shadows      !== "undefined") shadowsSlider    .value = +c.shadows;
+        if (typeof c.highlights   !== "undefined") highlightsSlider .value = +c.highlights;
         if (typeof c.tint         !== "undefined") tintSlider       .value = +c.tint;
         if (typeof c.lut_strength !== "undefined") lutStrengthSlider.value = +c.lut_strength;
         if (typeof c.target_kelvin !== "undefined") {
@@ -213,6 +215,40 @@ MenuItem {
             showOrigin: true;
             keyframe: "ColorSaturation";
             onValueChanged: controller.set_color_param("saturation", value);
+        }
+    }
+
+    // Placed after Saturation and before Temperature to match the order the grade is applied
+    // in (core/color/mod.rs `apply_color`), so the panel reads top-to-bottom as the pipeline.
+    Label {
+        text: qsTr("Shadows");
+        tooltip: qsTr("Lifts or deepens the darkest part of the image. The falloff is weighted to the toe, so mid grey moves about an eighth as far and the highlights barely move at all.");
+        SliderWithField {
+            id: shadowsSlider;
+            width: parent.width;
+            from: -100; to: 100;           // core: -1 .. 1
+            value: 0; defaultValue: 0;
+            scaler: 100.0;
+            precision: 0;
+            showOrigin: true;
+            keyframe: "ColorShadows";
+            onValueChanged: controller.set_color_param("shadows", value);
+        }
+    }
+
+    Label {
+        text: qsTr("Highlights");
+        tooltip: qsTr("Recovers or pushes the brightest part of the image. Weighted to the shoulder the same way Shadows is weighted to the toe, so the two do not fight each other.");
+        SliderWithField {
+            id: highlightsSlider;
+            width: parent.width;
+            from: -100; to: 100;           // core: -1 .. 1
+            value: 0; defaultValue: 0;
+            scaler: 100.0;
+            precision: 0;
+            showOrigin: true;
+            keyframe: "ColorHighlights";
+            onValueChanged: controller.set_color_param("highlights", value);
         }
     }
 

@@ -164,7 +164,7 @@ pub struct KernelParams {
     pub ewa_coeffs_q:             [f32; 4], // 16
     pub color_params_1:           [f32; 4], // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     pub color_params_2:           [f32; 4], // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
-    pub color_params_3:           [f32; 4], // 16 - lut_domain_min, lut_domain_max, unused, unused
+    pub color_params_3:           [f32; 4], // 16 - lut_domain_min, lut_domain_max, shadows, highlights
 }
 unsafe impl bytemuck::Zeroable for KernelParams {}
 unsafe impl bytemuck::Pod for KernelParams {}
@@ -913,7 +913,7 @@ mod cross_backend_color_tests {
 
     const COLOR_PARAMS_1: [f32; 4] = [1.2, 1.1, 0.8, 0.5]; // exposure, contrast, saturation, lut_strength
     const COLOR_PARAMS_2: [f32; 4] = [1.05, 1.0, 0.95, 2.0]; // wb r/g/b, lut_size
-    const COLOR_PARAMS_3: [f32; 4] = [0.0, 1.0, 0.0, 0.0]; // domain_min, domain_max
+    const COLOR_PARAMS_3: [f32; 4] = [0.0, 1.0, 0.3, -0.2]; // domain_min, domain_max, shadows, highlights
 
     /// Inverts every channel; bilinear interpolation of a linear function is exact, so
     /// `sample_trilinear` returns exactly `[1-c0, 1-c1, 1-c2]`. Same LUT the CPU test uses.
@@ -1011,6 +1011,8 @@ mod cross_backend_color_tests {
             saturation_factor: COLOR_PARAMS_1[2],
             lut_strength:      COLOR_PARAMS_1[3],
             wb_gains:          [COLOR_PARAMS_2[0], COLOR_PARAMS_2[1], COLOR_PARAMS_2[2]],
+            shadows:           COLOR_PARAMS_3[2],
+            highlights:        COLOR_PARAMS_3[3],
             lut_size:          COLOR_PARAMS_2[3] as u32,
             domain_min:        COLOR_PARAMS_3[0],
             domain_max:        COLOR_PARAMS_3[1],

@@ -13,7 +13,8 @@
 > defaults and many assume limited range for 10-bit YUV, ignoring the range tag. Fix is a
 > tagging policy decision, not a colour-maths change — see §1 below.
 
-Handoff note, 2026-08-20. Branch `wgpu-identity-investigation`, 7 commits on top of `master`.
+Handoff note, 2026-08-20; updated 2026-08-24. Branch `wgpu-identity-investigation`, 13 commits
+on top of `master`.
 `master` (`beb392a5`) already carries the merged colour work and is 50 commits ahead of
 `origin/master` — nothing here has been pushed.
 
@@ -299,8 +300,18 @@ None of these are caused by the colour work; all were reproduced with colour dis
 - **`gyroflow.log` is truncated on every launch** (`%LOCALAPPDATA%\Gyroflow\`). Copy it aside
   before reproducing anything from an earlier session. Its timestamps are UTC while the file mtime
   is local. `settings.json` beside it is not truncated and is a useful secondary source.
-- **The repo is CRLF.** Never `sed -i` — it rewrites the whole file to LF. Appending with `>>` can
-  also concatenate onto a missing trailing newline.
+- **Line endings are mixed, per file.** `src/core/color/mod.rs` is LF; `src/core/lib.rs`,
+  `src/controller.rs`, `src/rendering/mod.rs` and the QML files are CRLF. Check with `file` before
+  any scripted edit — assuming either one silently makes every replacement fail to match. Never
+  `sed -i` (rewrites the whole file to LF), and note PowerShell `Set-Content` re-encodes: it added
+  a BOM and mojibaked every non-ASCII character in `ColorAdjustments.qml`. Appending with `>>` can
+  also concatenate onto a missing trailing newline. Python in binary mode preserves both.
+- **Editing `src/qt_gpu/undistort.frag` does nothing until you recompile it.** The preview loads
+  precompiled `.qsb` files from `src/qt_gpu/compiled/`, baked into a Qt resource. Run
+  `bash src/qt_gpu/compiled/compile_shaders.sh` (needs `qsb.exe` from the Qt `bin` dir, path is
+  hardcoded in the script) and rebuild; it regenerates 21 permutations of distortion model x
+  digital lens. Nothing warns you - the preview simply keeps running the old shader, which reads
+  as "the feature does not work on the preview path".
 - **In PowerShell, never pipe a running process through `Select-Object -First N`** — it terminates
   the pipeline and kills the process. This aborted two renders before it was recognised.
 - The GPU backend is selected by `NO_OPENCL` / `NO_WGPU` (`core/gpu/mod.rs:375`).

@@ -1292,6 +1292,8 @@ impl StabilizationManager {
                 "exposure":               c.exposure,
                 "contrast":               c.contrast,
                 "saturation":             c.saturation,
+                "shadows":                c.shadows,
+                "highlights":             c.highlights,
                 "source_kelvin":          c.source_kelvin,
                 "source_kelvin_detected": c.source_kelvin_detected,
                 "target_kelvin":          c.target_kelvin,
@@ -1781,7 +1783,7 @@ impl StabilizationManager {
                 // hand-edited or corrupted project can't produce a nonsensical grade. The
                 // ranges live in `ColorAdjustments::set_param`, shared with the QML entry
                 // point in `Controller::set_color_param`.
-                for key in ["exposure", "contrast", "saturation", "source_kelvin", "target_kelvin", "tint", "lut_strength"] {
+                for key in ["exposure", "contrast", "saturation", "shadows", "highlights", "source_kelvin", "target_kelvin", "tint", "lut_strength"] {
                     if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { c.set_param(key, v); }
                 }
                 if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
@@ -2299,6 +2301,8 @@ DOMAIN_MAX 1.0 1.0 1.0
             c.exposure = 0.75;
             c.contrast = -0.25;
             c.saturation = 0.5;
+            c.shadows = 0.4;
+            c.highlights = -0.6;
             c.source_kelvin = 5200.0;
             c.source_kelvin_detected = true;
             c.target_kelvin = 6200.0;
@@ -2325,6 +2329,8 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_eq!(b.exposure,               a.exposure);
         assert_eq!(b.contrast,               a.contrast);
         assert_eq!(b.saturation,             a.saturation);
+        assert_eq!(b.shadows,                a.shadows);
+        assert_eq!(b.highlights,             a.highlights);
         assert_eq!(b.source_kelvin,          a.source_kelvin);
         assert_eq!(b.source_kelvin_detected, a.source_kelvin_detected);
         assert_eq!(b.target_kelvin,          a.target_kelvin);
@@ -2670,7 +2676,7 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_eq!(c.target_kelvin, 25000.0);
         assert_eq!(c.tint,         -1.0);
         assert_eq!(c.lut_strength,  1.0);
-        assert!(c.to_kernel_params(c.exposure, c.contrast, c.saturation, c.target_kelvin, c.tint, c.lut_strength).exposure_gain.is_finite());
+        assert!(c.to_kernel_params(color::ResolvedScalars { exposure: c.exposure, contrast: c.contrast, saturation: c.saturation, shadows: c.shadows, highlights: c.highlights, target_kelvin: c.target_kelvin, tint: c.tint, lut_strength: c.lut_strength }).exposure_gain.is_finite());
     }
 
     #[test]

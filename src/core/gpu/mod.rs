@@ -19,7 +19,7 @@ use std::hash::Hasher;
 /// same source that is compiled to SPIR-V also compiles for the host and can be called here.
 #[cfg(test)]
 mod spirv_color_tests {
-    use crate::color::{ ColorKernelParams, Lut3D, apply_color };
+    use crate::color::{ ColorKernelParams, Lut3D, ResolvedScalars, apply_color };
     use stabilize_spirv::glam::{ Vec4, vec4 };
     use stabilize_spirv::KernelParams as SpirvParams;
 
@@ -50,14 +50,14 @@ mod spirv_color_tests {
         p.max_pixel_value = max_pixel_value;
         p.color_params_1 = vec4(cp.exposure_gain, cp.contrast_factor, cp.saturation_factor, cp.lut_strength);
         p.color_params_2 = vec4(cp.wb_gains[0], cp.wb_gains[1], cp.wb_gains[2], cp.lut_size as f32);
-        p.color_params_3 = vec4(cp.domain_min, cp.domain_max, 0.0, 0.0);
+        p.color_params_3 = vec4(cp.domain_min, cp.domain_max, cp.shadows, cp.highlights);
         p
     }
 
-    fn kernel_params(lut: Option<&Lut3D>, exposure: f64, contrast: f64, saturation: f64, target_kelvin: f64, tint: f64, lut_strength: f64) -> ColorKernelParams {
+    fn kernel_params(lut: Option<&Lut3D>, s: crate::color::ResolvedScalars) -> ColorKernelParams {
         let mut adj = crate::color::ColorAdjustments::default();
         adj.lut = lut.map(|l| std::sync::Arc::new(l.clone()));
-        adj.to_kernel_params(exposure, contrast, saturation, target_kelvin, tint, lut_strength)
+        adj.to_kernel_params(s)
     }
 
     /// Exact f32 equality. Any tolerance here would mean the expressions diverged.
@@ -84,12 +84,12 @@ mod spirv_color_tests {
 
     #[test]
     fn matches_reference_without_lut() {
-        for &(exposure, contrast, saturation, kelvin, tint) in &[
-            (0.0, 0.0, 0.0, 5500.0, 0.0),
-            (1.5, 0.4, -0.3, 7200.0, 0.25),
-            (-2.25, -0.8, 0.9, 3200.0, -0.4),
+        for &(exposure, contrast, saturation, shadows, highlights, kelvin, tint) in &[
+            (0.0, 0.0, 0.0, 0.0, 0.0, 5500.0, 0.0),
+            (1.5, 0.4, -0.3, 0.6, -0.45, 7200.0, 0.25),
+            (-2.25, -0.8, 0.9, -1.0, 1.0, 3200.0, -0.4),
         ] {
-            let cp = kernel_params(None, exposure, contrast, saturation, kelvin, tint, 1.0);
+            let cp = kernel_params(None, ResolvedScalars { exposure, contrast, saturation, shadows, highlights, target_kelvin: kelvin, tint, ..Default::default() });
             let sp = params_and_spirv(&cp, false, 1.0);
             for probe in PROBES {
                 let expected = apply_color(*probe, &cp, None);
@@ -106,8 +106,8 @@ mod spirv_color_tests {
         assert_eq!(coeffs.len(), crate::stabilization::LUT_DATA_OFFSET + 27 * 3);
 
         for strength in [0.0f64, 0.5, 1.0] {
-            for &(exposure, contrast, saturation) in &[(0.0, 0.0, 0.0), (0.75, 0.3, -0.5)] {
-                let cp = kernel_params(Some(&lut), exposure, contrast, saturation, 6500.0, 0.1, strength);
+            for &(exposure, contrast, saturation, shadows, highlights) in &[(0.0, 0.0, 0.0, 0.0, 0.0), (0.75, 0.3, -0.5, -0.35, 0.8)] {
+                let cp = kernel_params(Some(&lut), ResolvedScalars { exposure, contrast, saturation, shadows, highlights, target_kelvin: 6500.0, tint: 0.1, lut_strength: strength });
                 let sp = params_and_spirv(&cp, true, 1.0);
                 for probe in PROBES {
                     // The reference skips the LUT entirely at strength 0, which is what the
@@ -126,7 +126,7 @@ mod spirv_color_tests {
         lut.domain_min = -0.5;
         lut.domain_max = 2.0;
         let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
-        let cp = kernel_params(Some(&lut), 0.25, 0.2, 0.35, 4800.0, -0.2, 1.0);
+        let cp = kernel_params(Some(&lut), ResolvedScalars { exposure: 0.25, contrast: 0.2, saturation: 0.35, shadows: 0.5, highlights: -0.6, target_kelvin: 4800.0, tint: -0.2, ..Default::default() });
         let sp = params_and_spirv(&cp, true, 1.0);
         for probe in PROBES {
             let expected = apply_color(*probe, &cp, Some(&lut));
@@ -141,7 +141,7 @@ mod spirv_color_tests {
     fn normalises_by_max_pixel_value_like_the_cpu_path() {
         let lut = test_lut();
         let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
-        let cp = kernel_params(Some(&lut), 0.5, -0.25, 0.4, 6000.0, 0.15, 0.75);
+        let cp = kernel_params(Some(&lut), ResolvedScalars { exposure: 0.5, contrast: -0.25, saturation: 0.4, shadows: -0.7, highlights: 0.3, target_kelvin: 6000.0, tint: 0.15, lut_strength: 0.75 });
         let max = 255.0f32;
         let sp = params_and_spirv(&cp, true, max);
         let inv_max = 1.0 / max;
@@ -159,7 +159,7 @@ mod spirv_color_tests {
     fn has_lut_flag_gates_the_lut() {
         let lut = test_lut();
         let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
-        let cp = kernel_params(Some(&lut), 0.0, 0.0, 0.0, 5500.0, 0.0, 1.0);
+        let cp = kernel_params(Some(&lut), ResolvedScalars::default());
         let sp = params_and_spirv(&cp, false, 1.0);
         for probe in PROBES {
             let expected = apply_color(*probe, &cp, None);

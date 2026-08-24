@@ -177,14 +177,16 @@ impl FrameTransform {
         // `is_active` only sees the static scalars, so a project whose colour lives entirely
         // in keyframes would be gated off before the keyframes below are ever read.
         let color_kernel = if color.enabled && (color.is_active() || params.keyframes.is_any_color_keyframed()) {
-            Some(color.to_kernel_params(
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorExposure,    timestamp_ms).unwrap_or(color.exposure),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorContrast,    timestamp_ms).unwrap_or(color.contrast),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorSaturation,  timestamp_ms).unwrap_or(color.saturation),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTemperature, timestamp_ms).unwrap_or(color.target_kelvin),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTint,        timestamp_ms).unwrap_or(color.tint),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorLutStrength, timestamp_ms).unwrap_or(color.lut_strength),
-            ))
+            Some(color.to_kernel_params(crate::color::ResolvedScalars {
+                exposure:      params.keyframes.value_at_video_timestamp(&KeyframeType::ColorExposure,    timestamp_ms).unwrap_or(color.exposure),
+                contrast:      params.keyframes.value_at_video_timestamp(&KeyframeType::ColorContrast,    timestamp_ms).unwrap_or(color.contrast),
+                saturation:    params.keyframes.value_at_video_timestamp(&KeyframeType::ColorSaturation,  timestamp_ms).unwrap_or(color.saturation),
+                shadows:       params.keyframes.value_at_video_timestamp(&KeyframeType::ColorShadows,     timestamp_ms).unwrap_or(color.shadows),
+                highlights:    params.keyframes.value_at_video_timestamp(&KeyframeType::ColorHighlights,  timestamp_ms).unwrap_or(color.highlights),
+                target_kelvin: params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTemperature, timestamp_ms).unwrap_or(color.target_kelvin),
+                tint:          params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTint,        timestamp_ms).unwrap_or(color.tint),
+                lut_strength:  params.keyframes.value_at_video_timestamp(&KeyframeType::ColorLutStrength, timestamp_ms).unwrap_or(color.lut_strength),
+            }))
         } else {
             None
         };
@@ -358,7 +360,7 @@ impl FrameTransform {
         if let Some(c) = color_kernel {
             kernel_params.color_params_1 = [c.exposure_gain, c.contrast_factor, c.saturation_factor, c.lut_strength];
             kernel_params.color_params_2 = [c.wb_gains[0], c.wb_gains[1], c.wb_gains[2], c.lut_size as f32];
-            kernel_params.color_params_3 = [c.domain_min, c.domain_max, 0.0, 0.0];
+            kernel_params.color_params_3 = [c.domain_min, c.domain_max, c.shadows, c.highlights];
             kernel_params.flags |= KernelParamsFlags::COLOR_ENABLED.bits();
             if c.lut_size > 0 { kernel_params.flags |= KernelParamsFlags::HAS_LUT.bits(); }
         }

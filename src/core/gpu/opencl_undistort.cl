@@ -245,7 +245,18 @@ float4 apply_color(float4 px, __global const float *lut_coeffs, __global KernelP
     // 4. Contrast around mid grey
     c = (c - (float3)(0.5f)) * params->color_params_1.y + (float3)(0.5f);
 
-    // 5. Saturation around luma
+    // 5. Shadows / highlights, each weighted to its own end of the tone range.
+    // Cubic weights, clamped at zero - a step-for-step duplicate of `apply_color` in
+    // src/core/color/mod.rs. Operation order must not be rearranged.
+    float tone_luma = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    float sw = fmax(1.0f - tone_luma, 0.0f);
+    float hw = fmax(tone_luma, 0.0f);
+    float shadow_w = sw * sw * sw;
+    float highlight_w = hw * hw * hw;
+    float tone = params->color_params_3.z * shadow_w + params->color_params_3.w * highlight_w;
+    c = c + (float3)(tone);
+
+    // 6. Saturation around luma
     float luma = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
     c = (float3)(luma) + (c - (float3)(luma)) * params->color_params_1.z;
 

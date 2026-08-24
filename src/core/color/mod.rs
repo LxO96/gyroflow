@@ -32,6 +32,8 @@ pub struct ColorAdjustments {
     pub exposure: f64,               // stops, -5..5, 0 neutral
     pub contrast: f64,               // -1..1, 0 neutral
     pub saturation: f64,             // -1..1, 0 neutral
+    pub shadows: f64,                // -1..1, 0 neutral
+    pub highlights: f64,             // -1..1, 0 neutral
     pub source_kelvin: f64,
     pub source_kelvin_detected: bool,
     pub target_kelvin: f64,
@@ -59,6 +61,8 @@ impl Default for ColorAdjustments {
             exposure: 0.0,
             contrast: 0.0,
             saturation: 0.0,
+            shadows: 0.0,
+            highlights: 0.0,
             source_kelvin: DEFAULT_KELVIN,
             source_kelvin_detected: false,
             target_kelvin: DEFAULT_KELVIN,
@@ -73,6 +77,44 @@ impl Default for ColorAdjustments {
     }
 }
 
+/// The keyframable scalars, resolved for a single frame by the caller.
+///
+/// A struct rather than a positional argument list because there are eight of them and every
+/// one is an `f64`: transposing `contrast` and `saturation` at a call site would compile
+/// cleanly and silently mis-grade every pixel.
+///
+/// `Default` is the *neutral* grade, not all-zeroes - `target_kelvin` at
+/// `DEFAULT_KELVIN` and `lut_strength` at 1.0 are what "no adjustment" means for those two.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedScalars {
+    pub exposure: f64,
+    pub contrast: f64,
+    pub saturation: f64,
+    pub shadows: f64,
+    pub highlights: f64,
+    pub target_kelvin: f64,
+    pub tint: f64,
+    pub lut_strength: f64,
+}
+
+impl Default for ResolvedScalars {
+    fn default() -> Self {
+        Self {
+            exposure: 0.0, contrast: 0.0, saturation: 0.0,
+            shadows: 0.0, highlights: 0.0,
+            target_kelvin: DEFAULT_KELVIN, tint: 0.0, lut_strength: 1.0,
+        }
+    }
+}
+
+/// How far a full-scale shadows or highlights slider moves its own end of the tone range.
+///
+/// The sliders are +/-1 like contrast and saturation, but a full +/-1 *added* to a pixel would
+/// be a far more violent move than the other controls make, so the stored value is halved on
+/// the way to the kernels. Mirrored in all five kernels only in the sense that they receive
+/// the already-scaled number - the scaling itself happens here, once.
+pub const TONE_REGION_SCALE: f64 = 0.5;
+
 /// Ready-to-multiply values handed to every kernel. No colour science here —
 /// it has all been done in Rust by the time this struct is built.
 #[derive(Debug, Clone, Copy, Default)]
@@ -80,6 +122,9 @@ pub struct ColorKernelParams {
     pub exposure_gain: f32,
     pub contrast_factor: f32,
     pub saturation_factor: f32,
+    /// Already scaled by `TONE_REGION_SCALE`, so the kernels just add.
+    pub shadows: f32,
+    pub highlights: f32,
     pub lut_strength: f32,
     pub wb_gains: [f32; 3],
     pub lut_size: u32,
@@ -109,6 +154,8 @@ impl ColorAdjustments {
             "exposure"      => self.exposure      = val.clamp(MIN_EXPOSURE, MAX_EXPOSURE),
             "contrast"      => self.contrast      = val.clamp(-1.0, 1.0),
             "saturation"    => self.saturation    = val.clamp(-1.0, 1.0),
+            "shadows"       => self.shadows       = val.clamp(-1.0, 1.0),
+            "highlights"    => self.highlights    = val.clamp(-1.0, 1.0),
             "tint"          => self.tint          = val.clamp(-1.0, 1.0),
             "source_kelvin" => self.source_kelvin = val.clamp(MIN_KELVIN, MAX_KELVIN),
             "target_kelvin" => self.target_kelvin = val.clamp(MIN_KELVIN, MAX_KELVIN),
@@ -122,6 +169,7 @@ impl ColorAdjustments {
         self.enabled && (
             self.lut.is_some()
             || self.exposure != 0.0 || self.contrast != 0.0 || self.saturation != 0.0
+            || self.shadows != 0.0 || self.highlights != 0.0
             || self.tint != 0.0
             || (self.target_kelvin - self.source_kelvin).abs() > f64::EPSILON
         )
@@ -134,13 +182,15 @@ impl ColorAdjustments {
     /// slider bounds are both bypassed - a hand-edited `keyframes` section, or a value typed
     /// into the unbounded `NumberField`, lands here raw. Unclamped, `exposure.exp2()` reaches
     /// `+inf` around 1024 and renders a white frame with no diagnostic.
-    pub fn to_kernel_params(&self, exposure: f64, contrast: f64, saturation: f64, target_kelvin: f64, tint: f64, lut_strength: f64) -> ColorKernelParams {
+    pub fn to_kernel_params(&self, s: ResolvedScalars) -> ColorKernelParams {
         ColorKernelParams {
-            exposure_gain:     exposure.clamp(MIN_EXPOSURE, MAX_EXPOSURE).exp2() as f32,
-            contrast_factor:   (1.0 + contrast.clamp(-1.0, 1.0)) as f32,
-            saturation_factor: (1.0 + saturation.clamp(-1.0, 1.0)) as f32,
-            lut_strength:      lut_strength.clamp(0.0, 1.0) as f32,
-            wb_gains:          kelvin_to_rgb_gains(self.source_kelvin, target_kelvin, tint),
+            exposure_gain:     s.exposure.clamp(MIN_EXPOSURE, MAX_EXPOSURE).exp2() as f32,
+            contrast_factor:   (1.0 + s.contrast.clamp(-1.0, 1.0)) as f32,
+            saturation_factor: (1.0 + s.saturation.clamp(-1.0, 1.0)) as f32,
+            shadows:           (s.shadows.clamp(-1.0, 1.0)    * TONE_REGION_SCALE) as f32,
+            highlights:        (s.highlights.clamp(-1.0, 1.0) * TONE_REGION_SCALE) as f32,
+            lut_strength:      s.lut_strength.clamp(0.0, 1.0) as f32,
+            wb_gains:          kelvin_to_rgb_gains(self.source_kelvin, s.target_kelvin, s.tint),
             lut_size:          self.lut.as_ref().map(|l| l.size).unwrap_or(0),
             domain_min:        self.lut.as_ref().map(|l| l.domain_min).unwrap_or(0.0),
             domain_max:        self.lut.as_ref().map(|l| l.domain_max).unwrap_or(1.0),
@@ -152,7 +202,7 @@ impl ColorAdjustments {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write_u8(self.enabled as u8);
         h.write_u8(self.bake_in_render as u8);
-        for v in [self.exposure, self.contrast, self.saturation, self.source_kelvin, self.target_kelvin, self.tint, self.lut_strength] {
+        for v in [self.exposure, self.contrast, self.saturation, self.shadows, self.highlights, self.source_kelvin, self.target_kelvin, self.tint, self.lut_strength] {
             h.write_u64(v.to_bits());
         }
         h.write_u32(self.lut.as_ref().map(|l| l.checksum).unwrap_or(0));
@@ -184,7 +234,26 @@ pub fn apply_color(rgb: [f32; 3], p: &ColorKernelParams, lut: Option<&Lut3D>) ->
     // 4. Contrast around mid grey
     for i in 0..3 { c[i] = (c[i] - 0.5) * p.contrast_factor + 0.5; }
 
-    // 5. Saturation around luma
+    // 5. Shadows / highlights, each weighted to its own end of the tone range.
+    //
+    // The weights are cubic so that each slider owns one end and hands mid grey back nearly
+    // untouched: at luma 0.5 both are exactly 0.125, so the two controls neither fight each
+    // other nor undo the contrast set above. Computed on the post-contrast pixel on purpose -
+    // the mask has to describe the image the user is actually looking at, or the sliders stop
+    // feeling predictable.
+    //
+    // Clamped at zero because the input is not guaranteed to be in 0..1: a LUT or an exposure
+    // push can carry a channel negative, and an unclamped cube would flip the weight's sign
+    // and *invert* the correction exactly where it is least expected.
+    let tone_luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let sw = (1.0 - tone_luma).max(0.0);
+    let hw = tone_luma.max(0.0);
+    let shadow_w    = sw * sw * sw;
+    let highlight_w = hw * hw * hw;
+    let tone = p.shadows * shadow_w + p.highlights * highlight_w;
+    for i in 0..3 { c[i] += tone; }
+
+    // 6. Saturation around luma
     let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
     for i in 0..3 { c[i] = luma + (c[i] - luma) * p.saturation_factor; }
 
@@ -196,7 +265,7 @@ mod tests {
     use super::*;
 
     fn neutral() -> ColorKernelParams {
-        ColorAdjustments::default().to_kernel_params(0.0, 0.0, 0.0, 5500.0, 0.0, 1.0)
+        ColorAdjustments::default().to_kernel_params(ResolvedScalars::default())
     }
 
     #[test]
@@ -210,14 +279,14 @@ mod tests {
 
     #[test]
     fn one_stop_exposure_doubles_linear_value() {
-        let p = ColorAdjustments::default().to_kernel_params(1.0, 0.0, 0.0, 5500.0, 0.0, 1.0);
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { exposure: 1.0, ..Default::default() });
         let out = apply_color([0.25, 0.25, 0.25], &p, None);
         assert!((out[0] - 0.5).abs() < 1e-6, "was {}", out[0]);
     }
 
     #[test]
     fn contrast_pivots_around_mid_grey() {
-        let p = ColorAdjustments::default().to_kernel_params(0.0, 0.5, 0.0, 5500.0, 0.0, 1.0);
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { contrast: 0.5, ..Default::default() });
         let mid = apply_color([0.5, 0.5, 0.5], &p, None);
         assert!((mid[0] - 0.5).abs() < 1e-6, "mid grey must not move, was {}", mid[0]);
         assert!(apply_color([0.75, 0.75, 0.75], &p, None)[0] > 0.75);
@@ -226,14 +295,14 @@ mod tests {
 
     #[test]
     fn full_negative_saturation_yields_grey() {
-        let p = ColorAdjustments::default().to_kernel_params(0.0, 0.0, -1.0, 5500.0, 0.0, 1.0);
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { saturation: -1.0, ..Default::default() });
         let out = apply_color([0.8, 0.2, 0.4], &p, None);
         assert!((out[0] - out[1]).abs() < 1e-6 && (out[1] - out[2]).abs() < 1e-6, "expected grey, got {out:?}");
     }
 
     #[test]
     fn saturation_preserves_luma() {
-        let p = ColorAdjustments::default().to_kernel_params(0.0, 0.0, 0.6, 5500.0, 0.0, 1.0);
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { saturation: 0.6, ..Default::default() });
         let input = [0.8f32, 0.2, 0.4];
         let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
         let out = apply_color(input, &p, None);
@@ -244,7 +313,7 @@ mod tests {
     fn zero_lut_strength_ignores_the_lut() {
         // A LUT that maps everything to black; at strength 0 it must do nothing.
         let black = Lut3D { size: 2, domain_min: 0.0, domain_max: 1.0, data: vec![0.0; 8 * 3], checksum: 0 };
-        let p = ColorAdjustments::default().to_kernel_params(0.0, 0.0, 0.0, 5500.0, 0.0, 0.0);
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { lut_strength: 0.0, ..Default::default() });
         let out = apply_color([0.7, 0.7, 0.7], &p, Some(&black));
         assert!((out[0] - 0.7).abs() < 1e-6, "was {}", out[0]);
     }
@@ -252,7 +321,7 @@ mod tests {
     #[test]
     fn half_lut_strength_blends_evenly() {
         let black = Lut3D { size: 2, domain_min: 0.0, domain_max: 1.0, data: vec![0.0; 8 * 3], checksum: 0 };
-        let p = ColorAdjustments::default().to_kernel_params(0.0, 0.0, 0.0, 5500.0, 0.0, 0.5);
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { lut_strength: 0.5, ..Default::default() });
         let out = apply_color([0.8, 0.8, 0.8], &p, Some(&black));
         assert!((out[0] - 0.4).abs() < 1e-6, "was {}", out[0]);
     }
@@ -271,6 +340,8 @@ mod tests {
             ("exposure",      -1e6, 1e6, -5.0,       5.0),
             ("contrast",      -1e6, 1e6, -1.0,       1.0),
             ("saturation",    -1e6, 1e6, -1.0,       1.0),
+            ("shadows",       -1e6, 1e6, -1.0,       1.0),
+            ("highlights",    -1e6, 1e6, -1.0,       1.0),
             ("tint",          -1e6, 1e6, -1.0,       1.0),
             ("source_kelvin",  0.0, 1e6, MIN_KELVIN, MAX_KELVIN),
             ("target_kelvin",  0.0, 1e6, MIN_KELVIN, MAX_KELVIN),
@@ -302,11 +373,65 @@ mod tests {
         assert_eq!(c.exposure, 1.0, "a rejected value must leave the field alone");
     }
 
+    /// Each slider owns one end of the tone range. Cubic weighting is what makes that true:
+    /// at the far end the weight is ~0, so the two controls do not fight each other.
+    #[test]
+    fn shadows_lift_the_toe_and_leave_the_shoulder_alone() {
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows: 1.0, ..Default::default() });
+        let toe      = apply_color([0.05, 0.05, 0.05], &p, None);
+        let shoulder = apply_color([0.95, 0.95, 0.95], &p, None);
+        assert!(toe[0] > 0.05 + 0.3, "toe should lift hard, was {}", toe[0]);
+        assert!((shoulder[0] - 0.95).abs() < 0.01, "shoulder should barely move, was {}", shoulder[0]);
+    }
+
+    #[test]
+    fn highlights_pull_the_shoulder_and_leave_the_toe_alone() {
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { highlights: -1.0, ..Default::default() });
+        let toe      = apply_color([0.05, 0.05, 0.05], &p, None);
+        let shoulder = apply_color([0.95, 0.95, 0.95], &p, None);
+        assert!(shoulder[0] < 0.95 - 0.3, "shoulder should come down hard, was {}", shoulder[0]);
+        assert!((toe[0] - 0.05).abs() < 0.01, "toe should barely move, was {}", toe[0]);
+    }
+
+    /// The number that decides whether these sliders feel controllable: a full-scale move
+    /// shifts its own end by TONE_REGION_SCALE and mid grey by one eighth of that, because
+    /// the cubic weight at luma 0.5 is exactly 0.125.
+    #[test]
+    fn a_full_slider_moves_mid_grey_by_one_eighth_of_its_own_end() {
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows: 1.0, ..Default::default() });
+        let at_black = apply_color([0.0, 0.0, 0.0], &p, None)[0];
+        let at_mid   = apply_color([0.5, 0.5, 0.5], &p, None)[0] - 0.5;
+        assert!((at_black - TONE_REGION_SCALE as f32).abs() < 1e-6, "was {at_black}");
+        assert!((at_mid - TONE_REGION_SCALE as f32 / 8.0).abs() < 1e-6, "was {at_mid}");
+    }
+
+    /// Equal and opposite pushes cancel exactly at mid grey - the weights are symmetric
+    /// about 0.5, so this is a cheap check that neither curve has drifted.
+    #[test]
+    fn opposite_pushes_cancel_at_mid_grey() {
+        let p = ColorAdjustments::default().to_kernel_params(ResolvedScalars { shadows: 1.0, highlights: -1.0, ..Default::default() });
+        let mid = apply_color([0.5, 0.5, 0.5], &p, None);
+        assert!((mid[0] - 0.5).abs() < 1e-6, "was {}", mid[0]);
+    }
+
+    #[test]
+    fn shadows_or_highlights_alone_make_the_grade_active() {
+        for name in ["shadows", "highlights"] {
+            let mut c = ColorAdjustments::default();
+            c.enabled = true;
+            assert!(!c.is_active(), "nothing set yet");
+            assert!(c.set_param(name, 0.5));
+            assert!(c.is_active(), "{name} alone should activate the grade");
+        }
+    }
+
     fn read_param(c: &ColorAdjustments, name: &str) -> f64 {
         match name {
             "exposure"      => c.exposure,
             "contrast"      => c.contrast,
             "saturation"    => c.saturation,
+            "shadows"       => c.shadows,
+            "highlights"    => c.highlights,
             "tint"          => c.tint,
             "source_kelvin" => c.source_kelvin,
             "target_kelvin" => c.target_kelvin,
@@ -322,6 +447,12 @@ mod tests {
         modified.exposure = 0.5;
         assert_ne!(base.get_checksum(), modified.get_checksum());
 
+        for name in ["shadows", "highlights"] {
+            let mut m = base.clone();
+            assert!(m.set_param(name, 0.5));
+            assert_ne!(base.get_checksum(), m.get_checksum(), "{name} must invalidate the preview");
+        }
+
         let mut with_lut = base.clone();
         with_lut.lut = Some(std::sync::Arc::new(Lut3D { size: 2, domain_min: 0.0, domain_max: 1.0, data: vec![0.5; 24], checksum: 12345 }));
         assert_ne!(base.get_checksum(), with_lut.get_checksum());
@@ -334,16 +465,16 @@ mod tests {
     fn keyframed_exposure_cannot_blow_up_the_gain() {
         let c = ColorAdjustments::default();
 
-        let huge = c.to_kernel_params(100_000.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        let huge = c.to_kernel_params(ResolvedScalars { exposure: 100_000.0, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
         assert!(huge.exposure_gain.is_finite(), "exposure gain was {}", huge.exposure_gain);
         assert_eq!(huge.exposure_gain, (MAX_EXPOSURE as f32).exp2());
 
-        let tiny = c.to_kernel_params(-100_000.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        let tiny = c.to_kernel_params(ResolvedScalars { exposure: -100_000.0, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
         assert!(tiny.exposure_gain.is_finite());
         assert_eq!(tiny.exposure_gain, (MIN_EXPOSURE as f32).exp2());
 
         // In-range values are untouched: one stop up is exactly a doubling.
-        let one_stop = c.to_kernel_params(1.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        let one_stop = c.to_kernel_params(ResolvedScalars { exposure: 1.0, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
         assert_eq!(one_stop.exposure_gain, 2.0);
     }
 
@@ -354,8 +485,8 @@ mod tests {
         let mut c = ColorAdjustments::default();
         c.set_param("exposure", 100.0);
         assert_eq!(c.exposure, MAX_EXPOSURE);
-        let via_keyframe = c.to_kernel_params(100.0, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
-        let via_static = c.to_kernel_params(c.exposure, 0.0, 0.0, DEFAULT_KELVIN, 0.0, 1.0);
+        let via_keyframe = c.to_kernel_params(ResolvedScalars { exposure: 100.0, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
+        let via_static = c.to_kernel_params(ResolvedScalars { exposure: c.exposure, target_kelvin: DEFAULT_KELVIN, ..Default::default() });
         assert_eq!(via_keyframe.exposure_gain, via_static.exposure_gain);
     }
 }
