@@ -1093,7 +1093,7 @@ Item {
                 // so a toggle left off here can never silently ship a wrong-looking export.
                 SmallLinkButton {
                     id: colorEnabledBtn;
-                    iconName: "pencil";
+                    iconName: "pencil-outline";
                     onCheckedChanged: { controller.preview_color_enabled = checked; vid.forceRedraw(); }
                     tooltip: qsTr("Toggle color adjustments");
                 }
