@@ -833,21 +833,66 @@ Item {
                     // that closes a combo box or a tooltip. Cancelling on a button this MouseArea
                     // already receives, and only while it is armed, steals nothing.
                     acceptedButtons: Qt.LeftButton | Qt.RightButton;
-                    onClicked: mouse => {
-                        if (mouse.button === Qt.RightButton) { root.wbPickArmed = false; return; }
-                        // Normalised, because the grab is taken at the window's device pixel
-                        // ratio and is not the same size as this item.
-                        const nx = mouse.x / Math.max(1, width);
-                        const ny = mouse.y / Math.max(1, height);
+
+                    // Where the press landed, and where the cursor is now. Both in item pixels;
+                    // they are only normalised at the moment of the pick, because the grab is
+                    // taken at the window's device pixel ratio and is not this item's size.
+                    property real startX: 0;
+                    property real startY: 0;
+                    property bool dragging: false;
+
+                    // Below this a drag is a click. Fingers and mice both wobble a pixel or two
+                    // on the way down, and a two-pixel rectangle is not what anyone meant.
+                    readonly property real dragThreshold: 4 * dpiScale;
+
+                    onPressed: mouse => {
+                        if (mouse.button !== Qt.LeftButton) return;
+                        startX = mouse.x; startY = mouse.y;
+                        marquee.x = mouse.x; marquee.y = mouse.y;
+                        marquee.width = 0; marquee.height = 0;
+                        dragging = false;
+                    }
+                    onPositionChanged: mouse => {
+                        if (!pressed) return;
+                        if (!dragging && (Math.abs(mouse.x - startX) > dragThreshold || Math.abs(mouse.y - startY) > dragThreshold))
+                            dragging = true;
+                        marquee.x = Math.min(startX, mouse.x);
+                        marquee.y = Math.min(startY, mouse.y);
+                        marquee.width  = Math.abs(mouse.x - startX);
+                        marquee.height = Math.abs(mouse.y - startY);
+                    }
+                    onReleased: mouse => {
+                        if (mouse.button === Qt.RightButton) { root.wbPickArmed = false; dragging = false; return; }
+
+                        // A click is sent as a rectangle with both corners at the same point;
+                        // `average_patch` widens it to a small block, so there is one code path
+                        // on the Rust side and clicking keeps behaving exactly as it did.
+                        const x1 = dragging? mouse.x : startX;
+                        const y1 = dragging? mouse.y : startY;
+                        const nx0 = startX / Math.max(1, width), ny0 = startY / Math.max(1, height);
+                        const nx1 = x1     / Math.max(1, width), ny1 = y1     / Math.max(1, height);
+
+                        dragging = false;
                         root.wbPickArmed = false;
                         vid.grabToImage(function(result) {
-                            const r = controller.pick_white_balance(result.image, nx, ny);
+                            const r = controller.pick_white_balance(result.image, nx0, ny0, nx1, ny1);
                             if (r.error) {
                                 window.showNotification(Modal.Warning, r.error);
                             } else {
                                 window.colorAdjustments.applyPickedWhiteBalance(r.kelvin, r.tint);
                             }
                         });
+                    }
+
+                    // Shows what is about to be sampled. Sits inside the MouseArea so it is torn
+                    // down with it, and is `enabled: false` by inheritance - a plain Rectangle
+                    // takes no input, so it cannot eat the release that ends the drag.
+                    Rectangle {
+                        id: marquee;
+                        visible: wbPicker.dragging;
+                        color: "#20ffffff";
+                        border.color: "#ffffff";
+                        border.width: 1 * dpiScale;
                     }
                 }
             }

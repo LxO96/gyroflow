@@ -79,7 +79,7 @@ pub struct Controller {
     get_smoothing_status: qt_method!(fn(&self) -> QJsonArray),
     set_smoothing_param: qt_method!(fn(&self, name: QString, val: f64)),
     set_color_param: qt_method!(fn(&self, name: QString, val: f64)),
-    pick_white_balance: qt_method!(fn(&self, img: QImage, x: f64, y: f64) -> QJsonObject),
+    pick_white_balance: qt_method!(fn(&self, img: QImage, x0: f64, y0: f64, x1: f64, y1: f64) -> QJsonObject),
     set_color_enabled: qt_method!(fn(&self, enabled: bool, bake_in_render: bool)),
     load_lut: qt_method!(fn(&mut self, url: QUrl) -> QString),
     clear_lut: qt_method!(fn(&mut self)),
@@ -1257,24 +1257,23 @@ impl Controller {
         self.request_recompute();
     }
 
-    /// Solve temperature and tint from a patch of the preview the user says should be grey.
+    /// Solve temperature and tint from a region of the preview the user says should be grey.
     ///
     /// `img` is what `vid.grabToImage` handed back - the *graded* frame as it appears on screen -
-    /// and `x`/`y` are the click position as fractions of the item, 0..1. Fractions rather than
-    /// pixels because the grab is taken at the window's device pixel ratio, which QML would have
-    /// to guess at and which differs between the click coordinates and the image. Returns
-    /// `{ kelvin, tint }` on success or `{ error: "..." }` with a message to show; QML decides
-    /// what to do with either, so nothing here touches the sliders directly.
+    /// and `x0,y0`-`x1,y1` are the dragged rectangle as fractions of the item, 0..1, in any
+    /// order. A click arrives as a degenerate rectangle and is widened to a small block by
+    /// `average_patch`, so both gestures take the same path. Fractions rather than pixels because
+    /// the grab is taken at the window's device pixel ratio, which QML would have to guess at and
+    /// which differs between the click coordinates and the image.
     ///
-    /// The colour science, and the argument for why a screenshot is enough to work from, live in
-    /// `core/color/picker.rs`.
-    fn pick_white_balance(&self, img: QImage, x: f64, y: f64) -> QJsonObject {
+    /// Returns `{ kelvin, tint }` on success or `{ error: "..." }` with a message to show; QML
+    /// decides what to do with either, so nothing here touches the sliders directly.
+    ///
+    /// This function is deliberately only an adapter: which pixels a pick averages, and which of
+    /// them are worth averaging, is colour-picker knowledge and lives with the rest of it in
+    /// `core/color/picker.rs`, where it can be tested without Qt.
+    fn pick_white_balance(&self, img: QImage, x0: f64, y0: f64, x1: f64, y1: f64) -> QJsonObject {
         let mut ret = QJsonObject::default();
-
-        // Average a small patch rather than trusting one pixel. Video is noisy, and at 10-bit
-        // H.264 a single sample can sit a couple of codes off its neighbours - enough to move the
-        // solved temperature by a few hundred kelvin on a low-contrast grey.
-        const RADIUS: i32 = 2; // 5x5
 
         let size = img.size();
         let (w, h) = (size.width as i32, size.height as i32);
@@ -1282,22 +1281,11 @@ impl Controller {
             ret.insert("error", QString::from("The preview could not be read.").into());
             return ret;
         }
-        let cx = (x.clamp(0.0, 1.0) * (w - 1) as f64).round() as i32;
-        let cy = (y.clamp(0.0, 1.0) * (h - 1) as f64).round() as i32;
 
-        let mut sum = [0.0f64; 3];
-        let mut n = 0.0f64;
-        for sy in (cy - RADIUS)..=(cy + RADIUS) {
-            for sx in (cx - RADIUS)..=(cx + RADIUS) {
-                // Clamp rather than skip, so a click near the edge still averages the same number
-                // of samples and cannot be biased by whichever side of the patch fell off.
-                let (px, py) = (sx.clamp(0, w - 1) as u32, sy.clamp(0, h - 1) as u32);
-                let (r, g, bl, _) = img.get_pixel_color(px, py).get_rgba_f();
-                sum[0] += r as f64; sum[1] += g as f64; sum[2] += bl as f64;
-                n += 1.0;
-            }
-        }
-        let patch = [sum[0] / n, sum[1] / n, sum[2] / n];
+        let patch = core::color::average_patch(w, h, [x0, y0, x1, y1], |x, y| {
+            let (r, g, b, _) = img.get_pixel_color(x, y).get_rgba_f();
+            [r as f64, g as f64, b as f64]
+        });
 
         let params = {
             let c = self.stabilizer.color.read();

@@ -403,8 +403,8 @@ MenuItem {
                     opacity: enabled? (checked? 1 : 0.7) : 0.3;
                     checked: window.videoArea.wbPickArmed;
                     textColor: checked? styleAccentColor : styleTextColor;
-                    tooltip: checked? qsTr("Click a grey area of the video. Right-click, or click here again, to cancel")
-                                    : qsTr("Pick white balance from a grey area of the video");
+                    tooltip: checked? qsTr("Click a grey area of the video, or drag to average a region. Right-click, or click here again, to cancel")
+                                    : qsTr("Pick white balance from a grey area of the video (click, or drag to average a region)");
                     onClicked: window.videoArea.wbPickArmed = !window.videoArea.wbPickArmed;
                 }
             }

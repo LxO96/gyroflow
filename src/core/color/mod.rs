@@ -10,7 +10,7 @@ pub mod white_balance;
 
 pub use lut::{ Lut3D, LutError, parse_cube, sample_trilinear };
 pub use output_range::OutputRange;
-pub use picker::{ solve_white_balance, PickError };
+pub use picker::{ solve_white_balance, average_patch, PickError };
 pub use output_space::OutputColorSpace;
 pub use source_metadata::SourceExposure;
 pub use white_balance::kelvin_to_rgb_gains;
