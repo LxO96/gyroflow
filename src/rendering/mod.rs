@@ -1122,6 +1122,104 @@ unsafe fn show_help_children(mut class: *const ffi::AVClass, flags: c_int) {
     // }
 }
 
+/// What the pixel format warning in Export settings needs to know, decided before any render.
+///
+/// The check the renderer performs at `ffmpeg_video.rs` - "is the frame's format in the encoder's
+/// `pix_fmts`?" - needs nothing that only exists mid-render: the list is a static property of the
+/// encoder, read straight out of ffmpeg. Running it up front is what lets the answer be a warning
+/// beside the codec picker rather than a modal with twenty-one buttons after the export has
+/// already started and failed.
+///
+/// `source_format` is the raw ffmpeg name from the file (`stream.video[0].codec.format_name`),
+/// e.g. `"yuv422p10le"`. Fields in the returned object:
+///
+/// - `ok` - the export can run as configured. Everything below is then absent.
+/// - `encoder` - which encoder the codec/GPU choice actually resolves to, for the message.
+/// - `source` - the source format, echoed back so QML does not have to normalise it.
+/// - `suggestion` - the format to encode as instead, ready to put in `RenderOptions::pixel_format`.
+/// - `same_quality` - the suggestion keeps the source's bit depth *and* chroma subsampling, so
+///   accepting it costs nothing. False means it is still the best available, but it does lose
+///   something, and the message has to say so.
+/// - `cpu_only` - no format works on this encoder at all; the only way out is CPU encoding.
+///
+/// `ok` is also returned when the source format is unknown to ffmpeg or the encoder cannot be
+/// resolved. Neither is a reason to warn: there is nothing to suggest, and the runtime dialog is
+/// still there to catch it.
+/// The answer, as plain data. A struct rather than a JSON value so the decision can be tested
+/// without Qt in the picture; `render_queue.rs` does the conversion for QML.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PixelFormatCheck {
+    pub ok: bool,
+    pub encoder: String,
+    pub source: String,
+    pub suggestion: String,
+    pub same_quality: bool,
+    pub cpu_only: bool,
+}
+
+pub fn check_export_pixel_format(codec: &str, gpu: bool, source_format: &str) -> PixelFormatCheck {
+    use std::str::FromStr;
+    let ok = PixelFormatCheck { ok: true, ..Default::default() };
+
+    let Ok(source) = Pixel::from_str(&source_format.to_ascii_lowercase()) else {
+        ::log::debug!("check_export_pixel_format: unknown source format {source_format:?}");
+        return ok;
+    };
+
+    let encoder_name = get_default_encoder(codec, gpu);
+    let Some(enc) = ffmpeg_next::encoder::find_by_name(&encoder_name) else { return ok; };
+    let supported = unsafe {
+        if enc.as_ptr().is_null() { return ok; }
+        ffmpeg_hw::pix_formats_to_vec((*enc.as_ptr()).pix_fmts)
+    };
+    // An encoder that advertises nothing takes anything as far as this check is concerned - the
+    // renderer's own test is `!supported.contains(..)`, which is false for an empty list too.
+    if supported.is_empty() { return ok; }
+
+    // The advertised list is necessary but not sufficient: it comes from the ffmpeg build, while
+    // the refusal comes from the hardware. Both questions have to be asked, in that order - the
+    // list is free, the probe is not.
+    if supported.contains(&source) && ffmpeg_hw::encoder_accepts_format(&encoder_name, source) { return ok; }
+
+    // Rank, probe the winner, and on refusal drop it and rank again. Ranking the whole list
+    // through the probe instead would mean opening an encoder session per candidate - twenty-one
+    // of them for NVENC, at ~100 ms each, on the UI thread. In practice this settles in one or
+    // two rounds; the cap is there so a thoroughly broken encoder cannot spin.
+    let mut remaining = supported.clone();
+    let mut suggestion = None;
+    for _ in 0..4 {
+        let Some(candidate) = ffmpeg_hw::find_best_matching_codec(source, &remaining) else { break };
+        if ffmpeg_hw::encoder_accepts_format(&encoder_name, candidate) {
+            suggestion = Some(candidate);
+            break;
+        }
+        remaining.retain(|&f| f != candidate);
+    }
+    ::log::debug!("check_export_pixel_format: {encoder_name} cannot take {source:?}, suggesting {suggestion:?}");
+
+    PixelFormatCheck {
+        ok:           false,
+        encoder:      encoder_name,
+        source:       format!("{source:?}").to_ascii_lowercase(),
+        suggestion:   suggestion.map(|f| format!("{f:?}").to_ascii_lowercase()).unwrap_or_default(),
+        same_quality: suggestion.map(|f| same_visual_quality(source, f)).unwrap_or(false),
+        cpu_only:     suggestion.is_none(),
+    }
+}
+
+/// Whether swapping `from` for `to` keeps every bit the source carried: same component depth and
+/// same chroma subsampling. Layout differences (planar versus semi-planar) do not count - the
+/// pixels are identical, only the memory order differs.
+fn same_visual_quality(from: Pixel, to: Pixel) -> bool {
+    unsafe {
+        let (a, b) = (ffi::av_pix_fmt_desc_get(from.into()), ffi::av_pix_fmt_desc_get(to.into()));
+        if a.is_null() || b.is_null() { return false; }
+        (*a).comp[0].depth   == (*b).comp[0].depth &&
+        (*a).log2_chroma_w   == (*b).log2_chroma_w &&
+        (*a).log2_chroma_h   == (*b).log2_chroma_h
+    }
+}
+
 pub fn get_default_encoder(codec: &str, gpu: bool) -> String {
     let encoder = ffmpeg_hw::find_working_encoder(&get_possible_encoders(codec, gpu), None);
     encoder.0.to_string()
@@ -1231,6 +1329,140 @@ pub fn test_decode() {
     let _ = proc.start_decoder_only(vec![(0.0, 1000.0)], Arc::new(AtomicBool::new(false)));
     ::log::debug!("Done in {:.3} ms", _time.elapsed().as_micros() as f64 / 1000.0);
 }*/
+
+#[cfg(test)]
+mod pixel_format_check_tests {
+    use super::*;
+    use ffmpeg_hw::find_best_matching_codec;
+
+    /// What `hevc_nvenc` reports on the machine this was written against, verbatim from
+    /// `Codec formats:` in gyroflow.log. Hardcoded so the ranking tests below are the same
+    /// everywhere, including on a machine with no NVIDIA GPU at all.
+    const NVENC_HEVC: &[Pixel] = &[
+        Pixel::YUV420P, Pixel::NV12, Pixel::P010LE, Pixel::YUV444P, Pixel::P016LE, Pixel::NV16,
+        Pixel::P210LE, Pixel::P216LE, Pixel::YUV444P16LE, Pixel::BGRA, Pixel::RGBA,
+        Pixel::X2RGB10LE, Pixel::X2BGR10LE, Pixel::GBRP, Pixel::GBRP16LE, Pixel::CUDA, Pixel::D3D11,
+    ];
+
+    /// The case the warning exists for: Sony 4:2:2 10-bit into the GPU H.265 encoder. `P210LE` is
+    /// the same layout with interleaved chroma, so the substitution is free - which is exactly
+    /// what makes it worth offering up front instead of a twenty-one button dialog after failure.
+    #[test]
+    fn a_422_10bit_source_is_offered_the_free_substitution() {
+        let picked = find_best_matching_codec(Pixel::YUV422P10LE, NVENC_HEVC);
+        assert_eq!(picked, Some(Pixel::P210LE));
+        assert!(same_visual_quality(Pixel::YUV422P10LE, Pixel::P210LE), "P210LE should cost nothing");
+    }
+
+    #[test]
+    fn a_supported_format_is_returned_unchanged() {
+        for f in [Pixel::YUV420P, Pixel::P010LE, Pixel::NV12] {
+            assert_eq!(find_best_matching_codec(f, NVENC_HEVC), Some(f));
+        }
+    }
+
+    /// Depth outranks chroma. A 10-bit 4:2:2 source offered a choice between "same chroma, 8 bit"
+    /// and "same depth, 4:2:0" must take the depth: chroma softening is recoverable-looking on
+    /// real footage, two lost bits in a gradient are not.
+    #[test]
+    fn keeping_bit_depth_beats_keeping_chroma() {
+        let supported = [Pixel::YUV422P, Pixel::YUV420P10LE];
+        assert_eq!(find_best_matching_codec(Pixel::YUV422P10LE, &supported), Some(Pixel::YUV420P10LE));
+    }
+
+    /// ...and when depth cannot be kept exactly, round up rather than down.
+    #[test]
+    fn depth_rounds_up_when_it_cannot_be_matched() {
+        let supported = [Pixel::YUV420P, Pixel::YUV420P12LE];
+        assert_eq!(find_best_matching_codec(Pixel::YUV420P10LE, &supported), Some(Pixel::YUV420P12LE));
+    }
+
+    /// An encoder advertises its hardware surfaces and its RGB layouts alongside real formats.
+    /// Neither is a substitute for a YUV source: `CUDA` is not a pixel layout, and `BGRA` would
+    /// silently insert a colour conversion. With nothing else on offer the honest answer is none,
+    /// which is what drives the "CPU encoding" wording in the warning.
+    #[test]
+    fn hardware_and_rgb_formats_are_not_offered_for_a_yuv_source() {
+        for supported in [
+            vec![Pixel::CUDA, Pixel::D3D11],
+            vec![Pixel::BGRA, Pixel::RGBA, Pixel::X2RGB10LE],
+            vec![Pixel::CUDA, Pixel::BGRA],
+        ] {
+            assert_eq!(find_best_matching_codec(Pixel::YUV422P10LE, &supported), None, "{supported:?}");
+        }
+    }
+
+    #[test]
+    fn an_encoder_that_advertises_nothing_yields_nothing() {
+        assert_eq!(find_best_matching_codec(Pixel::YUV422P10LE, &[]), None);
+    }
+
+    /// `same_visual_quality` is what decides whether the message promises the swap is free, so it
+    /// has to be strict about both axes, and indifferent to memory layout.
+    #[test]
+    fn same_visual_quality_compares_depth_and_chroma_only() {
+        assert!(same_visual_quality(Pixel::YUV420P10LE, Pixel::P010LE));   // planar vs semi-planar
+        assert!(same_visual_quality(Pixel::YUV420P,     Pixel::NV12));
+        assert!(!same_visual_quality(Pixel::YUV422P10LE, Pixel::P010LE));  // 4:2:2 -> 4:2:0
+        assert!(!same_visual_quality(Pixel::YUV420P10LE, Pixel::YUV420P)); // 10 bit -> 8 bit
+    }
+
+    /// A format string ffmpeg does not recognise must not produce a warning: there is nothing to
+    /// suggest, and a scary message about a file we failed to parse is worse than silence.
+    #[test]
+    fn an_unrecognised_source_format_never_warns() {
+        for s in ["", "not_a_format", "yuv422p10le_typo"] {
+            assert!(check_export_pixel_format("H.265/HEVC", true, s).ok, "{s:?} produced a warning");
+        }
+    }
+
+    /// The probe has to be able to say yes as well as no, or the warning would decide every
+    /// encoder is useless and always recommend CPU. libx264 is present in every build here and
+    /// takes yuv420p; nothing takes a planar float layout, and it is not in x264's list either.
+    #[test]
+    fn the_probe_distinguishes_a_usable_format_from_an_impossible_one() {
+        if ffmpeg_next::encoder::find_by_name("libx264").is_none() { return; }
+        assert!( ffmpeg_hw::encoder_accepts_format("libx264", Pixel::YUV420P));
+        assert!(!ffmpeg_hw::encoder_accepts_format("libx264", Pixel::GBRPF32LE));
+    }
+
+    /// A name ffmpeg has never heard of must be a clean `false`, not a panic or a null deref -
+    /// `get_default_encoder` can return one when a codec has no encoder on this machine.
+    #[test]
+    fn probing_an_encoder_that_does_not_exist_is_false() {
+        assert!(!ffmpeg_hw::encoder_accepts_format("no_such_encoder", Pixel::YUV420P));
+        assert!(!ffmpeg_hw::encoder_accepts_format("", Pixel::YUV420P));
+    }
+
+    /// Machine-independent invariant, run against whatever encoders this machine really has: if
+    /// the check says no, the way out it offers must actually exist. Suggesting a format the
+    /// encoder cannot take would replace one failed export with another.
+    #[test]
+    fn any_suggestion_is_one_the_resolved_encoder_accepts() {
+        for codec in ["H.264/AVC", "H.265/HEVC", "AV1", "ProRes", "DNxHD", "PNG Sequence"] {
+            for gpu in [true, false] {
+                for source in ["yuv422p10le", "yuv420p", "yuv444p12le", "gbrpf32le"] {
+                    let c = check_export_pixel_format(codec, gpu, source);
+                    if c.ok { continue; }
+
+                    assert_eq!(c.suggestion.is_empty(), c.cpu_only, "{codec} gpu={gpu} {source}: cpu_only must mean no suggestion");
+                    if c.cpu_only { continue; }
+
+                    let enc = ffmpeg_next::encoder::find_by_name(&c.encoder).expect("resolved encoder must exist");
+                    let supported = unsafe { ffmpeg_hw::pix_formats_to_vec((*enc.as_ptr()).pix_fmts) };
+                    let suggested = supported.iter().find(|f| format!("{f:?}").to_ascii_lowercase() == c.suggestion);
+                    assert!(suggested.is_some(), "{codec} gpu={gpu} {source}: suggested {} which {} does not advertise", c.suggestion, c.encoder);
+
+                    // The stronger half, and the one that matters: advertised is not the same as
+                    // usable. This is what stops the warning offering P210LE on a card with no
+                    // 4:2:2 encode block.
+                    assert!(ffmpeg_hw::encoder_accepts_format(&c.encoder, *suggested.unwrap()),
+                        "{codec} gpu={gpu} {source}: suggested {} which {} advertises but will not open with", c.suggestion, c.encoder);
+                }
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod packed_color_format_tests {

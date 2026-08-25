@@ -246,6 +246,7 @@ pub struct RenderQueue {
     get_next_item_id: qt_method!(fn(&self, job_id: u32) -> u32),
     get_encoder_options: qt_method!(fn(&self, encoder: String) -> String),
     get_default_encoder: qt_method!(fn(&self, codec: String, gpu: bool) -> String),
+    check_export_pixel_format: qt_method!(fn(&self, codec: String, gpu: bool, source_format: String) -> QJsonObject),
     get_active_render_count: qt_method!(fn(&self) -> usize),
 
     apply_to_all: qt_method!(fn(&mut self, data: String, additional_data: String, to_job_id: u32)),
@@ -1685,6 +1686,17 @@ impl RenderQueue {
         false
     }
 
+    fn check_export_pixel_format(&self, codec: String, gpu: bool, source_format: String) -> QJsonObject {
+        let c = rendering::check_export_pixel_format(&codec, gpu, &source_format);
+        let mut ret = QJsonObject::default();
+        ret.insert("ok",           c.ok.into());
+        ret.insert("encoder",      QString::from(c.encoder).into());
+        ret.insert("source",       QString::from(c.source).into());
+        ret.insert("suggestion",   QString::from(c.suggestion).into());
+        ret.insert("same_quality", c.same_quality.into());
+        ret.insert("cpu_only",     c.cpu_only.into());
+        ret
+    }
     fn get_default_encoder(&self, codec: String, gpu: bool) -> String {
         rendering::get_default_encoder(&codec, gpu)
     }

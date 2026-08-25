@@ -116,6 +116,30 @@ MenuItem {
 
     property bool canExport: !resolutionWarning.visible && !resolutionWarning2.visible;
 
+    // Set only by the pixel format warning below. Empty means "encode in whatever the source
+    // is", which is what every export did before this existed and still the right default: a
+    // conversion is a cost, and one nobody has been shown a reason for is a cost for nothing.
+    property string pixelFormatOverride: "";
+
+    // What `render_queue.check_export_pixel_format` last said about the current codec, GPU
+    // setting and source. `{ ok: true }` until a video is loaded, so nothing warns on an empty
+    // window. See the Rust side for the fields.
+    property var pixelFormatCheck: ({ ok: true });
+
+    // Re-asked whenever any of its three inputs moves. Cheap - the encoder's format list is a
+    // static property read straight out of ffmpeg, with no render and no file access - so it is
+    // fine to call this from a binding-ish context rather than caching it.
+    function updatePixelFormatCheck(): void {
+        const source = window.vidInfo? window.vidInfo.pixelFormatRaw : "";
+        if (!source) { root.pixelFormatCheck = { ok: true }; return; }
+        root.pixelFormatCheck = render_queue.check_export_pixel_format(root.outCodec, root.outGpu, source);
+
+        // An override chosen for a different codec is worse than none: it would be passed
+        // through to an encoder that may not take it either. Drop it whenever the question
+        // changes, and let the user re-accept.
+        root.pixelFormatOverride = "";
+    }
+
     function getExportOptions(): var {
         let encoderOpts = encoderOptions.text.replace("-qscale:v", "-qscale")
                                              .replace("-q:v", "-qscale");
@@ -129,7 +153,7 @@ MenuItem {
             bitrate:        root.outBitrate,
             use_gpu:        root.outGpu,
             audio:          root.outAudio,
-            pixel_format:   "",
+            pixel_format:   root.pixelFormatOverride,
 
             // Advanced
             encoder_options:       encoderOpts,
@@ -277,6 +301,10 @@ MenuItem {
             encoderOptions.preventSave = true;
             encoderOptions.text = settings.value("encoderOptions-" + currentIndex, "");
             encoderOptions.preventSave = false;
+
+            // Runs on codec change and on video load, which is two of the three inputs; the
+            // third is the GPU checkbox, which calls it itself.
+            root.updatePixelFormatCheck();
         }
         onCurrentIndexChanged: {
             const format = exportFormats[currentIndex];
@@ -491,6 +519,7 @@ MenuItem {
         onCheckedChanged: {
             if (!preventSave)
                 settings.setValue("exportGpu-" + codec.currentIndex, checked? 1 : 0);
+            root.updatePixelFormatCheck();
         }
         property bool preventSave: false;
         property bool enabled2: true;
@@ -501,6 +530,45 @@ MenuItem {
                          :
                            qsTr("GPU acceleration is not available for the pixel format of this video.");
     }
+    // Says up front what the renderer would otherwise only discover after the export has started.
+    //
+    // This used to surface as a modal *during* the export - "GPU accelerated encoder doesn't
+    // support this pixel format" - offering one button per format the encoder accepts, twenty-one
+    // of them on an NVIDIA card, after the user had already waited. The encoder's format list is
+    // static, so the same question can be answered the moment the codec is chosen, and answered
+    // with the single right format instead of a wall of buttons.
+    //
+    // The runtime modal stays: it is the only thing that catches an encoder which advertises a
+    // format and then refuses it for a device-specific reason. This should simply mean it stops
+    // firing. For the same reason this warning does not gate `canExport` - it is advice, and the
+    // user may know something the format list does not.
+    InfoMessageSmall {
+        id: pixelFormatWarning;
+        show: !root.pixelFormatCheck.ok;
+        type: root.pixelFormatOverride? InfoMessage.Info : InfoMessage.Warning;
+        t.textFormat: Text.StyledText;
+        t.onLinkActivated: (link) => root.pixelFormatOverride = (link == "undo"? "" : link);
+        text: {
+            const c = root.pixelFormatCheck;
+            if (c.ok) return "";
+            // `outCodec` rather than `c.encoder`: "H.265/HEVC" is what the user picked, while
+            // "hevc_nvenc" is an implementation detail they never chose and cannot act on.
+            const what = qsTr("The %1 encoder for %2 can't write %3.")
+                            .arg(root.outGpu? qsTr("GPU") : qsTr("CPU"))
+                            .arg(root.outCodec)
+                            .arg("<b>" + c.source + "</b>");
+            if (root.pixelFormatOverride)
+                return what + " " + qsTr("Exporting as %1.").arg("<b>" + root.pixelFormatOverride + "</b>")
+                            + " <a href=\"undo\">" + qsTr("Undo") + "</a>";
+            if (c.cpu_only)
+                return what + " " + qsTr("No compatible format is available on it - uncheck \"Use GPU encoding\" to export on the CPU, which is much slower, or pick another codec.");
+            const link = "<a href=\"" + c.suggestion + "\">" + qsTr("Use %1").arg(c.suggestion) + "</a>";
+            return what + " " + (c.same_quality
+                ? qsTr("%1 instead - same bit depth and chroma, same speed, nothing lost.").arg(link)
+                : qsTr("%1 instead - same speed, but it is not a bit-exact copy of the source.").arg(link));
+        }
+    }
+
     CheckBox {
         id: audio;
         text: qsTr("Export audio");
