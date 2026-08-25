@@ -13,7 +13,7 @@
 > defaults and many assume limited range for 10-bit YUV, ignoring the range tag. Fix is a
 > tagging policy decision, not a colour-maths change — see §1 below.
 
-Handoff note, 2026-08-20; updated 2026-08-24. Branch `wgpu-identity-investigation`, 13 commits
+Handoff note, 2026-08-20; updated 2026-08-25. Branch `wgpu-identity-investigation`, 23 commits
 on top of `master`.
 `master` (`beb392a5`) already carries the merged colour work and is 50 commits ahead of
 `origin/master` — nothing here has been pushed.
@@ -247,9 +247,12 @@ consequence. Extending it with a case that hits the sentinel path and one with
 
 ## 3. Verification owed
 
-- **The GUI export path, end to end.** Today's fix `0b2f5a96` makes `get_cloned` carry the colour
-  grade. Unit tests prove the clone, but nothing has exercised the actual Export button — and that
-  is precisely the path that was broken. Load a clip, set a LUT, tick "apply to rendered video",
+- **The GUI export path, end to end, *with the grade baked*.** Today's fix `0b2f5a96` makes
+  `get_cloned` carry the colour grade. Unit tests prove the clone, but nothing has exercised the
+  actual Export button with baking on — and that is precisely the path that was broken. The Export
+  button itself was driven to completion on 2026-08-25 while verifying `f757855f` (4K HEVC, GPU,
+  144 frames, "Rendering completed"), but **"Apply to rendered video" was off**, so the one thing
+  that needs confirming was not confirmed. Load a clip, set a LUT, tick "apply to rendered video",
   export, confirm the output is graded.
 - **The preview LUT lifetime crash** (`df6c7c64`). Item 13 of the checklist in the design spec.
   Needs two clips loaded through the preview by hand, repeatedly, plus two different LUT sizes
@@ -280,10 +283,82 @@ None of these are caused by the colour work; all were reproduced with colour dis
 - **CPU-only rendering does not work.** `NO_OPENCL=1 NO_WGPU=1` fails with
   `No cached wgpu found for key: …` instead of falling back to the CPU pixel path. This means the
   CPU colour stage has never run through a real render, only unit tests.
-- **`YUV422P10LE` is not a supported render output format**, so a stock Sony Cinema Line clip
-  cannot be exported without overriding `pixel_format`.
+- **`YUV422P10LE` is not a supported render output format** on the GPU encoders, so a stock Sony
+  Cinema Line clip cannot be exported without overriding `pixel_format`. As of `f757855f` this is
+  *handled* rather than fixed: Export settings warns before you press the button and offers the
+  best format the encoder will actually take. The underlying limit is hardware - see §6.
 - **The CLI trips a debug-only null-pointer assertion.** `RenderQueue` is a QObject constructed at
   `cli.rs:222`, but `QCoreApplication` is not created until `cli.rs:645`. Release builds are fine.
+
+---
+
+## 6. Session of 2026-08-25 - what was built, and what it left open
+
+Five commits, all on `wgpu-identity-investigation`. Every one was verified in the running app,
+not only by tests; the evidence is in each commit message.
+
+| commit | what |
+|---|---|
+| `54a23819` | Toolbar toggles: stabilization and colour are now independent |
+| `e32a92c7` | Thin-line `pencil-outline.svg` for the colour toggle |
+| `6f1c17ca` | White balance eyedropper |
+| `f757855f` | Pixel-format warning before export, replacing the mid-export modal |
+| `0ce62e02` | Eyedropper drags a region; fixes non-idempotent picking |
+
+### Things worth knowing before touching any of it
+
+- **Turning stabilization off no longer skips the render pass.** It builds an *exact* identity
+  transform instead (`frame_transform.rs`, search `bypass`), because skipping the pass also
+  skipped the grade. `stab_enabled` and `preview_color_enabled` are preview-only and are forced
+  back on by `StabilizationManager::clear_preview_overrides`, called from `set_render_params` -
+  the single funnel every render job goes through. Anything that renders outside that funnel would
+  inherit the toggles and silently ship an unstabilized or ungraded file.
+
+- **The eyedropper works from the graded on-screen pixel**, which is possible only because white
+  balance sits above contrast, tone and saturation in `apply_color`, and those three preserve
+  neutrality both ways. The full argument is in the module docs of `core/color/picker.rs`. If the
+  stage *order* ever changes, `solving_then_grading_neutralises_the_patch` fails - that test is
+  the guard, and it is deliberately written against `apply_color` itself rather than a copy.
+
+- **`MIN_KELVIN` moved from 1667 K to 2000 K** and now clamps inside `cct_to_xy`. Below ~1902 K
+  the Planckian white point leaves sRGB, the blue gain hits its 1e-6 floor, and the frame renders
+  with no blue at all - the gain is 1e-6 at 1900 K and 13.8 at 1905 K. This was a live bug in the
+  bottom of the temperature slider, not just an obstacle to the picker's search.
+
+### Newly open
+
+- **The runtime `convert_format` modal still guesses.** `f757855f` added a real capability probe
+  (`ffmpeg_hw::encoder_accepts_format` - opens a throwaway 640x480 encoder, because an encoder's
+  advertised `pix_fmts` belongs to the ffmpeg build, not the GPU). The pre-flight warning uses it;
+  the modal does not. Its accented default still comes from bare `find_best_matching_codec`, so on
+  this machine it still proposes `p210le`, which Ampere cannot encode - 4:2:2 NVENC is
+  Blackwell-only. The modal should route through the probe too. It should now be rare enough that
+  this is low priority, but it is a known wrong default.
+
+- **A QML `Shortcut` with an `enabled` binding never fires here.** Verified twice, in two files:
+  `sequence: "Escape"; enabled: <bool>` does nothing, while the same shortcut without `enabled`
+  fires. Every working binding in `Shortcuts.qml` omits it. Cause unknown. This is why the
+  eyedropper cancels on right-click rather than Escape - an always-registered Escape would shadow
+  the one that closes a combo box or a tooltip, since shortcuts are matched before key events
+  reach items.
+
+- **Deferred by the user, twice now: transfer-function-aware exposure.** The exposure slider
+  assumes display-referred input and divides stops by `DISPLAY_GAMMA` (2.2). On ungraded log
+  footage a multiply is a gamma change, not an exposure change, whatever constant is used. The
+  metadata carries what is needed - `"Gamma equation": "S-Gamut3.Cine/S-Log3"` - and nothing reads
+  it. See the doc comment on `DISPLAY_GAMMA` in `core/color/mod.rs`.
+
+### Verification method, for repeating it
+
+The app was driven by synthetic mouse and keyboard input from PowerShell (`SetCursorPos` +
+`mouse_event`, `keybd_event`), with screenshots via `System.Drawing.CopyFromScreen` of the window
+rect, cropped and zoomed to read small UI. Two traps cost real time:
+
+- `CopyFromScreen` returns white for any part of the window off the desktop bounds. Move the
+  window to a known position and size first (`MoveWindow`) rather than trusting where it opens.
+- A modal left over from a previous run - "You have unfinished tasks in the render queue" appears
+  at startup whenever the queue is non-empty - silently swallows the first clicks. Screenshot and
+  confirm state after every click that matters, rather than assuming a click landed.
 
 ---
 
@@ -314,6 +389,10 @@ None of these are caused by the colour work; all were reproduced with colour dis
   as "the feature does not work on the preview path".
 - **In PowerShell, never pipe a running process through `Select-Object -First N`** — it terminates
   the pipeline and kills the process. This aborted two renders before it was recognised.
+- **An encoder's advertised `pix_fmts` is not what the hardware can do.** It comes from the ffmpeg
+  build. `hevc_nvenc` lists `P210LE` on any machine; whether the GPU has a 4:2:2 encode block is a
+  separate question, and the answer only appears inside `avcodec_open2`. Use
+  `ffmpeg_hw::encoder_accepts_format` (cached, ~100 ms uncached) when the answer matters.
 - The GPU backend is selected by `NO_OPENCL` / `NO_WGPU` (`core/gpu/mod.rs:375`).
 - Cross-backend tests need a GPU and deliberately fail rather than skip when none is present, so
   they are `#[ignore]`d: `cd src/core && cargo test cross_backend -- --ignored --nocapture`.
