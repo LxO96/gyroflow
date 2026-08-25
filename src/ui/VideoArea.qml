@@ -32,6 +32,11 @@ Item {
     property alias dropRect: dropRect;
     property bool isCalibrator: false;
 
+    // Armed state of the white balance eyedropper in Color adjustments. Lives here rather than in
+    // the panel because the click that matters lands on the video, and both sides need to see it:
+    // the panel to light its button, this file to put a crosshair on the picture.
+    property bool wbPickArmed: false;
+
     property var pendingGyroflowData: null;
     property int pendingQueueJobId: 0;
     property url loadedFileUrl;
@@ -802,7 +807,48 @@ Item {
                 GridGuide {
                     id: gridGuide;
                     anchors.fill: vid;
-                    canShow: vid.loaded;
+                    canShow: vid.loaded && !root.wbPickArmed;
+                }
+
+                // White balance picker. Armed from the eyedropper in Color adjustments; the next
+                // click on the picture samples a patch and disarms.
+                //
+                // Sampling `vid` rather than the source frame is deliberate and is what makes the
+                // whole feature cheap: `grabToImage` already exists here, and the solver in
+                // core/color/picker.rs is built to work from the *graded* pixel - see its module
+                // docs for why that is enough. The cost is that anything drawn over the video
+                // (the grid guide, feature points) would be sampled too, so the guide is hidden
+                // while armed rather than leaving a trap the user cannot see.
+                MouseArea {
+                    id: wbPicker;
+                    anchors.fill: vid;
+                    enabled: root.wbPickArmed && vid.loaded;
+                    visible: enabled;
+                    cursorShape: Qt.CrossCursor;
+                    hoverEnabled: true;
+                    // Right-click cancels. Escape would be the conventional key, but a QML
+                    // Shortcut only ever fired here with `enabled` removed - and an
+                    // always-registered Escape is one the whole app pays for, because shortcuts
+                    // are matched before key events reach items and it would shadow the Escape
+                    // that closes a combo box or a tooltip. Cancelling on a button this MouseArea
+                    // already receives, and only while it is armed, steals nothing.
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton;
+                    onClicked: mouse => {
+                        if (mouse.button === Qt.RightButton) { root.wbPickArmed = false; return; }
+                        // Normalised, because the grab is taken at the window's device pixel
+                        // ratio and is not the same size as this item.
+                        const nx = mouse.x / Math.max(1, width);
+                        const ny = mouse.y / Math.max(1, height);
+                        root.wbPickArmed = false;
+                        vid.grabToImage(function(result) {
+                            const r = controller.pick_white_balance(result.image, nx, ny);
+                            if (r.error) {
+                                window.showNotification(Modal.Warning, r.error);
+                            } else {
+                                window.colorAdjustments.applyPickedWhiteBalance(r.kelvin, r.tint);
+                            }
+                        });
+                    }
                 }
             }
             Item {

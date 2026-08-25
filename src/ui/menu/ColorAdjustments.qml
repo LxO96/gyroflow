@@ -24,6 +24,18 @@ MenuItem {
 
     function applyEnabled(): void { controller.set_color_enabled(root.colorEnabled, root.bakeInRender); }
 
+    // Called by VideoArea once the picker has solved a patch. Writes through `field.value`, the
+    // same path a drag takes, so the value is clamped, a keyframe is recorded if keyframing is on,
+    // and the change reaches the core through the sliders' own `onValueChanged`.
+    //
+    // `tintSlider` is in *display* units here (-100..100, `scaler: 100`) while the solver works in
+    // core units (-1..1), hence the multiply; `temperatureSlider` has no scaler and takes Kelvin
+    // as-is. Getting this backwards would put the tint slider 100x off and look like a solver bug.
+    function applyPickedWhiteBalance(kelvin: real, tint: real): void {
+        temperatureSlider.field.value = kelvin;
+        tintSlider.field.value = tint * 100.0;
+    }
+
     // What the two metadata-anchored sliders are offset *from*. Exposure is already relative -
     // the grade is a gain, so +0.5 EV means half a stop brighter than this clip was, whatever
     // it was - and temperature is relative because the core keeps the offset when a new clip's
@@ -340,16 +352,17 @@ MenuItem {
     Label {
         text: qsTr("Temperature");
         tooltip: qsTr("Absolute target white point. The correction applied is the difference between this and the source white balance.");
-        // The full MIN_KELVIN..MAX_KELVIN range from core/color/mod.rs, not a narrower
-        // "usable" range: a Slider clamps its value to [from, to], so a project legitimately
-        // carrying 1800 K would be silently rewritten to the slider's floor on load.
+        // The full MIN_KELVIN..MAX_KELVIN range from core/color/mod.rs. The floor is 2000 K
+        // rather than the 1667 K the Planckian fit is defined over because sRGB cannot represent
+        // the locus below ~1902 K; the core clamps there too, so a project carrying 1800 K is
+        // corrected identically whichever way it arrives.
         Column {
             width: parent.width;
             spacing: 3 * dpiScale;
             SliderWithField {
                 id: temperatureSlider;
                 width: parent.width;
-                from: 1667; to: 25000;         // MIN_KELVIN .. MAX_KELVIN
+                from: 2000; to: 25000;         // MIN_KELVIN .. MAX_KELVIN
                 value: 5500; defaultValue: 5500;
                 // Kelvin is a reciprocal-ish scale: 2000->3000 K is a large visible shift while
                 // 20000->21000 K is invisible. On a linear track the entire range people actually
@@ -364,10 +377,36 @@ MenuItem {
                 keyframe: "ColorTemperature";
                 onValueChanged: controller.set_color_param("target_kelvin", value);
             }
-            SliderSteppers {
-                target: temperatureSlider;
-                step: 100;
-                note: root.kelvinNote;
+            // The steppers keep centring themselves on the track, so the space to the right -
+            // under the number field - is free for the picker. An Item rather than a Row because
+            // the two want different alignments: centred and right-anchored.
+            Item {
+                width: parent.width;
+                height: 20 * dpiScale;
+                SliderSteppers {
+                    target: temperatureSlider;
+                    step: 100;
+                    note: root.kelvinNote;
+                }
+                LinkButton {
+                    id: pickWbBtn;
+                    anchors.right: parent.right;
+                    anchors.verticalCenter: parent.verticalCenter;
+                    height: parent.height;
+                    iconName: "eyedropper";
+                    leftPadding: 4 * dpiScale; rightPadding: 4 * dpiScale;
+                    topPadding: 0; bottomPadding: 0;
+                    // Picking is meaningless while the section is off - the solved values would
+                    // be written to sliders nothing reads - so gate on it rather than letting the
+                    // click quietly do nothing.
+                    enabled: root.colorEnabled;
+                    opacity: enabled? (checked? 1 : 0.7) : 0.3;
+                    checked: window.videoArea.wbPickArmed;
+                    textColor: checked? styleAccentColor : styleTextColor;
+                    tooltip: checked? qsTr("Click a grey area of the video. Right-click, or click here again, to cancel")
+                                    : qsTr("Pick white balance from a grey area of the video");
+                    onClicked: window.videoArea.wbPickArmed = !window.videoArea.wbPickArmed;
+                }
             }
         }
     }

@@ -3,12 +3,14 @@
 
 pub mod lut;
 pub mod output_range;
+pub mod picker;
 pub mod output_space;
 pub mod source_metadata;
 pub mod white_balance;
 
 pub use lut::{ Lut3D, LutError, parse_cube, sample_trilinear };
 pub use output_range::OutputRange;
+pub use picker::{ solve_white_balance, PickError };
 pub use output_space::OutputColorSpace;
 pub use source_metadata::SourceExposure;
 pub use white_balance::kelvin_to_rgb_gains;
@@ -16,8 +18,16 @@ pub use white_balance::kelvin_to_rgb_gains;
 use std::sync::Arc;
 
 pub const DEFAULT_KELVIN: f64 = 5500.0;
-/// The range over which `white_balance::cct_to_xy` is defined.
-pub const MIN_KELVIN: f64 = 1667.0;
+/// The range over which the white balance model is usable.
+///
+/// The top is where `white_balance::cct_to_xy` stops being defined. The bottom is *not* that
+/// function's lower limit of 1667 K, but the point below which sRGB cannot represent the
+/// Planckian locus at all: the white point's blue component goes negative around 1902 K, and
+/// `kelvin_to_rgb_gains` then clamps it to a floor. The result is a discontinuity you can see -
+/// the blue gain is 1e-6 at 1900 K and 13.8 at 1905 K - so every temperature below the crossing
+/// rendered a broken, blue-less frame. 2000 K is the nearest round number safely above it.
+/// `white_point_stays_in_gamut_across_the_slider_range` is the guard.
+pub const MIN_KELVIN: f64 = 2000.0;
 pub const MAX_KELVIN: f64 = 25000.0;
 
 /// Exposure bounds, in stops. Shared by `set_param` and `to_kernel_params` so the static

@@ -2686,7 +2686,7 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_eq!(c.exposure,      5.0);
         assert_eq!(c.contrast,     -1.0);
         assert_eq!(c.saturation,    1.0);
-        assert_eq!(c.source_kelvin, 1667.0);
+        assert_eq!(c.source_kelvin, color::MIN_KELVIN);
         assert_eq!(c.target_kelvin, 25000.0);
         assert_eq!(c.tint,         -1.0);
         assert_eq!(c.lut_strength,  1.0);
