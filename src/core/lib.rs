@@ -954,6 +954,19 @@ impl StabilizationManager {
     pub fn set_show_detected_features(&self, v: bool) { self.params.write().show_detected_features = v; }
     pub fn set_show_optical_flow     (&self, v: bool) { self.params.write().show_optical_flow      = v; }
     pub fn set_stab_enabled          (&self, v: bool) { self.params.write().stab_enabled           = v; }
+    pub fn set_preview_color_enabled (&self, v: bool) { self.params.write().preview_color_enabled  = v; }
+
+    /// Force both toolbar toggles back on.
+    ///
+    /// They are preview-only affordances, but `get_cloned` copies `params` wholesale, so a
+    /// manager cloned for an export inherits whatever the user last left them at - and a render
+    /// silently missing the stabilization or the grade is a much worse bug than a preview that
+    /// does not match. Every render entry point calls this on its clone first.
+    pub fn clear_preview_overrides(&self) {
+        let mut params = self.params.write();
+        params.stab_enabled = true;
+        params.preview_color_enabled = true;
+    }
     pub fn set_frame_readout_time    (&self, v: f64)  { self.params.write().frame_readout_time     = v; }
     pub fn set_frame_readout_direction(&self, v: impl Into<ReadoutDirection>) { self.params.write().frame_readout_direction = v.into(); }
     pub fn set_adaptive_zoom         (&self, v: f64)  { self.params.write().adaptive_zoom_window   = v; self.invalidate_zooming(); }
@@ -1195,6 +1208,7 @@ impl StabilizationManager {
         self.params.write().framebuffer_inverted = false;
         self.params.write().fov_overview = false;
         self.params.write().show_safe_area = false;
+        self.clear_preview_overrides();
         self.stabilization.write().kernel_flags.set(KernelParamsFlags::DRAWING_ENABLED, false);
         self.set_size(size.0, size.1);
         self.set_output_size(output_size.0, output_size.1);
@@ -2733,5 +2747,28 @@ DOMAIN_MAX 1.0 1.0 1.0
         mgr.color.write().exposure = -3.0;
 
         assert_eq!(cloned.color.read().exposure, 0.75, "clone followed a later edit to the original");
+    }
+
+    /// The two toolbar toggles under the video are preview-only, but `get_cloned` copies `params`
+    /// wholesale, so the clone the Export button renders with inherits whatever the user last
+    /// left them at. `set_render_params` is the single funnel every job goes through
+    /// (`RenderQueue::add_internal`), alongside the other preview-only resets already there.
+    #[test]
+    fn render_params_clear_the_preview_toggles() {
+        let mgr = StabilizationManager::default();
+        mgr.set_stab_enabled(false);
+        mgr.set_preview_color_enabled(false);
+
+        let cloned = mgr.get_cloned();
+        assert!(!cloned.params.read().stab_enabled,          "precondition: the clone inherits the toggles");
+        assert!(!cloned.params.read().preview_color_enabled, "precondition: the clone inherits the toggles");
+
+        cloned.set_render_params((1920, 1080), (1920, 1080));
+        assert!(cloned.params.read().stab_enabled,          "the export would have rendered unstabilized");
+        assert!(cloned.params.read().preview_color_enabled, "the export would have rendered ungraded");
+
+        // ...and the preview it was cloned from still shows what the user asked it to.
+        assert!(!mgr.params.read().stab_enabled);
+        assert!(!mgr.params.read().preview_color_enabled);
     }
 }

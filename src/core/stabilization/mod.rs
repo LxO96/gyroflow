@@ -245,7 +245,7 @@ impl Stabilization {
 
     pub fn get_kernel_flags(&self, frame: usize, buffers: &Buffers) -> KernelParamsFlags {
         let mut kernel_flags = self.kernel_flags.clone();
-        kernel_flags.set(KernelParamsFlags::HAS_DIGITAL_LENS, self.compute_params.digital_lens.is_some());
+        kernel_flags.set(KernelParamsFlags::HAS_DIGITAL_LENS, self.compute_params.digital_lens.is_some() && !self.compute_params.bypass_stabilization);
         kernel_flags.set(KernelParamsFlags::HORIZONTAL_RS, self.compute_params.frame_readout_direction.is_horizontal());
         kernel_flags.set(KernelParamsFlags::HAS_SOURCE_RECT, buffers.input.rect.is_some() || self.size.0 != buffers.input.size.0 || self.size.1 != buffers.input.size.1);
         kernel_flags.set(KernelParamsFlags::HAS_OUTPUT_RECT, buffers.output.rect.is_some() || self.output_size.0 != buffers.output.size.0 || self.output_size.1 != buffers.output.size.1);
@@ -263,11 +263,14 @@ impl Stabilization {
         // only when a LUT is present); `at_timestamp` keeps setting them for its direct callers,
         // which have no `Stabilization` to ask, and the two paths agree by construction.
         let color = &self.compute_params.color;
-        let color_active = color.enabled && (color.is_active() || self.compute_params.keyframes.is_any_color_keyframed());
+        let color_active = !self.compute_params.bypass_color && color.enabled && (color.is_active() || self.compute_params.keyframes.is_any_color_keyframed());
         kernel_flags.set(KernelParamsFlags::COLOR_ENABLED, color_active);
         kernel_flags.set(KernelParamsFlags::HAS_LUT, color_active && self.compute_params.color.lut.is_some());
 
-        {
+        // Bypassed geometry sends no mesh, no per-frame distortion and no IBIS data, so the
+        // matching flags must go too: they are specialization constants, and a pipeline compiled
+        // to read a mesh buffer that `at_timestamp` now leaves empty would read past its end.
+        if !self.compute_params.bypass_stabilization {
             let gyro = self.compute_params.gyro.read();
             let file_metadata = gyro.file_metadata.read();
             if let Some(mc) = file_metadata.mesh_correction.get(frame) {

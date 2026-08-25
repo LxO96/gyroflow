@@ -1084,6 +1084,20 @@ Item {
                     tooltip: qsTr("Toggle stabilization");
                 }
 
+                // A/B the grade on its own. Deliberately beside the stabilization toggle and
+                // deliberately separate from it: turning stabilization off used to skip the whole
+                // render pass, taking the colour with it, so there was no way to see one without
+                // the other.
+                //
+                // Both are preview-only. `set_render_params` forces them back on for every job,
+                // so a toggle left off here can never silently ship a wrong-looking export.
+                SmallLinkButton {
+                    id: colorEnabledBtn;
+                    iconName: "pencil";
+                    onCheckedChanged: { controller.preview_color_enabled = checked; vid.forceRedraw(); }
+                    tooltip: qsTr("Toggle color adjustments");
+                }
+
                 SmallLinkButton {
                     id: muteBtn;
                     iconName: checked? "sound" : "sound-mute";

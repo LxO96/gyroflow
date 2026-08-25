@@ -134,6 +134,7 @@ pub struct Controller {
     request_recompute: qt_signal!(),
 
     stab_enabled: qt_property!(bool; WRITE set_stab_enabled),
+    preview_color_enabled: qt_property!(bool; WRITE set_preview_color_enabled),
     show_detected_features: qt_property!(bool; WRITE set_show_detected_features),
     show_optical_flow: qt_property!(bool; WRITE set_show_optical_flow),
     fov: qt_property!(f64; WRITE set_fov),
@@ -1036,8 +1037,6 @@ impl Controller {
             vid.onProcessTexture(Box::new(move |frame, timestamp_ms, width, height, backend_id, ptr1, ptr2, ptr3, ptr4, ptr5| -> bool {
                 if width < 4 || height < 4 || backend_id == 0 { return false; }
 
-                if !stab.params.read().stab_enabled { return true; }
-
                 let _time = std::time::Instant::now();
 
                 if preview_pipeline.load(SeqCst) == 0 {
@@ -1169,7 +1168,6 @@ impl Controller {
 
                 // TODO: cache in atomics instead of locking the mutex every time
                 let params = stab.params.read();
-                if !params.stab_enabled { return (0, 0, 0, std::ptr::null_mut()); }
                 let (ow, oh) = params.output_size;
                 let os = ow * 4; // Assume RGBA8 - 4 bytes per pixel
                 drop(params);
@@ -1599,7 +1597,8 @@ impl Controller {
 
     wrap_simple_method!(override_video_fps,         v: f64, r: bool; recompute; update_offset_model);
     wrap_simple_method!(set_video_rotation,         v: f64; recompute; zooming_data_changed);
-    wrap_simple_method!(set_stab_enabled,           v: bool);
+    wrap_simple_method!(set_stab_enabled,           v: bool; recompute);
+    wrap_simple_method!(set_preview_color_enabled,  v: bool; recompute);
     wrap_simple_method!(set_show_detected_features, v: bool);
     wrap_simple_method!(set_show_optical_flow,      v: bool);
     wrap_simple_method!(set_digital_lens_name,      v: String; recompute);

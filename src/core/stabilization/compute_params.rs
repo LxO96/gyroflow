@@ -51,6 +51,13 @@ pub struct ComputeParams {
     pub additional_translation: (f64, f64, f64),
     pub framebuffer_inverted: bool,
     pub suppress_rotation: bool,
+
+    /// The two toolbar toggles under the video, as *bypasses* rather than enables: this struct
+    /// derives `Default`, and two `ComputeParams::default()` callers rely on a zeroed value
+    /// meaning "behave normally". They are preview affordances only - see
+    /// [`crate::StabilizationParams::stab_enabled`] and `clear_preview_overrides`.
+    pub bypass_stabilization: bool,
+    pub bypass_color: bool,
     pub fov_algorithm_margin: f32,
     pub smoothing_fov_limit_per_frame: Vec<f64>,
     pub max_zoom: Option<f64>,
@@ -107,6 +114,8 @@ impl ComputeParams {
             lens_correction_amount: params.lens_correction_amount,
             light_refraction_coefficient: params.light_refraction_coefficient,
             framebuffer_inverted: params.framebuffer_inverted,
+            bypass_stabilization: !params.stab_enabled,
+            bypass_color:         !params.preview_color_enabled,
             frame_readout_time: params.frame_readout_time,
             frame_readout_direction: params.frame_readout_direction,
             trim_ranges: params.trim_ranges.clone(),
@@ -182,6 +191,8 @@ impl std::fmt::Debug for ComputeParams {
          .field("output_width",         &self.output_width)
          .field("output_height",        &self.output_height)
          .field("video_rotation",       &self.video_rotation)
+         .field("bypass_stabilization", &self.bypass_stabilization)
+         .field("bypass_color",         &self.bypass_color)
          .field("lens_correction_amount",    &self.lens_correction_amount)
          .field("light_refraction_coefficient", &self.light_refraction_coefficient)
          .field("background_mode",           &self.background_mode)
