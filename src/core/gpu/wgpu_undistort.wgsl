@@ -45,8 +45,8 @@ struct KernelParams {
     pixel_value_limit:        f32, // 16
     light_refraction_coefficient: f32, // 4
     plane_index:              i32, // 8
-    reserved1:                f32, // 12
-    reserved2:                f32, // 16
+    reference_count:          f32, // 12
+    denoise_sigma:            f32, // 16
     ewa_coeffs_p:             vec4<f32>, // 16
     ewa_coeffs_q:             vec4<f32>, // 16
     color_params_1:           vec4<f32>, // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength

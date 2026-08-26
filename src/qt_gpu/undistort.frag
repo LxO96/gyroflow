@@ -50,8 +50,8 @@ layout(std140, binding = 2) uniform KernelParams {
     float pixel_value_limit;        // 16
     float light_refraction_coefficient; // 4
     int plane_index;                // 8
-    float reserved1;                // 12
-    float reserved2;                // 16
+    float reference_count;          // 12
+    float denoise_sigma;             // 16
     vec4 ewa_coefs_p;               // 16
     vec4 ewa_coefs_q;               // 16
     vec4 color_params_1;            // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength

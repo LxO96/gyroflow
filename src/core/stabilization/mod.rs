@@ -158,8 +158,15 @@ pub struct KernelParams {
     pub pixel_value_limit:        f32, // 16
     pub light_refraction_coefficient: f32, // 4
     pub plane_index:              i32, // 8
-    pub reserved1:                f32, // 12
-    pub reserved2:                f32, // 16
+    /// Total source frames gathered per output pixel: `2k+1`. `1` disables the
+    /// temporal path entirely — every kernel branches on this before doing any
+    /// extra work, so `k = 0` costs nothing.
+    /// Stored as f32 to keep this slot byte-identical to the `reserved1` it
+    /// replaces; the kernels round it back to an integer count.
+    pub reference_count:          f32, // 12
+    /// Sigma of the rejection Gaussian, in normalised pixel units, for the plane
+    /// currently being processed. Selected per plane by `plane_index`.
+    pub denoise_sigma:            f32, // 16
     pub ewa_coeffs_p:             [f32; 4], // 16
     pub ewa_coeffs_q:             [f32; 4], // 16
     pub color_params_1:           [f32; 4], // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
@@ -168,6 +175,22 @@ pub struct KernelParams {
 }
 unsafe impl bytemuck::Zeroable for KernelParams {}
 unsafe impl bytemuck::Pod for KernelParams {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_params_layout_is_unchanged() {
+        // Mirrored byte-for-byte in opencl_undistort.cl, wgpu_undistort.wgsl,
+        // qt_gpu/undistort.frag and stabilize_spirv/src/types.rs. If this size
+        // changes, all four must change with it.
+        assert_eq!(std::mem::size_of::<KernelParams>() % 16, 0, "struct must stay 16-byte aligned");
+        assert_eq!(std::mem::align_of::<KernelParams>(), 4);
+        // Pinned so a new field cannot be added to one copy and not the other four.
+        assert_eq!(std::mem::size_of::<KernelParams>(), 416);
+    }
+}
 
 #[derive(Default, Debug)]
 pub enum BackendType {
