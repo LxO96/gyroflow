@@ -1192,7 +1192,10 @@ Item {
                 SmallLinkButton {
                     id: muteBtn;
                     iconName: checked? "sound" : "sound-mute";
-                    tooltip: checked? qsTr("Mute") : qsTr("Unmute");
+                    // Suppressed while the volume popup is open: the tooltip is anchored to this
+                    // button and lands on top of the slider, which is unreadable and, worse,
+                    // looks like part of it.
+                    tooltip: volumePopup.opened? "" : (checked? qsTr("Mute") : qsTr("Unmute"));
                     checked: !vid.muted;
 
                     ContextMenuMouseArea {
@@ -1201,27 +1204,100 @@ Item {
                         onContextMenu: (isHold, x, y) => { volumePopup.open(); if (isHold) vid.muted = !vid.muted; }
                     }
                     onClicked: () => { vid.muted = !vid.muted; }
+
+                    // Hovering the speaker reveals the volume slider; clicking still mutes.
+                    //
+                    // The popup and its slider are unchanged - they have been here all along, but
+                    // only reachable by right-clicking the icon (or long-pressing it on touch,
+                    // which is still the only route where there is no hover), so in practice
+                    // nobody found them.
+                    //
+                    // Two delays, and both earn their place. Opening waits, because this button
+                    // sits between the colour toggle and the playback-rate box: without a delay
+                    // the popup flashes every time the cursor crosses it on the way somewhere
+                    // else. Closing waits, because the cursor has to leave the button to reach
+                    // the slider - close on the first hover-out and the slider is unreachable.
+                    onHoveredChanged: {
+                        if (hovered) { volumeCloseTimer.stop(); volumeOpenTimer.restart(); }
+                        else         { volumeOpenTimer.stop();  volumeCloseTimer.restart(); }
+                    }
+                    Timer {
+                        id: volumeOpenTimer;
+                        interval: 250;
+                        onTriggered: if (muteBtn.hovered) volumePopup.open();
+                    }
+                    Timer {
+                        id: volumeCloseTimer;
+                        interval: 400;
+                        // `pressed` keeps it open through a drag that wanders outside the popup,
+                        // which is easy to do when the handle is already at one end of the track.
+                        onTriggered: if (!muteBtn.hovered && !volumeHover.hovered && !volumeSlider.pressed) volumePopup.close();
+                    }
+
+                    // Scroll over the speaker to set the level without aiming at anything. The
+                    // popup comes up with it so the change is visible rather than silent.
+                    WheelHandler {
+                        onWheel: event => {
+                            volumeSlider.value = Math.max(0, Math.min(100, volumeSlider.value + (event.angleDelta.y > 0? 5 : -5)));
+                            volumePopup.open();
+                            volumeCloseTimer.restart();
+                        }
+                    }
+
+                    // Declarative rather than assigning `vid.volume` from the slider's
+                    // `onValueChanged`: a stored level that happens to equal the Slider's own
+                    // initial value fires no change signal, so a saved volume of 0 was silently
+                    // never applied and audio came back at full level on the next launch.
+                    Binding { target: vid; property: "volume"; value: volumeSlider.value / 100.0; }
+
                     Popup {
                         id: volumePopup;
-                        width: volumeLabel.width + 25 * dpiScale;
+                        width: volumeRow.width + 20 * dpiScale;
                         height: 30 * dpiScale;
                         x: -width + muteBtn.width;
                         y: -height;
-                        Label {
-                            id: volumeLabel;
+
+                        Row {
+                            id: volumeRow;
                             anchors.centerIn: parent;
-                            text: qsTr("Volume");
-                            position: Label.LeftPosition;
-                            width: t.width + volumeSlider.width;
+                            spacing: 8 * dpiScale;
+
+                            // Keeps the popup alive while the cursor is inside it, which is the
+                            // other half of the close rule above. On the Row rather than on the
+                            // Popup because this component's `contentItem` is a ListView (it was
+                            // written for combo boxes), so a handler declared on the Popup lands
+                            // somewhere less predictable than the item actually under the cursor.
+                            HoverHandler {
+                                id: volumeHover;
+                                margin: 10 * dpiScale;   // cover the popup's padding too
+                                onHoveredChanged: {
+                                    if (hovered) volumeCloseTimer.stop();
+                                    else         volumeCloseTimer.restart();
+                                }
+                            }
+                            BasicText {
+                                text: qsTr("Volume");
+                                anchors.verticalCenter: parent.verticalCenter;
+                            }
                             Slider {
                                 id: volumeSlider;
-                                width: 200 * dpiScale;
+                                width: 150 * dpiScale;
+                                anchors.verticalCenter: parent.verticalCenter;
                                 unit: "%";
                                 from: 0;
                                 to: 100;
                                 value: settings.value("volume", 100);
                                 precision: 0;
-                                onValueChanged: { vid.volume = value / 100.0; settings.setValue("volume", value); }
+                                onValueChanged: settings.setValue("volume", value);
+                            }
+                            BasicText {
+                                // Fixed width, so the row does not shuffle sideways as the number
+                                // goes from "5 %" to "100 %" while you drag.
+                                width: 36 * dpiScale;
+                                horizontalAlignment: Text.AlignRight;
+                                anchors.verticalCenter: parent.verticalCenter;
+                                text: Math.round(volumeSlider.value) + " %";
+                                opacity: 0.7;
                             }
                         }
                     }
