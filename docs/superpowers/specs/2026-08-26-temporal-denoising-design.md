@@ -91,7 +91,7 @@ Mirrors `ColorAdjustments`, which is recent and proven.
 
 - New `src/core/denoise/mod.rs` holding `DenoiseSettings { enabled, quality, luma_strength, chroma_strength }`, hung off `Stabilizer` as `Arc<RwLock<_>>` following `lib.rs:87`. `quality` alone determines `k`; there is no independent radius field, so the two cannot disagree. `luma_strength` and `chroma_strength` are the `σ` of the combination rule, selected by `plane_index`.
 - A `set_param` entry for QML, with ranges clamped core-side per `lib.rs:1798`.
-- **Included in `get_checksum`.** The colour code documents the trap: fields that never touch preview pixels (`output_color_space`, `output_range`) are deliberately excluded, and everything that does change them must be in. Omitting denoise would leave a stale preview after every slider move.
+- **Invalidation.** The live path is `request_recompute()`, which `Controller::set_color_param` calls after every accepted value (`controller.rs:1257`); the denoise setter must do the same or the preview will not refresh. `DenoiseSettings` also gets a `get_checksum` mirroring `ColorAdjustments::get_checksum` (`color/mod.rs:256`) — currently exercised only by tests asserting that each pixel-affecting field changes the hash, which is a useful guard against a field being added and silently forgotten.
 - Serialised as a `"denoise"` sibling of `"color"` at `lib.rs:1401` and `:1792`, with the same preset-merge semantics.
 - New `src/ui/menu/Denoise.qml` plus a `qmldir` entry, modelled on `ColorAdjustments.qml`.
 - Flags in `src/cli.rs`, since CLI renders bypass the UI.
