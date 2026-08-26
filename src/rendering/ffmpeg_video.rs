@@ -484,18 +484,6 @@ impl<'a> VideoTranscoder<'a> {
         //     self.receive_and_process_encoded_packets(octx, ost_time_base)?;
         // }
 
-        // Emit any frames a delayed processor is still holding. Only on a clean
-        // finish: if the user cancelled or an error broke the loop, the tail
-        // frames belong to a render that is not happening.
-        if status == Status::Finish {
-            if let Some(mut cb) = self.on_finish_callback.take() {
-                let mut rate_control = RateControl::default();
-                let result = cb(&mut self.converter, &mut rate_control);
-                self.on_finish_callback = Some(cb);
-                result?;
-            }
-        }
-
         Ok(status)
     }
 

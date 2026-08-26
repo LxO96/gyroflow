@@ -501,6 +501,21 @@ impl<'a> FfmpegProcessor<'a> {
             self.video.decoder.as_mut().ok_or(Error::DecoderNotFound)?.send_eof()?;
             // self.video.decoder.as_mut().ok_or(Error::DecoderNotFound)?.flush();
             self.video.receive_and_process_video_frames(output_size, bitrate, Some(&mut octx), &mut self.ost_time_bases, start_ms, end_ms, &mut self.frame_ts)?;
+
+            // Decoding is genuinely finished here (the decoder has just been drained after
+            // its own EOF) and the encoder is still alive and accepting frames. Emit any
+            // frames a delayed processor (eg. temporal denoising, which holds back `k`
+            // frames) is still holding, but only if the user did not cancel the render --
+            // tail frames from a cancelled render belong to an export that is not happening.
+            if !cancel_flag.load(Relaxed) {
+                if let Some(mut cb) = self.video.on_finish_callback.take() {
+                    let mut rate_control = ffmpeg_video::RateControl::default();
+                    let result = cb(&mut self.video.converter, &mut rate_control);
+                    self.video.on_finish_callback = Some(cb);
+                    result?;
+                }
+            }
+
             self.video.encoder.as_mut().ok_or(Error::EncoderNotFound)?.send_eof()?;
             if let Err(e) = self.video.receive_and_process_encoded_packets(&mut octx, ost_time_base) {
                 log::error!("Failed to flush last packet: {e:?}");
