@@ -68,6 +68,10 @@ pub struct VideoTranscoder<'a> {
     pub buffers: FrameBuffers,
 
     pub on_frame_callback: Option<Box<dyn FnMut(i64, &mut frame::Video, Option<&mut frame::Video>, &mut Converter, &mut RateControl) -> Result<(), FFmpegError> + 'a>>,
+    /// Called once after the decode loop ends, so a processor holding frames back
+    /// (temporal denoising delays output by `k`) can emit its tail. Without this,
+    /// those frames are silently dropped and the output is `k` frames short.
+    pub on_finish_callback: Option<Box<dyn FnMut(&mut Converter, &mut RateControl) -> Result<(), FFmpegError> + 'a>>,
     pub on_encoder_initialized: Option<Box<dyn FnMut(&encoder::video::Video) -> Result<(), FFmpegError> + 'a>>,
 
     pub processing_order: ProcessingOrder,
@@ -479,6 +483,18 @@ impl<'a> VideoTranscoder<'a> {
         //     let octx = octx.unwrap();
         //     self.receive_and_process_encoded_packets(octx, ost_time_base)?;
         // }
+
+        // Emit any frames a delayed processor is still holding. Only on a clean
+        // finish: if the user cancelled or an error broke the loop, the tail
+        // frames belong to a render that is not happening.
+        if status == Status::Finish {
+            if let Some(mut cb) = self.on_finish_callback.take() {
+                let mut rate_control = RateControl::default();
+                let result = cb(&mut self.converter, &mut rate_control);
+                self.on_finish_callback = Some(cb);
+                result?;
+            }
+        }
 
         Ok(status)
     }

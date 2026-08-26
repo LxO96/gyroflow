@@ -602,6 +602,9 @@ impl<'a> FfmpegProcessor<'a> {
     pub fn on_frame<F>(&mut self, cb: F) where F: FnMut(i64, &mut frame::Video, Option<&mut frame::Video>, &mut ffmpeg_video_converter::Converter, &mut ffmpeg_video::RateControl) -> Result<(), FFmpegError> + 'a {
         self.video.on_frame_callback = Some(Box::new(cb));
     }
+    pub fn on_finish<F>(&mut self, cb: F) where F: FnMut(&mut ffmpeg_video_converter::Converter, &mut ffmpeg_video::RateControl) -> Result<(), FFmpegError> + 'a {
+        self.video.on_finish_callback = Some(Box::new(cb));
+    }
     pub fn on_encoder_initialized<F>(&mut self, cb: F) where F: FnMut(&encoder::video::Video) -> Result<(), FFmpegError> + 'a {
         self.video.on_encoder_initialized = Some(Box::new(cb));
     }
