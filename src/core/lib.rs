@@ -1329,6 +1329,16 @@ impl StabilizationManager {
             })
         };
 
+        let denoise = {
+            let d = self.denoise.read();
+            serde_json::json!({
+                "enabled":         d.enabled,
+                "quality":         d.quality.id(),
+                "luma_strength":   d.luma_strength,
+                "chroma_strength": d.chroma_strength,
+            })
+        };
+
         let trim_ranges_ms = params.trim_ranges.iter().map(|(a, b)| (a * params.duration_ms, b * params.duration_ms)).collect::<Vec<_>>();
 
         let mut obj = serde_json::json!({
@@ -1403,6 +1413,7 @@ impl StabilizationManager {
             },
 
             "color": color,
+            "denoise": denoise,
 
             "offsets": gyro.get_offsets(), // timestamp, offset value
             "keyframes": self.keyframes.read().serialize(),
@@ -1879,6 +1890,21 @@ impl StabilizationManager {
                             c.lut = None;
                         }
                     }
+                }
+            }
+            if let Some(serde_json::Value::Object(obj)) = obj.get("denoise") {
+                let mut d = self.denoise.write();
+                if let Some(v) = obj.get("enabled").and_then(|x| x.as_bool()) { d.enabled = v; }
+                // Clamped through set_param so a hand-edited or corrupted project
+                // cannot produce a nonsensical sigma. The ranges live in
+                // `DenoiseSettings::set_param`, shared with the QML entry point.
+                for key in ["luma_strength", "chroma_strength"] {
+                    if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { d.set_param(key, v); }
+                }
+                // An unknown id (an older or newer build, a hand-edited file) falls
+                // back to the current value rather than failing the import.
+                if let Some(v) = obj.get("quality").and_then(|x| x.as_str()) {
+                    if let Some(q) = denoise::DenoiseQuality::from_id(v) { d.quality = q; }
                 }
             }
             if let Some(serde_json::Value::Object(obj)) = obj.get_mut("output") {
@@ -2405,6 +2431,45 @@ DOMAIN_MAX 1.0 1.0 1.0
         let b = restored.color.read();
         assert_eq!(b.output_color_space, color::OutputColorSpace::Srgb);
         assert_eq!(b.output_range,       color::OutputRange::Full);
+    }
+
+    #[test]
+    fn denoise_settings_round_trip_through_the_project_file() {
+        let mgr = StabilizationManager::default();
+        {
+            let mut d = mgr.denoise.write();
+            d.enabled = true;
+            d.quality = denoise::DenoiseQuality::High;
+            d.luma_strength = 0.25;
+            d.chroma_strength = 0.75;
+        }
+        let restored = round_trip(&mgr);
+
+        let a = mgr.denoise.read();
+        let b = restored.denoise.read();
+        assert_eq!(a.enabled, b.enabled);
+        assert_eq!(a.quality, b.quality);
+        assert_eq!(a.luma_strength, b.luma_strength);
+        assert_eq!(a.chroma_strength, b.chroma_strength);
+    }
+
+    #[test]
+    fn denoise_import_clamps_hand_edited_values() {
+        let mgr = StabilizationManager::default();
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"denoise":{"enabled":true,"luma_strength":99.0,"chroma_strength":-99.0}}"#);
+        let d = mgr.denoise.read();
+        assert_eq!(d.luma_strength, denoise::MAX_STRENGTH);
+        assert_eq!(d.chroma_strength, denoise::MIN_STRENGTH);
+    }
+
+    #[test]
+    fn denoise_import_falls_back_on_an_unknown_quality_id() {
+        let mgr = StabilizationManager::default();
+        mgr.denoise.write().quality = denoise::DenoiseQuality::High;
+        // An id written by a newer build must leave the current value alone
+        // rather than fail the import, matching how output_color_space behaves.
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"denoise":{"quality":"ultra"}}"#);
+        assert_eq!(mgr.denoise.read().quality, denoise::DenoiseQuality::High);
     }
 
     #[test]
