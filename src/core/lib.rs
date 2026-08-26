@@ -14,6 +14,7 @@ pub mod camera_identifier;
 pub mod keyframes;
 pub mod stmap;
 pub mod color;
+pub mod denoise;
 
 pub mod zooming;
 pub mod smoothing;
@@ -85,6 +86,7 @@ pub struct StabilizationManager {
     pub lens: Arc<RwLock<LensProfile>>,
     pub smoothing: Arc<RwLock<Smoothing>>,
     pub color: Arc<RwLock<color::ColorAdjustments>>,
+    pub denoise: Arc<RwLock<denoise::DenoiseSettings>>,
 
     pub stabilization: Arc<RwLock<Stabilization>>,
 
@@ -119,6 +121,7 @@ impl Default for StabilizationManager {
         Self {
             smoothing: Arc::new(RwLock::new(Smoothing::default())),
             color: Arc::new(RwLock::new(color::ColorAdjustments::default())),
+            denoise: Arc::new(RwLock::new(denoise::DenoiseSettings::default())),
 
             params: Arc::new(RwLock::new(StabilizationParams::default())),
 
@@ -1189,6 +1192,7 @@ impl StabilizationManager {
             keyframes:  Arc::new(RwLock::new(self.keyframes.read().clone())),
             smoothing:  Arc::new(RwLock::new(self.smoothing.read().clone())),
             color:      Arc::new(RwLock::new(self.color.read().clone())),
+            denoise:    Arc::new(RwLock::new(self.denoise.read().clone())),
             input_file: Arc::new(RwLock::new(self.input_file.read().clone())),
             lens_profile_db: self.lens_profile_db.clone(),
 
