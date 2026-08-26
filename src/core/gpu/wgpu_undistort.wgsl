@@ -60,9 +60,11 @@ struct KernelParams {
 @group(0) @binding(3) @fragment var<storage, read> mesh_data: array<f32>;
 @group(0) @binding(4) @fragment var<storage, read> drawing: array<u32>;
 // {texture_input}
-@group(0) @binding(5) @fragment var input_texture: texture_2d<SCALAR>;
+// Layer 0 is the frame being rendered; layers 1.. are temporal reference frames.
+@group(0) @binding(5) @fragment var input_texture: texture_2d_array<SCALAR>;
 // {/texture_input}
 // {buffer_input}
+// All frames concatenated. Frame f starts at f * params.height * stride_px.
 @group(0) @binding(5) @fragment var<storage, read> input_buffer: array<SCALAR>;
 @group(0) @binding(6) @fragment var<storage, read_write> output_buffer: array<SCALAR>;
 // {/buffer_input}
@@ -211,13 +213,16 @@ fn map_coord(x: f32, in_min: f32, in_max: f32, out_min: f32, out_max: f32) -> f3
     return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
-fn read_input_at(uv: vec2<i32>) -> vec4<f32> {
+// `frame` is 0 for the frame being rendered and 1.. for temporal reference frames.
+// This is the single pixel-read chokepoint for both binding paths, so the frame
+// index is resolved here rather than duplicated at every call site.
+fn read_input_at(uv: vec2<i32>, frame: u32) -> vec4<f32> {
     // {texture_input}
-    return vec4<f32>(textureLoad(input_texture, uv, 0));
+    return vec4<f32>(textureLoad(input_texture, uv, i32(frame), 0));
     // {/texture_input}
     // {buffer_input}
     let stride_px = params.stride / (bytes_per_pixel / pix_element_count);
-    let buffer_pos = u32((uv.y * stride_px) + uv.x * pix_element_count);
+    let buffer_pos = u32((uv.y * stride_px) + uv.x * pix_element_count) + frame * u32(params.height) * u32(stride_px);
     return vec4<f32>(
         f32(input_buffer[buffer_pos + 0u]),
         f32(input_buffer[buffer_pos + 1u]),
@@ -296,9 +301,28 @@ fn bc2(x_param: f32) -> f32 {
 }
 ////////////////////////////// EWA (Elliptical Weighted Average) CubicBC sampling //////////////////////////////
 
+// Shared tail of every source sample: colour grading, the limited-range remap and
+// the value ceiling. Factored out so the reference-frame sampler lands in exactly
+// the same value space as the centre sample - the denoise rejection weights
+// compare the two directly, so any divergence here corrupts them everywhere.
+fn finish_sample(sum_param: vec4<f32>) -> vec4<f32> {
+    var sum = sum_param;
+    if (bool(flags & 4096)) {
+        sum = apply_color(sum, params.max_pixel_value);
+    }
+    if (bool(flags & 1)) { // fix range
+        sum = remap_colorrange(sum, params.plane_index == 0);
+    }
+    return vec4<f32>(
+        min(sum.x, params.pixel_value_limit),
+        min(sum.y, params.pixel_value_limit),
+        min(sum.z, params.pixel_value_limit),
+        min(sum.w, params.pixel_value_limit)
+    );
+}
+
 fn sample_input_at(uv_param: vec2<f32>, jac: vec4<f32>) -> vec4<f32> {
     var uv = uv_param;
-    let fix_range = bool(flags & 1);
 
     let bg = params.background * params.max_pixel_value;
     var sum = vec4<f32>(0.0);
@@ -327,7 +351,7 @@ fn sample_input_at(uv_param: vec2<f32>, jac: vec4<f32>) -> vec4<f32> {
                 }
                 var pixel: vec4<f32>;
                 if (in_y >= params.source_rect.y && in_y < params.source_rect.y + params.source_rect.w && in_x >= params.source_rect.x && in_x < params.source_rect.x + params.source_rect.z) {
-                    pixel = read_input_at(vec2<i32>(in_x, in_y));
+                    pixel = read_input_at(vec2<i32>(in_x, in_y), 0u);
                     pixel = draw_pixel(pixel, u32(in_x), u32(in_y), true);
                 } else {
                     pixel = bg;
@@ -361,7 +385,7 @@ fn sample_input_at(uv_param: vec2<f32>, jac: vec4<f32>) -> vec4<f32> {
                 for (var xp: i32 = 0; xp < i32(interpolation); xp = xp + 1) {
                     var pixel: vec4<f32>;
                     if (sx + xp >= params.source_rect.x && sx + xp < params.source_rect.x + params.source_rect.z) {
-                        pixel = read_input_at(vec2<i32>(sx + xp, sy + yp));
+                        pixel = read_input_at(vec2<i32>(sx + xp, sy + yp), 0u);
                         pixel = draw_pixel(pixel, u32(sx + xp), u32(sy + yp), true);
                     } else {
                         pixel = bg;
@@ -375,18 +399,7 @@ fn sample_input_at(uv_param: vec2<f32>, jac: vec4<f32>) -> vec4<f32> {
         }
     }
 
-    if (bool(flags & 4096)) {
-        sum = apply_color(sum, params.max_pixel_value);
-    }
-    if (fix_range) {
-        sum = remap_colorrange(sum, params.plane_index == 0);
-    }
-    return vec4<f32>(
-        min(sum.x, params.pixel_value_limit),
-        min(sum.y, params.pixel_value_limit),
-        min(sum.z, params.pixel_value_limit),
-        min(sum.w, params.pixel_value_limit)
-    );
+    return finish_sample(sum);
 }
 
 const GRID_SIZE: i32 = 9;
@@ -558,7 +571,11 @@ fn rotate_and_distort(pos: vec2<f32>, idx: u32, f: vec2<f32>, c: vec2<f32>, k1: 
     return vec2<f32>(-99999.0, -99999.0);
 }
 
-fn undistort_coord(position: vec2<f32>) -> vec2<f32> {
+// `frame_base` selects which frame's block of rolling-shutter matrices to map
+// through. Matrix blocks are 14 floats, so frame f's block starts at
+// f * matrix_count * 14 and the per-scanline index simply gains that offset.
+// Callers that want the frame being rendered pass 0u.
+fn undistort_coord(position: vec2<f32>, frame_base: u32) -> vec2<f32> {
     var out_pos = position;
     if (bool(flags & 64)) { // Uses output rect
         out_pos = vec2<f32>(
@@ -609,7 +626,7 @@ fn undistort_coord(position: vec2<f32>) -> vec2<f32> {
         sy = u32(min(params.height, max(0, i32(floor(0.5 + out_pos.y)))));
     }
     if (params.matrix_count > 1) {
-        let idx: u32 = u32((params.matrix_count / 2) * 14); // Use middle matrix
+        let idx: u32 = frame_base + u32((params.matrix_count / 2) * 14); // Use middle matrix
         let uv = rotate_and_distort(out_pos, idx, params.f, params.c, params.k1, params.k2, params.k3);
         if (uv.x > -99998.0) {
             if (bool(flags & 16)) { // Horizontal RS
@@ -621,7 +638,7 @@ fn undistort_coord(position: vec2<f32>) -> vec2<f32> {
     }
     ///////////////////////////////////////////////////////////////////
 
-    let idx: u32 = min(sy, u32(params.matrix_count - 1)) * 14u;
+    let idx: u32 = frame_base + min(sy, u32(params.matrix_count - 1)) * 14u;
     var uv = rotate_and_distort(out_pos, idx, params.f, params.c, params.k1, params.k2, params.k3);
 
     var frame_size = vec2<f32>(f32(params.width), f32(params.height));
@@ -657,6 +674,82 @@ fn undistort_coord(position: vec2<f32>) -> vec2<f32> {
     return uv;
 }
 
+// A 4-tap bilinear read of one reference frame.
+//
+// Reference frames are sampled bilinearly regardless of `interpolation`: at k=3
+// the configured sampler would otherwise run seven times per pixel, and the extra
+// accuracy is wasted on samples that are about to be averaged anyway. The taps go
+// through `read_input_at`, the same pixel-read chokepoint the centre sample uses,
+// and the result goes through `finish_sample`, the same value-space tail, so the
+// two are directly comparable.
+fn sample_bilinear_at(uv: vec2<f32>, frame: u32) -> vec4<f32> {
+    let bg = params.background * params.max_pixel_value;
+
+    let base = floor(uv);
+    let f = uv - base;
+    let x0 = i32(base.x);
+    let y0 = i32(base.y);
+
+    var sum = vec4<f32>(0.0);
+    for (var yp: i32 = 0; yp < 2; yp = yp + 1) {
+        let wy = select(1.0 - f.y, f.y, yp == 1);
+        let sy = y0 + yp;
+        for (var xp: i32 = 0; xp < 2; xp = xp + 1) {
+            let wx = select(1.0 - f.x, f.x, xp == 1);
+            let sx = x0 + xp;
+            var pixel: vec4<f32>;
+            if (sy >= params.source_rect.y && sy < params.source_rect.y + params.source_rect.w &&
+                sx >= params.source_rect.x && sx < params.source_rect.x + params.source_rect.z) {
+                pixel = read_input_at(vec2<i32>(sx, sy), frame);
+            } else {
+                pixel = bg;
+            }
+            sum = sum + pixel * (wx * wy);
+        }
+    }
+    return finish_sample(sum);
+}
+
+// Combine the centre sample with its temporal neighbours.
+//
+// Each reference frame has its own matrix block, so running the same
+// output->source mapping against block f gives exactly where this output pixel
+// lands in frame f. That is motion compensation for free: the rotation came
+// from the gyro, not from an estimator.
+//
+// Samples that disagree with the centre are rejected by a Gaussian on their
+// difference. This is load-bearing rather than a refinement - rotation aligns
+// frames for rotational camera motion only, so translation creates
+// depth-dependent parallax that nothing here can compensate, and moving
+// subjects never align at all.
+fn gather_denoised(position: vec2<f32>, centre: vec4<f32>) -> vec4<f32> {
+    let count = u32(round(params.reference_count));
+    if (count <= 1u) { return centre; } // Denoising disabled - costs one compare.
+
+    let sigma = params.denoise_sigma * params.max_pixel_value;
+    let inv_2sigma_sq = 1.0 / (2.0 * sigma * sigma);
+
+    var acc: vec4<f32> = centre;
+    var weight_sum: f32 = 1.0;
+
+    let block = u32(params.matrix_count) * 14u;
+    for (var f: u32 = 1u; f < count; f = f + 1u) {
+        let ruv = undistort_coord(position, f * block);
+        if (ruv.x < -99998.0) { continue; }
+
+        let s = sample_bilinear_at(ruv, f);
+
+        let d = s - centre;
+        let dist_sq = dot(d, d);
+        let w = exp(-dist_sq * inv_2sigma_sq);
+
+        acc = acc + s * w;
+        weight_sum = weight_sum + w;
+    }
+
+    return acc / weight_sum;
+}
+
 // Adapted from OpenCV: initUndistortRectifyMap + remap
 // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/calib3d/src/fisheye.cpp#L465-L567
 // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/imgproc/src/opencl/remap.cl#L390-L498
@@ -679,13 +772,13 @@ fn undistort(position: vec2<f32>) -> vec4<SCALAR> {
 
     if (out_pos.x < 0.0 || out_pos.y < 0.0 || out_pos.x > f32(params.output_width) || out_pos.y > f32(params.output_height)) { return vec4<SCALAR>(bg); }
 
-    var uv = undistort_coord(position);
+    var uv = undistort_coord(position, 0u);
     var jac = vec4<f32>(1.0, 0.0, 0.0, 1.0);
 
     if (interpolation > 8u) {
         let eps = 0.01;
-        let xyx = undistort_coord(position + vec2<f32>(eps, 0.0)) - uv;
-        let xyy = undistort_coord(position + vec2<f32>(0.0, eps)) - uv;
+        let xyx = undistort_coord(position + vec2<f32>(eps, 0.0), 0u) - uv;
+        let xyy = undistort_coord(position + vec2<f32>(0.0, eps), 0u) - uv;
         jac = vec4<f32>(xyx.x / eps, xyy.x / eps, xyx.y / eps, xyy.y / eps);
     }
 
@@ -724,12 +817,17 @@ fn undistort(position: vec2<f32>) -> vec4<SCALAR> {
             let c1 = sample_input_at(uv, jac);
             let c2 = sample_input_at(pt2, jac); // FIXME: jac should be adjusted for pt2
             pixel = c1 * alpha + c2 * (1.0 - alpha);
+            pixel = gather_denoised(position, pixel);
             pixel = draw_pixel(pixel, u32(p.x), u32(p.y), false);
             pixel = draw_safe_area(pixel, p.x, p.y);
             return vec4<SCALAR>(pixel);
         }
 
         pixel = sample_input_at(uv, jac);
+        // Denoise the resolved centre sample, before the drawing overlays and the
+        // safe-area dimming - those are display decorations, not image data, and
+        // averaging them across frames would be meaningless.
+        pixel = gather_denoised(position, pixel);
     }
     pixel = draw_pixel(pixel, u32(p.x), u32(p.y), false);
     pixel = draw_safe_area(pixel, p.x, p.y);
