@@ -740,7 +740,17 @@ fn gather_denoised(position: vec2<f32>, centre: vec4<f32>) -> vec4<f32> {
         let s = sample_bilinear_at(ruv, f);
 
         let d = s - centre;
-        let dist_sq = dot(d, d);
+        // Only the first `pix_element_count` lanes hold this pixel's data. On the
+        // buffer path the rest are the next pixels along (read_input_at reads four
+        // elements unconditionally), so including them would reject a sample because
+        // its NEIGHBOUR differs. The output write at the end of this file gates its
+        // stores the same way, for the same reason. `pix_element_count` is a pipeline
+        // constant, so these branches fold away at compile time.
+        var dist_sq = 0.0;
+        if (pix_element_count >= 1) { dist_sq += d.x * d.x; }
+        if (pix_element_count >= 2) { dist_sq += d.y * d.y; }
+        if (pix_element_count >= 3) { dist_sq += d.z * d.z; }
+        if (pix_element_count >= 4) { dist_sq += d.w * d.w; }
         let w = exp(-dist_sq * inv_2sigma_sq);
 
         acc = acc + s * w;
