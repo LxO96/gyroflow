@@ -386,6 +386,18 @@ impl Stabilization {
         transform
     }
 
+    /// Build the centre transform plus one matrix block per reference timestamp.
+    /// Each block comes from the same `get_frame_transform_at` the centre frame
+    /// uses, so a reference frame's rolling-shutter matrices are computed
+    /// exactly as that frame's own render would compute them.
+    pub fn get_frame_transform_with_references<T: PixelType>(&self, timestamp_us: i64, reference_timestamps: &[i64], frame: Option<usize>, buffers: &Buffers) -> FrameTransform {
+        let mut t = self.get_frame_transform_at::<T>(timestamp_us, frame, buffers);
+        t.reference_matrices = reference_timestamps.iter()
+            .map(|ts| self.get_frame_transform_at::<T>(*ts, None, buffers).matrices)
+            .collect();
+        t
+    }
+
     pub fn ensure_stab_data_at_timestamp<T: PixelType>(&mut self, timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers, is_pixel_normalized: bool) {
         let mut insert = true;
         if let Some(itm) = self.stab_data.get(&timestamp_us) {
@@ -843,7 +855,7 @@ mod color_cache_key_tests {
     use super::*;
 
     fn buffers() -> Buffers<'static> {
-        Buffers { input: BufferDescription::default(), output: BufferDescription::default() }
+        Buffers { input: BufferDescription::default(), output: BufferDescription::default(), references: Vec::new() }
     }
 
     fn stab_with(color: crate::color::ColorAdjustments) -> Stabilization {
@@ -1014,6 +1026,7 @@ mod cross_backend_color_tests {
             // Identity 3x3 in the first 9 fields; the trailing 5 stay zero, which disables
             // the extra shift/angle adjustment.
             matrices: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            reference_matrices: Vec::new(),
             kernel_params: p,
             fov: 1.0,
             minimal_fov: 1.0,
@@ -1090,6 +1103,7 @@ mod cross_backend_color_tests {
         let mut buffers = Buffers {
             input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
             output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+            references: Vec::new(),
         };
 
         let inst = crate::gpu::wgpu::WgpuWrapper::new(
@@ -1119,6 +1133,7 @@ mod cross_backend_color_tests {
             let mut buffers = Buffers {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
             };
             let ok = Stabilization::undistort_image_cpu::<2, RGBAf>(&mut buffers, &itm.kernel_params, &DistortionModel::default(), None, &itm.matrices, &[], &[], &coeffs);
             assert!(ok, "undistort_image_cpu returned false");
@@ -1205,6 +1220,7 @@ mod cross_backend_color_tests {
             let mut buffers = Buffers {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE8 as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut inp_buf }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE8 as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
             };
             if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { println!("SKIPPED: no wgpu adapter"); return; }
             let inst = match crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, RGBA8::wgpu_format().unwrap(), DistortionModel::default(), None, &buffers, 0, None) {
@@ -1252,6 +1268,7 @@ mod cross_backend_color_tests {
             let mut buffers = Buffers {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut inp_buf }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
             };
             if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() {
                 println!("SKIPPED: no wgpu adapter"); return;
@@ -1272,6 +1289,7 @@ mod cross_backend_color_tests {
             let mut b = Buffers {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_in }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_out }, texture_copy: false },
+                references: Vec::new(),
             };
             // The CPU path must NOT get the wgpu half-pixel correction - it already feeds
             // integer pixel coordinates. Applying it here would shift the CPU instead.

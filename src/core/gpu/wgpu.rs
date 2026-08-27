@@ -175,7 +175,9 @@ impl WgpuWrapper {
 
         let in_size = (buffers.input.size.2 * buffers.input.size.1) as wgpu::BufferAddress;
         let out_size = (buffers.output.size.2 * buffers.output.size.1) as wgpu::BufferAddress;
-        let params_size = (max_matrix_count * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        // 7 = the largest 2k+1 any quality tier asks for (DenoiseQuality::High).
+        const MAX_REFERENCE_FRAMES: usize = 7;
+        let params_size = (max_matrix_count * MAX_REFERENCE_FRAMES * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
 
         let drawing_enabled = (params.flags & 8) == 8;
 
@@ -288,8 +290,12 @@ impl WgpuWrapper {
             }
 
             let backend = adapter.get_info().backend;
-            let in_texture = init_texture(&device, backend, &buffers.input, wgpu_format.0, true);
-            let out_texture = init_texture(&device, backend, &buffers.output, wgpu_format.0, false);
+            // The centre frame is layer 0; any temporal references follow it, so the
+            // texture (and, where the backend allocates one directly, the buffer) must
+            // be sized for all of them up front - it is not resized per-frame.
+            let in_array_layers = 1 + buffers.references.len() as u32;
+            let in_texture = init_texture(&device, backend, &buffers.input, wgpu_format.0, true, in_array_layers);
+            let out_texture = init_texture(&device, backend, &buffers.output, wgpu_format.0, false, 1);
 
             let uses_textures = in_texture.wgpu_texture.is_some();
             let kernel = preprocess_kernel(&lens_model_functions, wgpu_format.1, uses_textures);
@@ -470,21 +476,77 @@ impl WgpuWrapper {
     }
 
     pub fn undistort_image(&self, buffers: &mut Buffers, itm: &crate::stabilization::FrameTransform, drawing_buffer: &[u8]) -> bool {
-        let matrices = bytemuck::cast_slice(&itm.matrices);
+        // Block layout the shader indexes into: frame f starts at
+        // f * matrix_count * 14 floats. Centre first, then references in
+        // temporal order.
+        let mut all_matrices: Vec<[f32; 14]> = Vec::with_capacity(itm.matrices.len() * (1 + itm.reference_matrices.len()));
+        all_matrices.extend_from_slice(&itm.matrices);
+        for block in &itm.reference_matrices {
+            debug_assert_eq!(block.len(), itm.matrices.len(), "every reference block must match the centre block length or the shader's stride arithmetic is wrong");
+            all_matrices.extend_from_slice(block);
+        }
+        let matrices = bytemuck::cast_slice(&all_matrices);
 
         let in_size = (buffers.input.size.2 * buffers.input.size.1) as u64;
         let out_size = (buffers.output.size.2 * buffers.output.size.1) as u64;
         if self.in_size  != in_size  { log::error!("Buffer size mismatch! {} vs {}", self.in_size,  in_size);  return false; }
         if self.out_size != out_size { log::error!("Buffer size mismatch! {} vs {}", self.out_size, out_size); return false; }
 
+        // The buffer path's frame offset is `frame * height * stride_px`, so every
+        // concatenated reference frame must have identical stride and height to the
+        // centre, or the shader silently samples garbage.
+        for (i, r) in buffers.references.iter().enumerate() {
+            debug_assert_eq!(r.size.1, buffers.input.size.1, "reference frame {i} has a different height ({}) than the centre frame ({}) - the shader's f*height*stride offset arithmetic would be wrong", r.size.1, buffers.input.size.1);
+            debug_assert_eq!(r.size.2, buffers.input.size.2, "reference frame {i} has a different stride ({}) than the centre frame ({}) - the shader's f*height*stride offset arithmetic would be wrong", r.size.2, buffers.input.size.2);
+        }
+
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
         let _temp_texture = handle_input_texture(&self.device, &buffers.input, &self.queue, &mut encoder, &self.in_texture, self.pixel_format, self.padded_out_stride);
 
+        // Upload reference frames into the layers/offsets that follow the centre frame.
+        if !buffers.references.is_empty() {
+            if let Some(in_tex) = self.in_texture.wgpu_texture.as_ref() {
+                for (i, r) in buffers.references.iter().enumerate() {
+                    match &r.data {
+                        BufferSource::Cpu { buffer } => {
+                            self.queue.write_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: in_tex,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d { x: 0, y: 0, z: (i + 1) as u32 },
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                bytemuck::cast_slice(buffer),
+                                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(r.size.2 as u32), rows_per_image: None },
+                                wgpu::Extent3d { width: r.size.0 as u32, height: r.size.1 as u32, depth_or_array_layers: 1 },
+                            );
+                        }
+                        _ => log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will be missing this frame"),
+                    }
+                }
+            } else if let Some(in_buf) = self.in_texture.wgpu_buffer.as_ref() {
+                let capacity = in_buf.size();
+                if capacity < in_size * (1 + buffers.references.len()) as u64 {
+                    log::error!("Reference frame buffer too small for {} references ({} < {})", buffers.references.len(), capacity, in_size * (1 + buffers.references.len()) as u64);
+                } else {
+                    for (i, r) in buffers.references.iter().enumerate() {
+                        if let BufferSource::Cpu { buffer } = &r.data {
+                            self.queue.write_buffer(in_buf, (i as u64 + 1) * in_size, bytemuck::cast_slice(buffer));
+                        } else {
+                            log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will be missing this frame");
+                        }
+                    }
+                }
+            }
+        }
+
         if self.params_size < matrices.len() as u64    { log::error!("Buffer size mismatch! {} vs {}", self.params_size, matrices.len()); return false; }
 
         self.queue.write_buffer(self.buf_matrices.as_ref().unwrap(), 0, matrices);
-        self.queue.write_buffer(self.buf_params.as_ref().unwrap(), 0, bytemuck::bytes_of(&itm.kernel_params));
+        let mut kernel_params = itm.kernel_params;
+        kernel_params.reference_count = (1 + buffers.references.len()) as f32;
+        self.queue.write_buffer(self.buf_params.as_ref().unwrap(), 0, bytemuck::bytes_of(&kernel_params));
         if !drawing_buffer.is_empty() {
             if self.drawing_size < drawing_buffer.len() as u64 { log::error!("Buffer size mismatch! {} vs {}", self.drawing_size, drawing_buffer.len()); return false; }
             self.queue.write_buffer(self.buf_drawing.as_ref().unwrap(), 0, drawing_buffer);

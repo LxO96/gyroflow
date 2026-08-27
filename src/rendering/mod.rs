@@ -710,6 +710,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     plane.init_size(org_sizes.0, org_sizes.1);
                     plane.set_compute_params(compute_params);
                     let render_globals = render_globals.clone();
+                    let denoise = stab.denoise.clone();
                     $planes.push(Box::new(move |timestamp_us: i64, in_frame_data: &mut Video, out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
                         let mut g = render_globals.borrow_mut();
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
@@ -717,7 +718,8 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
 
                         let mut buffers = Buffers {
                             input:  get_plane_buffer(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
-                            output: get_plane_buffer(out_frame_data, out_size, plane_index, &mut g, wgpu_format)
+                            output: get_plane_buffer(out_frame_data, out_size, plane_index, &mut g, wgpu_format),
+                            references: Vec::new(),
                         };
 
                         if plane.initialized_backend.is_none() || plane.pending_device_change.is_some() {
@@ -732,6 +734,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                             transform.kernel_params.max_pixel_value = 1.0;
                         }
                         transform.kernel_params.plane_index = plane_index as i32;
+                        transform.kernel_params.denoise_sigma = denoise.read().sigma_for_plane(plane_index as i32);
                         if fill_with_background {
                             transform.kernel_params.flags |= KernelParamsFlags::FILL_WITH_BACKGROUND.bits();
                         }

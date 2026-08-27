@@ -247,7 +247,10 @@ pub struct BufferDescription<'a> {
 }
 pub struct Buffers<'a> {
     pub input: BufferDescription<'a>,
-    pub output: BufferDescription<'a>
+    pub output: BufferDescription<'a>,
+    /// Temporal reference frames, in temporal order, excluding the centre frame
+    /// which is `input`. Empty when denoising is off.
+    pub references: Vec<BufferDescription<'a>>,
 }
 
 #[derive(Debug, Default)]
@@ -368,6 +371,7 @@ impl<'a> Buffers<'a> {
         let mut hasher = crc32fast::Hasher::new();
         hasher.write_u32(self.input.get_checksum());
         hasher.write_u32(self.output.get_checksum());
+        hasher.write_usize(self.references.len());
         hasher.finalize()
     }
 }

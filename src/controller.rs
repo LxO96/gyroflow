@@ -1044,6 +1044,7 @@ impl Controller {
                     let mut buffers = Buffers{
                         input:  BufferDescription { size: (width as usize, height as usize, width as usize * 4), ..Default::default() },
                         output: BufferDescription { size: (width as usize, height as usize, width as usize * 4), ..Default::default() },
+                        references: Vec::new(),
                     };
 
                     let (offset, fps) = {
@@ -1083,6 +1084,7 @@ impl Controller {
                                         context: ptr2 as *mut std::ffi::c_void
                                     }, ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "OpenGL"))
                         },
@@ -1098,6 +1100,7 @@ impl Controller {
                                     texture_copy: true,
                                     data: BufferSource::Metal { texture: ptr1 as *mut std::ffi::c_void, command_queue: ptr3 as *mut std::ffi::c_void }, ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "Metal"))
                         },
@@ -1122,6 +1125,7 @@ impl Controller {
                                         device_context: ptr3 as *mut std::ffi::c_void
                                     }, ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "DirectX11"))
                         },
@@ -1140,6 +1144,7 @@ impl Controller {
                                     data: BufferSource::Vulkan { texture: ptr1, device: ptr2, physical_device: ptr4, instance: ptr5 },
                                     ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "Vulkan"))
                         }
@@ -1187,6 +1192,7 @@ impl Controller {
                         data: BufferSource::Cpu { buffer: &mut out_pixels },
                         ..Default::default()
                     },
+                    references: Vec::new(),
                 });
                 match ret {
                     Ok(bk) => {

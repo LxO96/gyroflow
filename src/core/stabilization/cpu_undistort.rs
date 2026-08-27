@@ -1027,6 +1027,7 @@ mod color_stage_tests {
             let mut buffers = Buffers {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
             };
             let ok = Stabilization::undistort_image_cpu::<2, RGBAf>(&mut buffers, &params, &distortion_model, None, &matrices, &[], &[], &coeffs);
             assert!(ok, "undistort_image_cpu returned false");
