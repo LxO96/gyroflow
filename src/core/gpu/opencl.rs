@@ -232,7 +232,12 @@ impl OclWrapper {
                     BufferSource::Cpu { buffer } => {
                         let flags = if is_in { MemFlags::new().read_only().host_write_only() }
                                     else     { MemFlags::new().write_only().host_read_only().alloc_host_ptr() };
-                        Ok((Buffer::builder().queue(ocl_queue.clone()).len(buffer.len()).flags(flags).build()?, None))
+                        // The centre frame occupies offset 0 of the input buffer; any temporal
+                        // reference frames are uploaded right after it at i * buffer.len() (see
+                        // undistort_image below), so the buffer must be sized for all of them up
+                        // front - it is not resized per-frame.
+                        let len = if is_in { buffer.len() * (1 + buffers.references.len()) } else { buffer.len() };
+                        Ok((Buffer::builder().queue(ocl_queue.clone()).len(len).flags(flags).build()?, None))
                     },
                     BufferSource::OpenCL { queue, .. } => {
                         if !queue.is_null() {
@@ -287,11 +292,15 @@ impl OclWrapper {
                 .build(&ctx.context)?;
 
             let max_matrix_count = 14 * if (params.flags & 16) == 16 { params.width } else { params.height };
+            // 7 = the largest 2k+1 any quality tier asks for (DenoiseQuality::High). Matches
+            // MAX_REFERENCE_FRAMES in wgpu.rs so both backends size their matrix buffer the
+            // same way, with headroom rather than an exact fit.
+            const MAX_REFERENCE_FRAMES: usize = 7;
             let flags = MemFlags::new().read_only().host_write_only();
 
             let buf_params   = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(std::mem::size_of::<KernelParams>()).build()?;
             let buf_drawing  = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(drawing_len.max(4)).build()?;
-            let buf_matrices = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(max_matrix_count).build()?;
+            let buf_matrices = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(max_matrix_count as usize * MAX_REFERENCE_FRAMES).build()?;
             let buf_mesh_data = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(crate::gyro_source::splines::MAX_BUFFER_SIZE).build()?;
 
             // Unlike the other backends, OpenCL keeps its interpolation tables as `__constant`
@@ -342,7 +351,15 @@ impl OclWrapper {
     }
 
     pub fn undistort_image(&self, buffers: &mut Buffers, itm: &crate::stabilization::FrameTransform, drawing_buffer: &[u8]) -> ocl::Result<()> {
-        let matrices = unsafe { std::slice::from_raw_parts(itm.matrices.as_ptr() as *const f32, itm.matrices.len() * 14 ) };
+        // Block layout the kernel indexes into: frame f starts at f * matrix_count * 14
+        // floats. Centre first, then references in temporal order - mirrors wgpu.rs.
+        let mut all_matrices: Vec<[f32; 14]> = Vec::with_capacity(itm.matrices.len() * (1 + itm.reference_matrices.len()));
+        all_matrices.extend_from_slice(&itm.matrices);
+        for block in &itm.reference_matrices {
+            debug_assert_eq!(block.len(), itm.matrices.len(), "every reference block must match the centre block length or the kernel's stride arithmetic is wrong");
+            all_matrices.extend_from_slice(block);
+        }
+        let matrices = unsafe { std::slice::from_raw_parts(all_matrices.as_ptr() as *const f32, all_matrices.len() * 14) };
 
         let mut _temp1 = None;
         let mut _temp2 = None;
@@ -369,8 +386,22 @@ impl OclWrapper {
         match buffers.input.data {
             BufferSource::None => { },
             BufferSource::Cpu { ref buffer } => {
-                if self.src.len() != buffer.len() { log::error!("Buffer size mismatch input! {} vs {}", self.src.len(), buffer.len());  return Ok(()); }
+                let expected_len = buffer.len() * (1 + buffers.references.len());
+                if self.src.len() != expected_len { log::error!("Buffer size mismatch input! {} vs {}", self.src.len(), expected_len);  return Ok(()); }
                 self.src.write(buffer as &[u8]).enq()?;
+
+                // Reference frames go in as offsets into the same enlarged input buffer,
+                // right after the centre frame, matching the frame * height * stride stride
+                // the kernel's sample_bilinear reads with.
+                for (i, r) in buffers.references.iter().enumerate() {
+                    debug_assert_eq!(r.size.1, buffers.input.size.1, "reference frame {i} has a different height ({}) than the centre frame ({}) - the kernel's frame*height*stride offset arithmetic would be wrong", r.size.1, buffers.input.size.1);
+                    debug_assert_eq!(r.size.2, buffers.input.size.2, "reference frame {i} has a different stride ({}) than the centre frame ({}) - the kernel's frame*height*stride offset arithmetic would be wrong", r.size.2, buffers.input.size.2);
+                    if let BufferSource::Cpu { buffer: ref rbuf } = r.data {
+                        self.src.write(rbuf as &[u8]).offset((i + 1) * buffer.len()).enq()?;
+                    } else {
+                        log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will be missing this frame");
+                    }
+                }
             },
             BufferSource::OpenCL { texture, .. } => unsafe {
                 if buffers.input.texture_copy {
@@ -416,7 +447,9 @@ impl OclWrapper {
             _ => { }
         }
 
-        self.buf_params.write(bytemuck::bytes_of(&itm.kernel_params)).enq()?;
+        let mut kernel_params = itm.kernel_params;
+        kernel_params.reference_count = (1 + buffers.references.len()) as f32;
+        self.buf_params.write(bytemuck::bytes_of(&kernel_params)).enq()?;
         self.buf_matrices.write(matrices).enq()?;
 
         unsafe { self.kernel.enq()?; }

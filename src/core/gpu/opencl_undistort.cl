@@ -598,7 +598,11 @@ float2 rotate_and_distort(float2 pos, uint idx, __global KernelParams *params, _
     return (float2)(-99999.0f, -99999.0f);
 }
 
-float2 undistort_coord(float2 out_pos, __global KernelParams *params, __global const float *matrices, __global const float *mesh_data) {
+// `frame_base` selects which frame's block of rolling-shutter matrices to map through.
+// Matrix blocks are 14 floats, so frame f's block starts at f * matrix_count * 14 and the
+// per-scanline index simply gains that offset. Callers that want the frame being rendered
+// pass 0.
+float2 undistort_coord(float2 out_pos, int frame_base, __global KernelParams *params, __global const float *matrices, __global const float *mesh_data) {
     out_pos.x = map_coord(out_pos.x, (float)params->output_rect.x, (float)(params->output_rect.x + params->output_rect.z), 0.0f, (float)params->output_width ) + params->translation2d.x;
     out_pos.y = map_coord(out_pos.y, (float)params->output_rect.y, (float)(params->output_rect.y + params->output_rect.w), 0.0f, (float)params->output_height) + params->translation2d.y;
 
@@ -642,7 +646,7 @@ float2 undistort_coord(float2 out_pos, __global KernelParams *params, __global c
         sy = min((int)params->height, max(0, (int)round(out_pos.y)));
     }
     if (params->matrix_count > 1) {
-        int idx = (params->matrix_count / 2) * 14; // Use middle matrix
+        int idx = frame_base + (params->matrix_count / 2) * 14; // Use middle matrix
         float2 uv = rotate_and_distort(out_pos, idx, params, matrices, mesh_data);
         if (uv.x > -99998.0f) {
             if ((params->flags & 16)) { // Horizontal RS
@@ -654,7 +658,7 @@ float2 undistort_coord(float2 out_pos, __global KernelParams *params, __global c
     }
     ///////////////////////////////////////////////////////////////////
 
-    int idx = min(sy, params->matrix_count - 1) * 14;
+    int idx = frame_base + min(sy, params->matrix_count - 1) * 14;
     float2 uv = rotate_and_distort(out_pos, idx, params, matrices, mesh_data);
 
     float2 frame_size = (float2)((float)params->width, (float)params->height);
@@ -688,6 +692,110 @@ float2 undistort_coord(float2 out_pos, __global KernelParams *params, __global c
     return uv;
 }
 
+// A 4-tap bilinear read of one reference frame, mirroring `sample_bilinear_at` in
+// wgpu_undistort.wgsl.
+//
+// Reference frames are sampled bilinearly regardless of the configured interpolation
+// filter: at higher quality settings the configured sampler would otherwise run once
+// per reference frame for samples that are about to be averaged away, for no accuracy
+// gain. The result goes through the same colour-grading / range-remap / ceiling tail as
+// `sample_input_at`, so the two are directly comparable by `gather_denoised`.
+DATA_TYPEF sample_bilinear(__global const uchar *srcptr, float2 uv, int frame, __global KernelParams *params, __global const uchar *drawing, DATA_TYPEF bg, __global const float *lut_coeffs) {
+    float2 base = floor(uv);
+    float2 f = uv - base;
+    int x0 = (int)base.x;
+    int y0 = (int)base.y;
+
+    int frame_offset = frame * params->height * params->stride;
+
+    DATA_TYPEF sum = 0;
+    #pragma unroll
+    for (int yp = 0; yp < 2; ++yp) {
+        float wy = (yp == 1) ? f.y : (1.0f - f.y);
+        int sy = y0 + yp;
+        #pragma unroll
+        for (int xp = 0; xp < 2; ++xp) {
+            float wx = (xp == 1) ? f.x : (1.0f - f.x);
+            int sx = x0 + xp;
+            DATA_TYPEF pixel;
+            if (sy >= params->source_rect.y && sy < params->source_rect.y + params->source_rect.w &&
+                sx >= params->source_rect.x && sx < params->source_rect.x + params->source_rect.z) {
+                DATA_TYPE src_px = *(__global const DATA_TYPE *)&srcptr[frame_offset + sy * params->stride + sx * PIXEL_BYTES];
+                // The centre sample's taps stamp the drawing overlay too (see
+                // sample_input_at). It is indexed by canvas position and is
+                // frame-independent, so stamping it identically here makes centre and
+                // reference differ by exactly zero in stroke pixels - the rejection weight
+                // becomes 1.0 and the stroke survives. Skipping it would make the rejection
+                // react to overlay content and fade the user's own brush strokes toward the
+                // un-stroked references.
+                draw_pixel(&src_px, sx, sy, true, max(params->width, params->output_width), params, drawing);
+                pixel = DATA_CONVERTF(src_px);
+            } else {
+                pixel = bg;
+            }
+            sum += pixel * (wx * wy);
+        }
+    }
+
+    if ((params->flags & 4096)) {
+        float4 color_px = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        *(DATA_TYPEF *)&color_px = sum;
+        color_px = apply_color(color_px, lut_coeffs, params);
+        sum = *(DATA_TYPEF *)&color_px;
+    }
+    if ((params->flags & 1)) {
+        sum = remap_colorrange(sum, params->plane_index == 0, params);
+    }
+    sum = min(sum, (DATA_TYPEF)(params->pixel_value_limit));
+    return sum;
+}
+
+// Combine the centre sample with its temporal neighbours. Mirror of `gather_denoised` in
+// wgpu_undistort.wgsl and of `denoise::rejection_weight` in Rust - all three must agree:
+// the GPU tests compare this kernel's output against the wgpu kernel's.
+//
+// Each reference frame has its own matrix block, so running the same output->source
+// mapping against block f gives exactly where this output pixel lands in frame f. That is
+// motion compensation for free: the rotation came from the gyro, not from an estimator.
+//
+// Samples that disagree with the centre are rejected by a Gaussian on their difference.
+// This is load-bearing rather than a refinement - rotation aligns frames for rotational
+// camera motion only, so translation creates depth-dependent parallax that nothing here
+// can compensate, and moving subjects never align at all.
+DATA_TYPEF gather_denoised(float2 position, DATA_TYPEF centre, __global const uchar *srcptr, __global KernelParams *params, __global const float *matrices, __global const float *mesh_data, __global const uchar *drawing, DATA_TYPEF bg, __global const float *lut_coeffs) {
+    int count = (int)round(params->reference_count);
+    if (count <= 1) { return centre; } // Denoising disabled - costs one compare.
+
+    float sigma = params->denoise_sigma * params->max_pixel_value;
+    float inv_2sigma_sq = 1.0f / (2.0f * sigma * sigma);
+
+    DATA_TYPEF acc = centre;
+    float weight_sum = 1.0f;
+
+    int block = params->matrix_count * 14;
+    for (int f = 1; f < count; f++) {
+        float2 ruv = undistort_coord(position, f * block, params, matrices, mesh_data);
+        if (ruv.x < -99998.0f) { continue; }
+
+        DATA_TYPEF s = sample_bilinear(srcptr, ruv, f, params, drawing, bg, lut_coeffs);
+
+        // DATA_TYPEF is already sized to this plane's channel count (float, float2 or
+        // float4 - never wider), so unlike a fixed-width buffer read it never carries a
+        // neighbouring pixel's data in its upper lanes. Widening through a zeroed float4
+        // and taking dot() therefore sums exactly this pixel's channels.
+        DATA_TYPEF d = s - centre;
+        float4 d4 = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        *(DATA_TYPEF *)&d4 = d;
+        float dist_sq = dot(d4, d4);
+        float w = exp(-dist_sq * inv_2sigma_sq);
+
+        acc += s * w;
+        weight_sum += w;
+    }
+
+    return acc / weight_sum;
+}
+
 // Adapted from OpenCV: initUndistortRectifyMap + remap
 // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/calib3d/src/fisheye.cpp#L465-L567
 // https://github.com/opencv/opencv/blob/2b60166e5c65f1caccac11964ad760d847c536e4/modules/imgproc/src/opencl/remap.cl#L390-L498
@@ -716,13 +824,13 @@ __kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstp
         }
 
         float2 out_pos = (float2)((float)buf_x, (float)buf_y);
-        float2 uv = undistort_coord(out_pos, params, matrices, mesh_data);
+        float2 uv = undistort_coord(out_pos, 0, params, matrices, mesh_data);
         float4 jac = (float4)(1.0f, 0.0f, 0.0f, 1.0f);
 
 #       if INTERPOLATION > 8
             const float eps = 0.01f;
-            float2 xyx = undistort_coord(out_pos + (float2)(eps, 0.0f), params, matrices, mesh_data) - uv;
-            float2 xyy = undistort_coord(out_pos + (float2)(0.0f, eps), params, matrices, mesh_data) - uv;
+            float2 xyx = undistort_coord(out_pos + (float2)(eps, 0.0f), 0, params, matrices, mesh_data) - uv;
+            float2 xyy = undistort_coord(out_pos + (float2)(0.0f, eps), 0, params, matrices, mesh_data) - uv;
             jac = (float4)(xyx.x / eps, xyy.x / eps, xyx.y / eps, xyy.y / eps);
 #       endif
 
@@ -755,14 +863,21 @@ __kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstp
 
                 DATA_TYPEF c1 = sample_input_at(uv,  jac, srcptr, params, drawing, bg, lut_coeffs);
                 DATA_TYPEF c2 = sample_input_at(pt2, jac, srcptr, params, drawing, bg, lut_coeffs); // FIXME: jac should be adjusted for pt2
-                final_pix = DATA_CONVERT(c1 * alpha + c2 * (1.0f - alpha));
+                DATA_TYPEF blended = c1 * alpha + c2 * (1.0f - alpha);
+                blended = gather_denoised(out_pos, blended, srcptr, params, matrices, mesh_data, drawing, bg, lut_coeffs);
+                final_pix = DATA_CONVERT(blended);
                 draw_pixel(&final_pix, x, y, false, max(params->width, params->output_width), params, drawing);
                 draw_safe_area(&final_pix, x, y, params);
                 *out_pix = final_pix;
                 return;
             }
 
-            final_pix = DATA_CONVERT(sample_input_at(uv, jac, srcptr, params, drawing, bg, lut_coeffs));
+            DATA_TYPEF centre_px = sample_input_at(uv, jac, srcptr, params, drawing, bg, lut_coeffs);
+            // Denoise the resolved centre sample, before the drawing overlays and the
+            // safe-area dimming - those are display decorations, not image data, and
+            // averaging them across frames would be meaningless.
+            centre_px = gather_denoised(out_pos, centre_px, srcptr, params, matrices, mesh_data, drawing, bg, lut_coeffs);
+            final_pix = DATA_CONVERT(centre_px);
         } else {
             final_pix = DATA_CONVERT(bg);
         }
