@@ -510,7 +510,7 @@ impl<'a> FfmpegProcessor<'a> {
             if !cancel_flag.load(Relaxed) {
                 if let Some(mut cb) = self.video.on_finish_callback.take() {
                     let mut rate_control = ffmpeg_video::RateControl::default();
-                    let result = cb(&mut self.video.converter, &mut rate_control);
+                    let result = cb(&mut self.video, &mut rate_control, &mut octx, &mut self.ost_time_bases);
                     self.video.on_finish_callback = Some(cb);
                     result?;
                 }
@@ -617,7 +617,7 @@ impl<'a> FfmpegProcessor<'a> {
     pub fn on_frame<F>(&mut self, cb: F) where F: FnMut(i64, &mut frame::Video, Option<&mut frame::Video>, &mut ffmpeg_video_converter::Converter, &mut ffmpeg_video::RateControl) -> Result<(), FFmpegError> + 'a {
         self.video.on_frame_callback = Some(Box::new(cb));
     }
-    pub fn on_finish<F>(&mut self, cb: F) where F: FnMut(&mut ffmpeg_video_converter::Converter, &mut ffmpeg_video::RateControl) -> Result<(), FFmpegError> + 'a {
+    pub fn on_finish<F>(&mut self, cb: F) where F: FnMut(&mut VideoTranscoder<'a>, &mut ffmpeg_video::RateControl, &mut format::context::Output, &mut Vec<Rational>) -> Result<(), FFmpegError> + 'a {
         self.video.on_finish_callback = Some(Box::new(cb));
     }
     pub fn on_encoder_initialized<F>(&mut self, cb: F) where F: FnMut(&encoder::video::Video) -> Result<(), FFmpegError> + 'a {

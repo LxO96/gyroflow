@@ -349,6 +349,132 @@ fn should_bake_color<T: PixelType>(bake_color: bool) -> bool {
     bake_color && T::COUNT >= 3
 }
 
+/// Whether `timestamp_us` falls outside every trim range, i.e. this output frame should be
+/// replaced with the configured background rather than real (trimmed-away) content.
+/// Factored out so the trailing frames a temporal window drains after decoding ends
+/// (`timestamp_us` no longer arriving from the decode loop) can compute the same thing the
+/// live per-frame path does.
+fn compute_fill_with_background(pad_with_black: bool, trim_ranges: &[(f64, f64)], duration_ms: f64, timestamp_us: i64) -> bool {
+    pad_with_black && !trim_ranges.is_empty() &&
+        !trim_ranges.iter().any(|x| timestamp_us >= (x.0 * duration_ms * 1000.0).round() as i64 &&
+                                    timestamp_us <= (x.1 * duration_ms * 1000.0).round() as i64)
+}
+
+/// Reborrows a shared frame reference as mutable, for APIs (`data_mut`, `swscale::Context::run`
+/// as the source) that only ever read through it despite requiring `&mut` in their signature.
+///
+/// Needed because the temporal window used for denoising hands out `&Video` for the centre
+/// frame and its references alike - the centre frame doubles as a reference for its
+/// neighbours, so no genuine `&mut` can coexist with those shared borrows. Every call site
+/// here only *reads* through the result; the window's contract (no `push` while an `Emission`
+/// is alive) is what makes that sound despite going through `&mut`.
+///
+/// `rustc`'s `invalid_reference_casting` lint flags the direct `&T as *const T as *mut T`
+/// shape as always-UB regardless of usage, so this is deliberately exempted rather than
+/// worked around - the point of centralising it in one function is that the actual safety
+/// argument (read-only use, no concurrent mutation) lives in exactly one place to audit.
+#[allow(invalid_reference_casting)]
+fn as_mut_video(v: &Video) -> &mut Video {
+    unsafe { &mut *(v as *const Video as *mut Video) }
+}
+
+/// Converts `src` to `target` format, into a freshly-allocated frame. Used only for
+/// temporal-window reference frames that need format conversion before undistortion: unlike
+/// the centre frame (which can reuse `Converter`'s single cached scratch buffer across
+/// calls, since only one is ever alive at a time), every reference has to keep its own
+/// independent buffer alive simultaneously alongside the centre and every other reference -
+/// reusing one shared scratch buffer across them would make each conversion silently
+/// overwrite the last.
+///
+/// Not colour-managed to the same degree as `Converter::convert_pixel_format_color_aware`
+/// (which additionally sets swscale's colourspace/range coefficients): reference frames only
+/// feed the denoise gather kernel's averaging, never the visible output directly, so a small
+/// colour mismatch there is judged an acceptable simplification versus threading that whole
+/// mechanism through a one-off per-reference conversion.
+fn convert_frame_to_format(src: &Video, target: Pixel, interpolation: ffmpeg_next::software::scaling::flag::Flags, full_range: bool) -> Result<Video, FFmpegError> {
+    if src.format() == target {
+        return Ok(src.clone());
+    }
+    let mut out = Video::new(target, src.width(), src.height());
+    if full_range {
+        out.set_color_range(ffmpeg_next::util::color::Range::JPEG);
+    } else {
+        out.set_color_range(src.color_range());
+    }
+    let mut conv = ffmpeg_next::software::scaling::Context::get(src.format(), src.width(), src.height(), target, src.width(), src.height(), interpolation)?;
+    conv.run(as_mut_video(src), &mut out)?;
+    Ok(out)
+}
+
+/// Runs every plane closure over one frame (plus its temporal references) into `output_frame`.
+type PlaneClosures = Vec<Box<dyn FnMut(i64, &Video, &[&Video], &[i64], &mut Video, usize, bool)>>;
+fn run_planes(planes: &mut PlaneClosures, timestamp_us: i64, frame: &Video, references: &[&Video], reference_timestamps: &[i64], out_frame: &mut Video, fill_with_background: bool) {
+    for (i, cb) in planes.iter_mut().enumerate() {
+        (*cb)(timestamp_us, frame, references, reference_timestamps, out_frame, i, fill_with_background);
+    }
+}
+
+/// The per-frame dispatch that used to live inline as the `undistort_frame` closure plus the
+/// `color_convert_to`/format-match block around it. Pulled out to a free function, parameterised
+/// over everything it used to capture, so both the live decode path (`on_frame`) and the
+/// temporal window's drain (`on_finish`, run once decoding has already finished) can call the
+/// exact same logic on a centre frame plus its references.
+#[allow(clippy::too_many_arguments)]
+fn process_and_undistort(
+    planes: &mut PlaneClosures,
+    converter: &mut ffmpeg_video_converter::Converter,
+    color_convert_to: Option<Pixel>,
+    output_range: OutputRange,
+    output_color_space: OutputColorSpace,
+    is_prores_videotoolbox: bool,
+    ffmpeg_interpolation: ffmpeg_next::software::scaling::flag::Flags,
+    timestamp_us: i64,
+    frame: &Video,
+    references: &[&Video],
+    reference_timestamps: &[i64],
+    output_frame: &mut Video,
+    fill_with_background: bool,
+) -> Result<(), FFmpegError> {
+    if let Some(target) = color_convert_to {
+        set_output_range(output_frame, output_range);
+        tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
+        tag_output_color_space(output_frame, output_color_space);
+        let mut owned_refs: Vec<Video> = Vec::with_capacity(references.len());
+        for r in references {
+            owned_refs.push(convert_frame_to_format(r, target, ffmpeg_interpolation, true)?);
+        }
+        let ref_slices: Vec<&Video> = owned_refs.iter().collect();
+        converter.convert_pixel_format_color_aware(as_mut_video(frame), output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
+            run_planes(planes, timestamp_us, converted_frame, &ref_slices, reference_timestamps, converted_output, fill_with_background);
+        })?;
+    } else {
+        match frame.format() {
+            Pixel::VIDEOTOOLBOX | // Pixel::D3D11 |
+            Pixel::NV12 | Pixel::NV21 | Pixel::YUV420P | Pixel::YUVJ420P |
+            Pixel::P010LE | Pixel::P016LE | Pixel::P210LE | Pixel::P216LE | Pixel::P410LE | Pixel::P416LE |
+            Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
+            Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
+            Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE |
+            Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE |
+            Pixel::AYUV64LE | Pixel::GBRAPF32LE | Pixel::GBRPF32LE |
+            Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE => {
+                run_planes(planes, timestamp_us, frame, references, reference_timestamps, output_frame, fill_with_background);
+            },
+            _ => {
+                let mut owned_refs: Vec<Video> = Vec::with_capacity(references.len());
+                for r in references {
+                    owned_refs.push(convert_frame_to_format(r, Pixel::YUV444P16LE, ffmpeg_interpolation, false)?);
+                }
+                let ref_slices: Vec<&Video> = owned_refs.iter().collect();
+                converter.convert_pixel_format(as_mut_video(frame), output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
+                    run_planes(planes, timestamp_us, converted_frame, &ref_slices, reference_timestamps, converted_output, fill_with_background);
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &gyroflow_core::InputFile, render_options: &RenderOptions, gpu_decoder_index: i32, trim_range_ind: Option<usize>, cancel_flag: Arc<AtomicBool>, pause_flag: Arc<AtomicBool>, encoder_initialized: F2) -> Result<(), FFmpegError>
     where F: Fn((f64, usize, usize, bool, bool)) + Send + Sync + Clone,
           F2: Fn(String) + Send + Sync + Clone
@@ -406,7 +532,27 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     if cfg!(target_os = "android") {
         decoder_options.set("ndk_codec", "1");
     }
-    let gpu_decoding = stab.gpu_decoding.load(std::sync::atomic::Ordering::SeqCst);
+    // How many past/future neighbours each output frame is denoised against. Computed from
+    // the *input* frame size (not the output/render size) because that's what the cost of
+    // gathering references scales with. `0` means denoising is off - the window below then
+    // emits every frame immediately, on push, with no reference gathering at all.
+    let denoise_k = {
+        let (w, h) = stab.params.read().size;
+        stab.denoise.read().radius_for_size(w, h)
+    };
+
+    let mut gpu_decoding = stab.gpu_decoding.load(std::sync::atomic::Ordering::SeqCst);
+    if denoise_k > 0 && gpu_decoding {
+        // Ruling 12: reference upload (Task 7) only handles `BufferSource::Cpu`. The
+        // zero-copy GPU-interop sources (D3D11, CUDA, Metal, Vulkan) log and skip
+        // references, which would make denoising silently do nothing on the majority of
+        // exports (GPU decoding is the default) - the user waits through a whole render and
+        // gets an unchanged file back. Forcing CPU decoding here is a modest extra cost
+        // (denoising already pays for a multi-frame gather) in exchange for the feature
+        // actually working.
+        log::info!("Denoising requires CPU-decoded frames (radius {denoise_k}); forcing software decoding for this render.");
+        gpu_decoding = false;
+    }
     let mut proc = FfmpegProcessor::from_file(&input_file.url, gpu_decoding && gpu_decoder_index >= 0, gpu_decoder_index as usize, Some(decoder_options))?;
 
     let render_options_dict = render_options.get_encoder_options_dict();
@@ -584,7 +730,10 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
 
     log::debug!("start_us: {}, render_duration: {}, render_frame_count: {}", start_us, render_duration, render_frame_count);
 
-    let mut planes = Vec::<Box<dyn FnMut(i64, &mut Video, &mut Video, usize, bool)>>::new();
+    // Shared between the live decode path (`on_frame`) and the drain of the temporal
+    // window's tail (`on_finish`), which runs as a separate closure after decoding has
+    // already finished - see `process_and_undistort`.
+    let planes: Rc<RefCell<PlaneClosures>> = Rc::new(RefCell::new(Vec::new()));
 
     // Colour adjustments are baked into the render only when the user asked for it.
     // Read once, so the decision (and the pixel format it implies) cannot change between
@@ -605,19 +754,47 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     let output_range = stab.color.read().output_range;
     // The packed RGB format the source must be converted to for the colour stage, decided
     // once when the planes are built and reused by the per-frame dispatch below, so the two
-    // cannot disagree about the layout the closures were built for.
-    let mut color_convert_to: Option<Pixel> = None;
+    // cannot disagree about the layout the closures were built for. `Cell` (not a plain
+    // `Option`) for the same reason `planes` is behind an `Rc<RefCell<_>>`: `on_finish`'s
+    // drain needs to read the value the first `on_frame` call settled on.
+    let color_convert_to: Rc<std::cell::Cell<Option<Pixel>>> = Rc::new(std::cell::Cell::new(None));
 
     let is_prores_videotoolbox = proc.video_codec.as_deref() == Some("prores_videotoolbox");
 
     let progress2 = progress.clone();
-    let mut process_frame = 0;
+    let progress_finish = progress.clone();
+    // `Rc<Cell<_>>` rather than a plain local: the drain (`on_finish`) needs to keep counting
+    // from wherever the live decode path left off, and to remain accurate for the progress
+    // report on both sides, it counts *emitted* frames (see the `on_frame`/`on_finish` bodies
+    // below) rather than decoded ones - with output delayed by `denoise_k`, counting decoded
+    // frames would run `denoise_k` ahead and finish short of 100%.
+    let process_frame = Rc::new(std::cell::Cell::new(0usize));
     if let Some(i) = trim_range_ind {
         for x in 0..i {
             let x = org_trim_ranges[x];
-            process_frame += ((x.1 - x.0) * total_frame_count as f64).round() as usize;
+            process_frame.set(process_frame.get() + ((x.1 - x.0) * total_frame_count as f64).round() as usize);
         }
     }
+
+    // Delays output by `denoise_k` frames so each denoised frame sees both its past and
+    // future neighbours; see `temporal_window`. `denoise_k == 0` (denoising off) makes the
+    // window emit every frame immediately on push, with an empty reference list - the
+    // existing undenoised path, unchanged.
+    let window: Rc<RefCell<temporal_window::TemporalWindow<Video>>> = Rc::new(RefCell::new(temporal_window::TemporalWindow::new(denoise_k)));
+    let window_finish = window.clone();
+    let planes_finish = planes.clone();
+    let color_convert_to_finish = color_convert_to.clone();
+    let process_frame_finish = process_frame.clone();
+    let trim_ranges_finish = trim_ranges.clone();
+    let pad_with_black_finish = render_options.pad_with_black;
+    // Owns the buffer the drain writes denoised pixels into before encoding. Deliberately
+    // *not* `vt.buffers.output_frame_pre`/`output_frame_post` (the live path's buffer):
+    // `encode_extra_frame` needs `&mut VideoTranscoder` to reach the encoder, and that
+    // buffer is itself a field of `VideoTranscoder` - passing a borrow derived from `vt`
+    // back into a method that also wants `&mut vt` doesn't borrow-check. A fully independent
+    // owned frame avoids that self-borrow; it's (re)sized to match the live buffer's
+    // format/dimensions the first time the drain runs.
+    let drain_output_frame: Rc<RefCell<Option<Video>>> = Rc::new(RefCell::new(None));
 
     proc.on_encoder_initialized(|enc: &ffmpeg_next::encoder::video::Video| {
         encoder_initialized(enc.codec().map(|x| x.name().to_string()).unwrap_or_default());
@@ -636,10 +813,6 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     let render_globals = Rc::new(RefCell::new(zero_copy::RenderGlobals::default()));
 
     proc.on_frame(move |mut timestamp_us, input_frame, output_frame, converter, rate_control| {
-        let fill_with_background = render_options.pad_with_black && !trim_ranges.is_empty() &&
-            !trim_ranges.iter().any(|x| timestamp_us >= (x.0 * duration_ms * 1000.0).round() as i64 &&
-                                        timestamp_us <= (x.1 * duration_ms * 1000.0).round() as i64);
-
         if let Some(scale) = fps_scale {
             timestamp_us = (timestamp_us as f64 / scale).round() as i64;
         }
@@ -651,7 +824,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             prev_real_ts = rate_control.out_timestamp_us;
             if ramped_ts < (final_ts as f64 + interval as f64 / 2.0) { // interval/2 because we want frame in the middle of the range, not in the end
                 rate_control.repeat_times = 0; // skip this frame
-                process_frame += 1;
+                process_frame.set(process_frame.get() + 1);
                 return Ok(());
             } else {
                 let repeat_times = current_interval / interval as f64;
@@ -711,22 +884,25 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     plane.set_compute_params(compute_params);
                     let render_globals = render_globals.clone();
                     let denoise = stab.denoise.clone();
-                    $planes.push(Box::new(move |timestamp_us: i64, in_frame_data: &mut Video, out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
+                    $planes.borrow_mut().push(Box::new(move |timestamp_us: i64, in_frame_data: &Video, references: &[&Video], reference_timestamps: &[i64], out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
                         let mut g = render_globals.borrow_mut();
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
                         let timestamp_us = timestamp_us + offset_us;
 
                         let mut buffers = Buffers {
-                            input:  get_plane_buffer(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
+                            input:  get_plane_buffer_ref(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
                             output: get_plane_buffer(out_frame_data, out_size, plane_index, &mut g, wgpu_format),
-                            references: Vec::new(),
+                            references: references.iter().map(|r| {
+                                let ref_size = zero_copy::get_plane_size(*r, plane_index);
+                                get_plane_buffer_ref(*r, ref_size, plane_index, &mut g, wgpu_format)
+                            }).collect(),
                         };
 
                         if plane.initialized_backend.is_none() || plane.pending_device_change.is_some() {
                             plane.ensure_ready_for_processing::<$t>(timestamp_us, None, &mut buffers);
                             plane.stab_data.clear();
                         }
-                        let mut transform = plane.get_frame_transform_at::<$t>(timestamp_us, None, &mut buffers);
+                        let mut transform = plane.get_frame_transform_with_references::<$t>(timestamp_us, reference_timestamps, None, &buffers);
                         transform.kernel_params.pixel_value_limit = $max_val;
                         transform.kernel_params.max_pixel_value = $max_val;
                         if plane.initialized_backend.is_wgpu() && $t::wgpu_format().map(|x| x.2).unwrap_or_default() {
@@ -746,7 +922,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             };
         }
 
-        if planes.is_empty() {
+        if planes.borrow().is_empty() {
             // Good reference about video formats: https://source.chromium.org/chromium/chromium/src/+/master:media/base/video_frame.cc
             // https://gist.github.com/Jim-Bar/3cbba684a71d1a9d468a6711a6eddbeb
 
@@ -770,8 +946,8 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     ::log::warn!("Colour baking is not supported for hardware frames ({:?}); rendering without colour adjustments", input_frame.format());
                     bake_color = false;
                 } else {
-                    color_convert_to = packed_color_format(format);
-                    if color_convert_to.is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA) {
+                    color_convert_to.set(packed_color_format(format));
+                    if color_convert_to.get().is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA) {
                         // `packed_color_format` also returns `None` when swscale cannot
                         // handle the format, and those sources dispatch to 3- and 4-channel
                         // plane types that `should_bake_color` would happily grade - as YUV,
@@ -783,7 +959,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 }
             }
 
-            if let Some(target) = color_convert_to {
+            if let Some(target) = color_convert_to.get() {
                 // Baking: the colour stage grades R, G and B of one pixel at once, so the
                 // frame it sees must be packed RGB. `packed_color_format` picks the target
                 // and guarantees it is one of these two.
@@ -892,52 +1068,92 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 }
             }
         }
-        if planes.is_empty() {
+        if planes.borrow().is_empty() {
             return Err(FFmpegError::UnknownPixelFormat(input_frame.format()));
         }
 
-        let mut undistort_frame = |frame: &mut Video, out_frame: &mut Video| {
-            for (i, cb) in planes.iter_mut().enumerate() {
-                (*cb)(timestamp_us, frame, out_frame, i, fill_with_background);
+        // Delayed by `denoise_k` frames so each output frame sees both its past and future
+        // neighbours (see `temporal_window`). `denoise_k == 0` makes every `push` emit
+        // immediately with an empty reference list - the existing undenoised path, unchanged.
+        match window.borrow_mut().push(timestamp_us, input_frame.clone()) {
+            Some(emission) => {
+                rate_control.out_timestamp_us = emission.centre_ts;
+                let fill_with_background = compute_fill_with_background(render_options.pad_with_black, &trim_ranges, duration_ms, emission.centre_ts);
+                process_and_undistort(
+                    &mut planes.borrow_mut(),
+                    converter,
+                    color_convert_to.get(),
+                    output_range,
+                    output_color_space,
+                    is_prores_videotoolbox,
+                    ffmpeg_interpolation,
+                    emission.centre_ts,
+                    emission.centre,
+                    &emission.references,
+                    &emission.reference_timestamps,
+                    output_frame,
+                    fill_with_background,
+                )?;
+                process_frame.set(process_frame.get() + 1);
+                progress2((process_frame.get() as f64 / render_frame_count as f64, process_frame.get(), render_frame_count, false, false));
             }
-            progress2((process_frame as f64 / render_frame_count as f64, process_frame, render_frame_count, false, false));
-        };
-
-        if let Some(target) = color_convert_to {
-            // The plane closures above were built for this converted packed RGB frame, so
-            // the frame handed to them must go through the same conversion. `color_convert_to`
-            // is the one value both decisions read, so they cannot disagree.
-            set_output_range(output_frame, output_range);
-            tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
-            tag_output_color_space(output_frame, output_color_space);
-            converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
-                undistort_frame(converted_frame, converted_output);
-            })?;
-        } else {
-            match input_frame.format() {
-                Pixel::VIDEOTOOLBOX | // Pixel::D3D11 |
-                Pixel::NV12 | Pixel::NV21 | Pixel::YUV420P | Pixel::YUVJ420P |
-                Pixel::P010LE | Pixel::P016LE | Pixel::P210LE | Pixel::P216LE | Pixel::P410LE | Pixel::P416LE |
-                Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
-                Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
-                Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE |
-                Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE |
-                Pixel::AYUV64LE | Pixel::GBRAPF32LE | Pixel::GBRPF32LE |
-                Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE => {
-                    undistort_frame(input_frame, output_frame)
-                },
-                _ => {
-                    converter.convert_pixel_format(input_frame, output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
-                        undistort_frame(converted_frame, converted_output);
-                    })?;
-                }
+            None => {
+                // The window is still filling (or, with `denoise_k == 0`, this branch never
+                // happens at all): nothing new was written into `output_frame` this call, so
+                // suppress the encode for this decoded frame - the same lever the frame-rate
+                // conversion path above uses to skip a frame.
+                rate_control.repeat_times = 0;
             }
         }
 
-        process_frame += 1;
-        // log::debug!("process_frame: {}, timestamp_us: {}", process_frame, timestamp_us);
-
         Ok(())
+    });
+
+    proc.on_finish(move |vt, rate_control, octx, ost_time_bases| {
+        // The last `denoise_k` frames are still in the window's ring: without this they are
+        // silently dropped and the output is `denoise_k` frames short of the input - a
+        // failure that is very easy to miss, since the file still plays fine.
+        let mut result = Ok(());
+        window_finish.borrow_mut().drain_each(|emission| {
+            if result.is_err() { return; }
+            let outcome = (|| -> Result<(), FFmpegError> {
+                let mut buf_cell = drain_output_frame.borrow_mut();
+                if buf_cell.is_none() {
+                    let template = vt.output_frame_template().ok_or(FFmpegError::FrameEmpty)?;
+                    let mut nf = Video::new(template.format(), template.width(), template.height());
+                    nf.set_color_range(template.color_range());
+                    *buf_cell = Some(nf);
+                }
+                let output_frame = buf_cell.as_mut().unwrap();
+
+                rate_control.out_timestamp_us = emission.centre_ts;
+                rate_control.repeat_times = 1;
+                let fill_with_background = compute_fill_with_background(pad_with_black_finish, &trim_ranges_finish, duration_ms, emission.centre_ts);
+                process_and_undistort(
+                    &mut planes_finish.borrow_mut(),
+                    &mut vt.converter,
+                    color_convert_to_finish.get(),
+                    output_range,
+                    output_color_space,
+                    is_prores_videotoolbox,
+                    ffmpeg_interpolation,
+                    emission.centre_ts,
+                    emission.centre,
+                    &emission.references,
+                    &emission.reference_timestamps,
+                    output_frame,
+                    fill_with_background,
+                )?;
+                vt.encode_extra_frame(output_frame, rate_control, octx, ost_time_bases)?;
+                process_frame_finish.set(process_frame_finish.get() + 1);
+                progress_finish((process_frame_finish.get() as f64 / render_frame_count as f64, process_frame_finish.get(), render_frame_count, false, false));
+                Ok(())
+            })();
+            if let Err(e) = outcome {
+                result = Err(e);
+            }
+        });
+        result
     });
 
     let mut filename = render_options.output_filename.clone();
