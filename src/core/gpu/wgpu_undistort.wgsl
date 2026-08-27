@@ -701,6 +701,13 @@ fn sample_bilinear_at(uv: vec2<f32>, frame: u32) -> vec4<f32> {
             if (sy >= params.source_rect.y && sy < params.source_rect.y + params.source_rect.w &&
                 sx >= params.source_rect.x && sx < params.source_rect.x + params.source_rect.z) {
                 pixel = read_input_at(vec2<i32>(sx, sy), frame);
+                // The centre sample's taps stamp the drawing overlay too. It is
+                // indexed by canvas position and is frame-independent, so stamping it
+                // identically here makes centre and reference differ by exactly zero
+                // in stroke pixels - the weight becomes 1.0 and the stroke survives.
+                // Skipping it would make the rejection react to overlay content and
+                // fade the user's own brush strokes toward the un-stroked references.
+                pixel = draw_pixel(pixel, u32(sx), u32(sy), true);
             } else {
                 pixel = bg;
             }
