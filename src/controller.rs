@@ -91,6 +91,10 @@ pub struct Controller {
     set_output_range: qt_method!(fn(&mut self, id: QString)),
     get_output_ranges: qt_method!(fn(&self) -> QJsonArray),
     get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
+    set_denoise_param: qt_method!(fn(&self, name: QString, val: f64)),
+    set_denoise_enabled: qt_method!(fn(&self, enabled: bool)),
+    set_denoise_quality: qt_method!(fn(&self, id: QString)),
+    get_denoise_quality: qt_method!(fn(&self) -> QString),
     set_horizon_lock: qt_method!(fn(&self, lock_percent: f64, roll: f64, lock_pitch: bool, pitch: f64, automatic_lock: bool, turn_threshold: f64, turn_smoothing_ms: f64, turn_multiplier: f64, tilt_accel_limit: f64)),
     get_turn_speed: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
     get_x_angle: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
@@ -1261,6 +1265,42 @@ impl Controller {
             return;
         }
         self.request_recompute();
+    }
+
+    // Denoising is a render-only parameter in exactly the sense colour is: it changes pixels
+    // but not the stabilization maths, so it reaches the kernels only through `ComputeParams`
+    // (compute_params.rs clones `mgr.denoise`) and `request_recompute()` is the one thing that
+    // installs a fresh `ComputeParams`. Without it the preview keeps the old settings and the
+    // panel looks dead. Each setter recomputes on success only - a rejected value changed
+    // nothing, so re-rendering would be pure waste.
+    fn set_denoise_param(&mut self, name: QString, val: f64) {
+        let name = name.to_string();
+        if !self.stabilizer.denoise.write().set_param(&name, val) {
+            ::log::warn!("Rejected denoise parameter: {name} = {val}");
+            return;
+        }
+        self.request_recompute();
+    }
+
+    fn set_denoise_enabled(&mut self, enabled: bool) {
+        self.stabilizer.denoise.write().enabled = enabled;
+        self.request_recompute();
+    }
+
+    fn set_denoise_quality(&mut self, id: QString) {
+        let id = id.to_string();
+        match core::denoise::DenoiseQuality::from_id(&id) {
+            Some(q) => { self.stabilizer.denoise.write().quality = q; }
+            // An unrecognised id is ignored rather than reset to the default: QML builds the
+            // dropdown from these ids and should never send another one, and silently changing
+            // the user's choice would be worse than doing nothing.
+            None => { ::log::warn!("Unknown denoise quality: {id}"); return; }
+        }
+        self.request_recompute();
+    }
+
+    fn get_denoise_quality(&self) -> QString {
+        QString::from(self.stabilizer.denoise.read().quality.id())
     }
 
     /// Solve temperature and tint from a region of the preview the user says should be grey.
