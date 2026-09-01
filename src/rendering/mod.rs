@@ -360,6 +360,26 @@ fn compute_fill_with_background(pad_with_black: bool, trim_ranges: &[(f64, f64)]
                                     timestamp_us <= (x.1 * duration_ms * 1000.0).round() as i64)
 }
 
+/// A decoded frame plus the two per-frame values that must travel with it through the
+/// temporal window.
+///
+/// Emission is delayed by `k` frames, so anything derived from the frame's own position in
+/// the timeline has to be captured at push time and restored at emit time. Recomputing
+/// either from the *centre* timestamp at emit time is wrong:
+///
+/// - `out_ts` is the normalised output PTS (`ffmpeg_video.rs` builds it as
+///   `ts - frame_ts.first + frame_ts.add_video`, then applies the speed ramp on top). The
+///   window's `centre_ts` is the raw decoder timestamp - a *different domain*. Substituting
+///   one for the other is a no-op on an untrimmed, unscaled, single-range clip and silently
+///   shifts or breaks every other export.
+/// - `fill_bg` is compared against `trim_ranges`, which are fractions of the *unscaled*
+///   duration, so it must be computed before the `fps_scale` division.
+struct WindowFrame {
+    out_ts: i64,
+    fill_bg: bool,
+    frame: Video,
+}
+
 /// Reborrows a shared frame reference as mutable, for APIs (`data_mut`, `swscale::Context::run`
 /// as the source) that only ever read through it despite requiring `&mut` in their signature.
 ///
@@ -777,16 +797,13 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     }
 
     // Delays output by `denoise_k` frames so each denoised frame sees both its past and
-    // future neighbours; see `temporal_window`. `denoise_k == 0` (denoising off) makes the
-    // window emit every frame immediately on push, with an empty reference list - the
-    // existing undenoised path, unchanged.
-    let window: Rc<RefCell<temporal_window::TemporalWindow<Video>>> = Rc::new(RefCell::new(temporal_window::TemporalWindow::new(denoise_k)));
+    // future neighbours; see `temporal_window`. At `denoise_k == 0` the window is bypassed
+    // entirely (see `on_frame`), so denoising off costs neither a clone nor a delay.
+    let window: Rc<RefCell<temporal_window::TemporalWindow<WindowFrame>>> = Rc::new(RefCell::new(temporal_window::TemporalWindow::new(denoise_k)));
     let window_finish = window.clone();
     let planes_finish = planes.clone();
     let color_convert_to_finish = color_convert_to.clone();
     let process_frame_finish = process_frame.clone();
-    let trim_ranges_finish = trim_ranges.clone();
-    let pad_with_black_finish = render_options.pad_with_black;
     // Owns the buffer the drain writes denoised pixels into before encoding. Deliberately
     // *not* `vt.buffers.output_frame_pre`/`output_frame_post` (the live path's buffer):
     // `encode_extra_frame` needs `&mut VideoTranscoder` to reach the encoder, and that
@@ -813,6 +830,10 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     let render_globals = Rc::new(RefCell::new(zero_copy::RenderGlobals::default()));
 
     proc.on_frame(move |mut timestamp_us, input_frame, output_frame, converter, rate_control| {
+        // Computed before the `fps_scale` division below, because `trim_ranges` are
+        // fractions of the unscaled duration.
+        let fill_with_background = compute_fill_with_background(render_options.pad_with_black, &trim_ranges, duration_ms, timestamp_us);
+
         if let Some(scale) = fps_scale {
             timestamp_us = (timestamp_us as f64 / scale).round() as i64;
         }
@@ -1072,13 +1093,42 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             return Err(FFmpegError::UnknownPixelFormat(input_frame.format()));
         }
 
+        if denoise_k == 0 {
+            // Denoising off: render the frame as it arrives, exactly as before this feature
+            // existed. No window, and - importantly - no `input_frame.clone()`, which would
+            // otherwise cost a full `av_frame_get_buffer` + `av_frame_copy` (~12 MB/frame at
+            // 4K 8-bit 4:2:0) on every export for nothing, and cannot copy a hardware frame
+            // at all. `rate_control.out_timestamp_us` keeps the value `ffmpeg_video.rs`
+            // computed for it.
+            process_and_undistort(
+                &mut planes.borrow_mut(),
+                converter,
+                color_convert_to.get(),
+                output_range,
+                output_color_space,
+                is_prores_videotoolbox,
+                ffmpeg_interpolation,
+                timestamp_us,
+                input_frame,
+                &[],
+                &[],
+                output_frame,
+                fill_with_background,
+            )?;
+            process_frame.set(process_frame.get() + 1);
+            progress2((process_frame.get() as f64 / render_frame_count as f64, process_frame.get(), render_frame_count, false, false));
+            return Ok(());
+        }
+
         // Delayed by `denoise_k` frames so each output frame sees both its past and future
-        // neighbours (see `temporal_window`). `denoise_k == 0` makes every `push` emit
-        // immediately with an empty reference list - the existing undenoised path, unchanged.
-        match window.borrow_mut().push(timestamp_us, input_frame.clone()) {
+        // neighbours (see `temporal_window`). `out_ts` and `fill_bg` are captured here and
+        // restored on emission - see `WindowFrame` for why recomputing them from the centre
+        // timestamp is wrong.
+        let item = WindowFrame { out_ts: rate_control.out_timestamp_us, fill_bg: fill_with_background, frame: input_frame.clone() };
+        match window.borrow_mut().push(timestamp_us, item) {
             Some(emission) => {
-                rate_control.out_timestamp_us = emission.centre_ts;
-                let fill_with_background = compute_fill_with_background(render_options.pad_with_black, &trim_ranges, duration_ms, emission.centre_ts);
+                rate_control.out_timestamp_us = emission.centre.out_ts;
+                let references: Vec<&Video> = emission.references.iter().map(|r| &r.frame).collect();
                 process_and_undistort(
                     &mut planes.borrow_mut(),
                     converter,
@@ -1088,20 +1138,19 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     is_prores_videotoolbox,
                     ffmpeg_interpolation,
                     emission.centre_ts,
-                    emission.centre,
-                    &emission.references,
+                    &emission.centre.frame,
+                    &references,
                     &emission.reference_timestamps,
                     output_frame,
-                    fill_with_background,
+                    emission.centre.fill_bg,
                 )?;
                 process_frame.set(process_frame.get() + 1);
                 progress2((process_frame.get() as f64 / render_frame_count as f64, process_frame.get(), render_frame_count, false, false));
             }
             None => {
-                // The window is still filling (or, with `denoise_k == 0`, this branch never
-                // happens at all): nothing new was written into `output_frame` this call, so
-                // suppress the encode for this decoded frame - the same lever the frame-rate
-                // conversion path above uses to skip a frame.
+                // The window is still filling: nothing new was written into `output_frame`
+                // this call, so suppress the encode for this decoded frame - the same lever
+                // the frame-rate conversion path above uses to skip a frame.
                 rate_control.repeat_times = 0;
             }
         }
@@ -1126,9 +1175,9 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 }
                 let output_frame = buf_cell.as_mut().unwrap();
 
-                rate_control.out_timestamp_us = emission.centre_ts;
+                rate_control.out_timestamp_us = emission.centre.out_ts;
                 rate_control.repeat_times = 1;
-                let fill_with_background = compute_fill_with_background(pad_with_black_finish, &trim_ranges_finish, duration_ms, emission.centre_ts);
+                let references: Vec<&Video> = emission.references.iter().map(|r| &r.frame).collect();
                 process_and_undistort(
                     &mut planes_finish.borrow_mut(),
                     &mut vt.converter,
@@ -1138,11 +1187,11 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     is_prores_videotoolbox,
                     ffmpeg_interpolation,
                     emission.centre_ts,
-                    emission.centre,
-                    &emission.references,
+                    &emission.centre.frame,
+                    &references,
                     &emission.reference_timestamps,
                     output_frame,
-                    fill_with_background,
+                    emission.centre.fill_bg,
                 )?;
                 vt.encode_extra_frame(output_frame, rate_control, octx, ost_time_bases)?;
                 process_frame_finish.set(process_frame_finish.get() + 1);
