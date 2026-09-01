@@ -921,6 +921,13 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                         let mut g = render_globals.borrow_mut();
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
                         let timestamp_us = timestamp_us + offset_us;
+                        // The references go through the same `get_frame_transform_at`, in the same
+                        // timestamp domain, so the frame offset has to apply to them too. Shifting
+                        // only the centre warps every reference with `frame_offset` frames' worth of
+                        // stale camera orientation, which on a pan lands them tens of pixels away:
+                        // the rejection weight then discards them in textured areas and blends them
+                        // into directional smearing in flat ones.
+                        let reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
                         let mut buffers = Buffers {
                             input:  get_plane_buffer_ref(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
@@ -935,7 +942,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                             plane.ensure_ready_for_processing::<$t>(timestamp_us, None, &mut buffers);
                             plane.stab_data.clear();
                         }
-                        let mut transform = plane.get_frame_transform_with_references::<$t>(timestamp_us, reference_timestamps, None, &buffers);
+                        let mut transform = plane.get_frame_transform_with_references::<$t>(timestamp_us, &reference_timestamps, None, &buffers);
                         transform.kernel_params.pixel_value_limit = $max_val;
                         transform.kernel_params.max_pixel_value = $max_val;
                         if plane.initialized_backend.is_wgpu() && $t::wgpu_format().map(|x| x.2).unwrap_or_default() {
