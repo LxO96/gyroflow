@@ -406,22 +406,34 @@ fn as_mut_video(v: &Video) -> &mut Video {
 /// reusing one shared scratch buffer across them would make each conversion silently
 /// overwrite the last.
 ///
-/// Not colour-managed to the same degree as `Converter::convert_pixel_format_color_aware`
-/// (which additionally sets swscale's colourspace/range coefficients): reference frames only
-/// feed the denoise gather kernel's averaging, never the visible output directly, so a small
-/// colour mismatch there is judged an acceptable simplification versus threading that whole
-/// mechanism through a one-off per-reference conversion.
-fn convert_frame_to_format(src: &Video, target: Pixel, interpolation: ffmpeg_next::software::scaling::flag::Flags, full_range: bool) -> Result<Video, FFmpegError> {
+/// `color_aware` mirrors `Converter::convert_pixel_format_color_aware` vs
+/// `convert_pixel_format`, and must match whichever one the *centre* frame goes through -
+/// the gather compares references against the centre by value, so the two have to land in
+/// the same value space. Getting this wrong does not merely tint the references: the
+/// rejection Gaussian measures the difference between a reference and the centre, so a
+/// systematic offset makes it reject them. On BT.709 footage swscale's default (601)
+/// coefficients diverge only on saturated colour, which would switch denoising off on
+/// coloured areas while leaving it working on grey; on a full-range source tagged
+/// `Range::JPEG` (see `ffmpeg_video.rs`'s retagging), a default `srcRange = 0` applies a
+/// ~1.16 gain about black to every reference pixel and rejects all of them, leaving a
+/// gather that costs full price and does nothing.
+fn convert_frame_to_format(src: &Video, target: Pixel, interpolation: ffmpeg_next::software::scaling::flag::Flags, color_aware: bool) -> Result<Video, FFmpegError> {
     if src.format() == target {
         return Ok(src.clone());
     }
     let mut out = Video::new(target, src.width(), src.height());
-    if full_range {
+    let mut conv = ffmpeg_next::software::scaling::Context::get(src.format(), src.width(), src.height(), target, src.width(), src.height(), interpolation)?;
+    if color_aware {
+        // The intermediate is packed RGB, which is full range by convention - the same
+        // reasoning, and the same arguments, as the centre frame's conversion.
         out.set_color_range(ffmpeg_next::util::color::Range::JPEG);
+        unsafe { ffmpeg_video_converter::Converter::set_color_details(&mut conv, src.color_space(), src.color_range(), out.color_range()); }
     } else {
+        // The unknown-format -> YUV444P16LE fallback is YUV->YUV and round-trips through
+        // swscale's defaults on the centre frame too, so leaving the context unconfigured
+        // is what keeps the two sides matched here.
         out.set_color_range(src.color_range());
     }
-    let mut conv = ffmpeg_next::software::scaling::Context::get(src.format(), src.width(), src.height(), target, src.width(), src.height(), interpolation)?;
     conv.run(as_mut_video(src), &mut out)?;
     Ok(out)
 }
