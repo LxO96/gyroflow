@@ -175,9 +175,7 @@ impl WgpuWrapper {
 
         let in_size = (buffers.input.size.2 * buffers.input.size.1) as wgpu::BufferAddress;
         let out_size = (buffers.output.size.2 * buffers.output.size.1) as wgpu::BufferAddress;
-        // 7 = the largest 2k+1 any quality tier asks for (DenoiseQuality::High).
-        const MAX_REFERENCE_FRAMES: usize = 7;
-        let params_size = (max_matrix_count * MAX_REFERENCE_FRAMES * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
+        let params_size = (max_matrix_count * super::MAX_GATHER_FRAMES * std::mem::size_of::<f32>()) as wgpu::BufferAddress;
 
         let drawing_enabled = (params.flags & 8) == 8;
 
@@ -292,8 +290,11 @@ impl WgpuWrapper {
             let backend = adapter.get_info().backend;
             // The centre frame is layer 0; any temporal references follow it, so the
             // texture (and, where the backend allocates one directly, the buffer) must
-            // be sized for all of them up front - it is not resized per-frame.
-            let in_array_layers = 1 + buffers.references.len() as u32;
+            // be sized for all of them up front - it is not resized per-frame. Sized for
+            // the largest window rather than for this emission's reference count, which
+            // varies across a clip while this wrapper is built once - see
+            // `super::MAX_GATHER_FRAMES`.
+            let in_array_layers = if buffers.references.is_empty() { 1 } else { super::MAX_GATHER_FRAMES as u32 };
             let in_texture = init_texture(&device, backend, &buffers.input, wgpu_format.0, true, in_array_layers);
             let out_texture = init_texture(&device, backend, &buffers.output, wgpu_format.0, false, 1);
 
@@ -527,12 +528,17 @@ impl WgpuWrapper {
                 }
             } else if let Some(in_buf) = self.in_texture.wgpu_buffer.as_ref() {
                 let capacity = in_buf.size();
-                if capacity < in_size * (1 + buffers.references.len()) as u64 {
-                    log::error!("Reference frame buffer too small for {} references ({} < {})", buffers.references.len(), capacity, in_size * (1 + buffers.references.len()) as u64);
+                // `read_input_at`'s buffer branch steps between frames by
+                // `params.height * stride_px`, which is not the same as this plane's own
+                // frame size on a subsampled plane - see `super::reference_frame_pitch`.
+                let pitch = super::reference_frame_pitch(&itm.kernel_params, &buffers.input, in_size as usize) as u64;
+                let required = pitch * (1 + buffers.references.len()) as u64;
+                if capacity < required {
+                    log::error!("Reference frame buffer too small for {} references ({} < {})", buffers.references.len(), capacity, required);
                 } else {
                     for (i, r) in buffers.references.iter().enumerate() {
                         if let BufferSource::Cpu { buffer } = &r.data {
-                            self.queue.write_buffer(in_buf, (i as u64 + 1) * in_size, bytemuck::cast_slice(buffer));
+                            self.queue.write_buffer(in_buf, (i as u64 + 1) * pitch, bytemuck::cast_slice(buffer));
                         } else {
                             log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will be missing this frame");
                         }

@@ -11,8 +11,32 @@ pub mod wgpu_interop;
 #[cfg(target_os = "windows")]                            pub mod wgpu_interop_directx;
 #[cfg(any(target_os = "windows", target_os = "linux"))]  pub mod wgpu_interop_cuda;
 
-pub mod drawing;
-use std::hash::Hasher;
+pub mod drawing;
+use std::hash::Hasher;
+
+/// Frames an input allocation must hold when temporal denoising is active: the largest
+/// `2k + 1` any quality tier asks for (`DenoiseQuality::High`, k = 3).
+///
+/// Deliberately not `1 + buffers.references.len()`. That count *varies* across a clip -
+/// the temporal window has fewer neighbours to offer at the head and tail than in the
+/// middle - while a GPU wrapper is built once and then reused for every frame, so sizing
+/// it from whichever emission happened to arrive first leaves it too small for the rest.
+pub const MAX_GATHER_FRAMES: usize = 7;
+
+/// Byte pitch between consecutive frames inside a temporal-gather input allocation.
+///
+/// Both kernels step between reference frames with `frame * params.height * params.stride`,
+/// and `KernelParams::height` is the *canvas* (luma) height on every plane - a subsampled
+/// chroma plane's own buffer is only `input.size.1` rows tall, so its true frame size is
+/// half of what the kernel steps by. Laying the frames out at the kernel's pitch is what
+/// makes host and kernel agree; the unwritten rows at the tail of each slot are never read
+/// back, because every sample the kernel takes is bounded by `source_rect`.
+///
+/// The `max` guards the other direction: a CPU buffer carrying trailing padding beyond
+/// `height * stride` would otherwise have consecutive frames overlap.
+pub fn reference_frame_pitch(params: &crate::stabilization::KernelParams, input: &BufferDescription, centre_len: usize) -> usize {
+    (params.height as usize * params.stride as usize).max(centre_len).max(input.size.1 * input.size.2)
+}
 
 /// The rust-gpu colour stage must be arithmetically identical to `crate::color::apply_color`.
 /// `stabilize_spirv` is a path dependency with `crate-type = ["lib", "dylib"]`, so the very
@@ -371,8 +395,70 @@ impl<'a> Buffers<'a> {
         let mut hasher = crc32fast::Hasher::new();
         hasher.write_u32(self.input.get_checksum());
         hasher.write_u32(self.output.get_checksum());
-        hasher.write_usize(self.references.len());
+        // Only *whether* references are present, not how many. The count varies over a
+        // clip - the window has fewer neighbours to offer at the head and tail than in
+        // the middle - and this checksum keys the cached GPU wrapper. Hashing the exact
+        // count would rebuild (and recompile) the whole pipeline several times per
+        // render; the wrapper is instead sized once for `MAX_GATHER_FRAMES`.
+        hasher.write_u8(!self.references.is_empty() as u8);
         hasher.finalize()
+    }
+}
+
+
+#[cfg(test)]
+mod reference_layout_tests {
+    use super::*;
+    use crate::stabilization::KernelParams;
+
+    fn desc(w: usize, h: usize, stride: usize) -> BufferDescription<'static> {
+        BufferDescription { size: (w, h, stride), rect: None, rotation: None, data: BufferSource::None, texture_copy: false }
+    }
+
+    /// The kernels step between reference frames by `params.height * params.stride`, and
+    /// `KernelParams::height` is the canvas (luma) height on *every* plane. A 4:2:0 chroma
+    /// plane is only half that tall, so pitching its reference frames by its own frame size
+    /// puts every frame after the first at the wrong offset - and the last one past the end
+    /// of the allocation, which an OpenCL driver reports as `CL_OUT_OF_RESOURCES`.
+    #[test]
+    fn pitch_follows_the_kernel_not_the_plane_on_subsampled_planes() {
+        let mut params = KernelParams::default();
+        params.height = 2160; // canvas height, shared by all planes
+        params.stride = 1920; // this chroma plane's own stride
+
+        let chroma = desc(1920, 1080, 1920);
+        let plane_frame_bytes = 1080 * 1920;
+
+        assert_eq!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), 2160 * 1920);
+        assert_ne!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), plane_frame_bytes,
+                   "pitching by the plane's own frame size is the bug this guards against");
+    }
+
+    /// On the luma plane the two definitions coincide; the helper must not inflate it.
+    #[test]
+    fn pitch_is_exact_on_the_luma_plane() {
+        let mut params = KernelParams::default();
+        params.height = 2160;
+        params.stride = 3840;
+        assert_eq!(reference_frame_pitch(&params, &desc(3840, 2160, 3840), 2160 * 3840), 2160 * 3840);
+    }
+
+    /// A CPU buffer carrying padding beyond `height * stride` must still get frames that
+    /// do not overlap.
+    #[test]
+    fn pitch_never_lets_frames_overlap_a_padded_buffer() {
+        let mut params = KernelParams::default();
+        params.height = 1080;
+        params.stride = 1920;
+        let padded = 1080 * 1920 + 4096;
+        assert!(reference_frame_pitch(&params, &desc(1920, 1080, 1920), padded) >= padded);
+    }
+
+    /// The largest window any quality tier asks for is `2k + 1` at k = 3. Both backends
+    /// size their allocations from this, so it must stay in step with `DenoiseQuality`.
+    #[test]
+    fn max_gather_frames_covers_the_highest_quality_tier() {
+        assert_eq!(MAX_GATHER_FRAMES, 2 * crate::denoise::DenoiseQuality::High.radius() + 1);
     }
 }
 
