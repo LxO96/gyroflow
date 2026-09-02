@@ -50,8 +50,8 @@ layout(std140, binding = 2) uniform KernelParams {
     float pixel_value_limit;        // 16
     float light_refraction_coefficient; // 4
     int plane_index;                // 8
-    float reserved1;                // 12
-    float reserved2;                // 16
+    float reference_count;          // 12
+    float denoise_sigma;             // 16
     vec4 ewa_coefs_p;               // 16
     vec4 ewa_coefs_q;               // 16
     vec4 color_params_1;            // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
@@ -158,7 +158,15 @@ vec4 apply_color(vec4 px) {
     // 4. Contrast around mid grey
     c = (c - vec3(0.5)) * params.color_params_1.y + vec3(0.5);
 
-    // 5. Saturation around luma
+    // 5. Shadows / highlights: a cubic Bezier tone curve on luma, applied as a single gain.
+    // A step-for-step duplicate of `apply_color` in src/core/color/mod.rs, which carries the
+    // derivation and the monotonicity bound. Operation order must not be rearranged.
+    float tone_luma = clamp(0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b, 0.0, 1.0);
+    float inv_luma = 1.0 - tone_luma;
+    float tone = 1.0 + params.color_params_3.z * inv_luma * inv_luma + params.color_params_3.w * tone_luma * inv_luma;
+    c = c * tone;
+
+    // 6. Saturation around luma
     float luma = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
     c = vec3(luma) + (c - vec3(luma)) * params.color_params_1.z;
 

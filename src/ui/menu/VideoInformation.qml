@@ -18,6 +18,10 @@ MenuItem {
     property string filename: "";
     property bool isCalibrator: false;
     property string pixelFormat: "";
+    // The raw ffmpeg name ("yuv422p10le"), as opposed to the human-readable `pixelFormat`
+    // above ("YUV422 10 bit"). Export settings needs the real one to ask whether the chosen
+    // encoder can write it.
+    property string pixelFormatRaw: "";
     property bool hasAccessToInputDirectory: true;
     property alias infoList: list;
     property var orgModel: [];
@@ -85,6 +89,7 @@ MenuItem {
         }
 
         root.pixelFormat = getPixelFormat(md) || "---";
+        root.pixelFormatRaw = md["stream.video[0].codec.format_name"] || "";
 
         root.videoRotation = (360 - (md["stream.video[0].rotation"] || 0)) % 360; // Constrain to 0-360
 

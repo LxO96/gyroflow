@@ -14,6 +14,7 @@ pub mod camera_identifier;
 pub mod keyframes;
 pub mod stmap;
 pub mod color;
+pub mod denoise;
 
 pub mod zooming;
 pub mod smoothing;
@@ -85,6 +86,7 @@ pub struct StabilizationManager {
     pub lens: Arc<RwLock<LensProfile>>,
     pub smoothing: Arc<RwLock<Smoothing>>,
     pub color: Arc<RwLock<color::ColorAdjustments>>,
+    pub denoise: Arc<RwLock<denoise::DenoiseSettings>>,
 
     pub stabilization: Arc<RwLock<Stabilization>>,
 
@@ -119,6 +121,7 @@ impl Default for StabilizationManager {
         Self {
             smoothing: Arc::new(RwLock::new(Smoothing::default())),
             color: Arc::new(RwLock::new(color::ColorAdjustments::default())),
+            denoise: Arc::new(RwLock::new(denoise::DenoiseSettings::default())),
 
             params: Arc::new(RwLock::new(StabilizationParams::default())),
 
@@ -889,7 +892,23 @@ impl StabilizationManager {
         }
     }
 
-    pub fn process_pixels<T: PixelType>(&self, mut timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers) -> Result<stabilization::ProcessedInfo, GyroflowCoreError> {
+    pub fn process_pixels<T: PixelType>(&self, timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers) -> Result<stabilization::ProcessedInfo, GyroflowCoreError> {
+        self.process_pixels_with_references::<T>(timestamp_us, frame, buffers, &[])
+    }
+
+    /// `process_pixels`, plus the per-reference matrix blocks the temporal-denoise gather needs.
+    ///
+    /// `buffers.references` alone is not enough to denoise: the kernel indexes one matrix block
+    /// per reference frame and reads its rejection sigma out of `KernelParams`, and the cached
+    /// `stab_data` transform carries neither - `ensure_stab_data_at_timestamp` builds it with
+    /// plain `get_frame_transform_at`. Handing it a transform built by
+    /// `get_frame_transform_with_references` instead is what the render path does at
+    /// `rendering/mod.rs`; this is the same thing for the live preview.
+    ///
+    /// `reference_timestamps` must be in the same order as `buffers.references` and in the raw
+    /// source-timestamp domain - the frame offset and fps scale are applied here, to the centre
+    /// and to every reference alike, so both sides stay in one domain (R9-4).
+    pub fn process_pixels_with_references<T: PixelType>(&self, mut timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers, reference_timestamps: &[i64]) -> Result<stabilization::ProcessedInfo, GyroflowCoreError> {
         if let gpu::BufferSource::Cpu { buffer } = &buffers.input.data  { if buffer.is_empty() { return Err(GyroflowCoreError::InputBufferEmpty); } }
         if let gpu::BufferSource::Cpu { buffer } = &buffers.output.data { if buffer.is_empty() { return Err(GyroflowCoreError::OutputBufferEmpty); } }
 
@@ -898,10 +917,15 @@ impl StabilizationManager {
             (params.frame_offset, params.fps)
         };
         let frame = frame.map(|x| (x as i32 + offset).max(0) as usize);
-        timestamp_us += (offset as f64 / fps * 1000000.0).round() as i64;
+        let offset_us = (offset as f64 / fps * 1000000.0).round() as i64;
+        timestamp_us += offset_us;
+        let mut reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
         if let Some(scale) = self.params.read().fps_scale {
             timestamp_us = (timestamp_us as f64 / scale).round() as i64;
+            for ts in reference_timestamps.iter_mut() {
+                *ts = (*ts as f64 / scale).round() as i64;
+            }
         }
 
         if self.smoothing_invalidated.load(SeqCst) {
@@ -932,7 +956,24 @@ impl StabilizationManager {
         }
 
         if let Some(undist) = self.stabilization.try_read_for(std::time::Duration::from_millis(30000)) {
-            undist.process_pixels::<T>(timestamp_us, frame, buffers, None)
+            if reference_timestamps.is_empty() || buffers.references.is_empty() {
+                // Clear rather than merely branch: the backends derive `reference_count` from
+                // `buffers.references`, but the matrices come from the transform, and the
+                // plain path builds one with no `reference_matrices` at all. Leaving the
+                // buffers populated would have the kernel index matrix blocks that were never
+                // written.
+                buffers.references.clear();
+                undist.process_pixels::<T>(timestamp_us, frame, buffers, None)
+            } else {
+                // The gather reads `reference_count` from `buffers.references.len()` but takes
+                // its matrices from the transform, so the two must be built together or the
+                // kernel walks off the end of the matrix buffer.
+                let mut transform = undist.get_frame_transform_with_references::<T>(timestamp_us, &reference_timestamps, frame, buffers);
+                // Preview pixels are a single interleaved RGBA plane, so plane 0 - the luma
+                // strength - is the only sigma that applies.
+                transform.kernel_params.denoise_sigma = self.denoise.read().sigma_for_plane(0);
+                undist.process_pixels::<T>(timestamp_us, frame, buffers, Some(&transform))
+            }
         } else {
             Err(GyroflowCoreError::Unknown)
         }
@@ -954,6 +995,19 @@ impl StabilizationManager {
     pub fn set_show_detected_features(&self, v: bool) { self.params.write().show_detected_features = v; }
     pub fn set_show_optical_flow     (&self, v: bool) { self.params.write().show_optical_flow      = v; }
     pub fn set_stab_enabled          (&self, v: bool) { self.params.write().stab_enabled           = v; }
+    pub fn set_preview_color_enabled (&self, v: bool) { self.params.write().preview_color_enabled  = v; }
+
+    /// Force both toolbar toggles back on.
+    ///
+    /// They are preview-only affordances, but `get_cloned` copies `params` wholesale, so a
+    /// manager cloned for an export inherits whatever the user last left them at - and a render
+    /// silently missing the stabilization or the grade is a much worse bug than a preview that
+    /// does not match. Every render entry point calls this on its clone first.
+    pub fn clear_preview_overrides(&self) {
+        let mut params = self.params.write();
+        params.stab_enabled = true;
+        params.preview_color_enabled = true;
+    }
     pub fn set_frame_readout_time    (&self, v: f64)  { self.params.write().frame_readout_time     = v; }
     pub fn set_frame_readout_direction(&self, v: impl Into<ReadoutDirection>) { self.params.write().frame_readout_direction = v.into(); }
     pub fn set_adaptive_zoom         (&self, v: f64)  { self.params.write().adaptive_zoom_window   = v; self.invalidate_zooming(); }
@@ -1175,6 +1229,8 @@ impl StabilizationManager {
             lens:   Arc::new(RwLock::new(self.lens.read().clone())),
             keyframes:  Arc::new(RwLock::new(self.keyframes.read().clone())),
             smoothing:  Arc::new(RwLock::new(self.smoothing.read().clone())),
+            color:      Arc::new(RwLock::new(self.color.read().clone())),
+            denoise:    Arc::new(RwLock::new(self.denoise.read().clone())),
             input_file: Arc::new(RwLock::new(self.input_file.read().clone())),
             lens_profile_db: self.lens_profile_db.clone(),
 
@@ -1194,6 +1250,7 @@ impl StabilizationManager {
         self.params.write().framebuffer_inverted = false;
         self.params.write().fov_overview = false;
         self.params.write().show_safe_area = false;
+        self.clear_preview_overrides();
         self.stabilization.write().kernel_flags.set(KernelParamsFlags::DRAWING_ENABLED, false);
         self.set_size(size.0, size.1);
         self.set_output_size(output_size.0, output_size.1);
@@ -1291,6 +1348,8 @@ impl StabilizationManager {
                 "exposure":               c.exposure,
                 "contrast":               c.contrast,
                 "saturation":             c.saturation,
+                "shadows":                c.shadows,
+                "highlights":             c.highlights,
                 "source_kelvin":          c.source_kelvin,
                 "source_kelvin_detected": c.source_kelvin_detected,
                 "target_kelvin":          c.target_kelvin,
@@ -1298,11 +1357,23 @@ impl StabilizationManager {
                 "lut_strength":           c.lut_strength,
                 "lut_path":               c.lut_path,
                 "lut_name":               c.lut_name,
+                "output_color_space":     c.output_color_space,
+                "output_range":           c.output_range,
                 // Embedded fallback, so the project still grades identically if the
                 // .cube file moves, is deleted, or the project travels to another machine.
                 // The checksum is deliberately not stored - it's recomputed from the data
                 // on import so it can never disagree with it.
                 "lut_data":               c.lut.as_ref().and_then(|l| util::compress_to_base91_cbor(&(l.size, l.domain_min, l.domain_max, &l.data))),
+            })
+        };
+
+        let denoise = {
+            let d = self.denoise.read();
+            serde_json::json!({
+                "enabled":         d.enabled,
+                "quality":         d.quality.id(),
+                "luma_strength":   d.luma_strength,
+                "chroma_strength": d.chroma_strength,
             })
         };
 
@@ -1380,6 +1451,7 @@ impl StabilizationManager {
             },
 
             "color": color,
+            "denoise": denoise,
 
             "offsets": gyro.get_offsets(), // timestamp, offset value
             "keyframes": self.keyframes.read().serialize(),
@@ -1778,10 +1850,19 @@ impl StabilizationManager {
                 // hand-edited or corrupted project can't produce a nonsensical grade. The
                 // ranges live in `ColorAdjustments::set_param`, shared with the QML entry
                 // point in `Controller::set_color_param`.
-                for key in ["exposure", "contrast", "saturation", "source_kelvin", "target_kelvin", "tint", "lut_strength"] {
+                for key in ["exposure", "contrast", "saturation", "shadows", "highlights", "source_kelvin", "target_kelvin", "tint", "lut_strength"] {
                     if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { c.set_param(key, v); }
                 }
                 if let Some(v) = obj.get("source_kelvin_detected").and_then(|x| x.as_bool()) { c.source_kelvin_detected = v; }
+                // Unknown ids (an older build, a hand-edited file) fall back to the current
+                // value rather than failing the import - worst case is an export tagged like
+                // the source, which is exactly what happened before this field existed.
+                if let Some(v) = obj.get("output_color_space").and_then(|x| x.as_str()) {
+                    if let Some(s) = color::OutputColorSpace::from_id(v) { c.output_color_space = s; }
+                }
+                if let Some(v) = obj.get("output_range").and_then(|x| x.as_str()) {
+                    if let Some(r) = color::OutputRange::from_id(v) { c.output_range = r; }
+                }
                 let new_lut_path = obj.get("lut_path").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
                 let new_lut_name = obj.get("lut_name").and_then(|x| x.as_str()).filter(|x| !x.is_empty()).map(|x| x.to_string());
                 let has_lut_data = obj.get("lut_data").and_then(|x| x.as_str()).is_some_and(|x| !x.is_empty());
@@ -1847,6 +1928,21 @@ impl StabilizationManager {
                             c.lut = None;
                         }
                     }
+                }
+            }
+            if let Some(serde_json::Value::Object(obj)) = obj.get("denoise") {
+                let mut d = self.denoise.write();
+                if let Some(v) = obj.get("enabled").and_then(|x| x.as_bool()) { d.enabled = v; }
+                // Clamped through set_param so a hand-edited or corrupted project
+                // cannot produce a nonsensical sigma. The ranges live in
+                // `DenoiseSettings::set_param`, shared with the QML entry point.
+                for key in ["luma_strength", "chroma_strength"] {
+                    if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { d.set_param(key, v); }
+                }
+                // An unknown id (an older or newer build, a hand-edited file) falls
+                // back to the current value rather than failing the import.
+                if let Some(v) = obj.get("quality").and_then(|x| x.as_str()) {
+                    if let Some(q) = denoise::DenoiseQuality::from_id(v) { d.quality = q; }
                 }
             }
             if let Some(serde_json::Value::Object(obj)) = obj.get_mut("output") {
@@ -2287,6 +2383,8 @@ DOMAIN_MAX 1.0 1.0 1.0
             c.exposure = 0.75;
             c.contrast = -0.25;
             c.saturation = 0.5;
+            c.shadows = 0.4;
+            c.highlights = -0.6;
             c.source_kelvin = 5200.0;
             c.source_kelvin_detected = true;
             c.target_kelvin = 6200.0;
@@ -2313,12 +2411,103 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_eq!(b.exposure,               a.exposure);
         assert_eq!(b.contrast,               a.contrast);
         assert_eq!(b.saturation,             a.saturation);
+        assert_eq!(b.shadows,                a.shadows);
+        assert_eq!(b.highlights,             a.highlights);
         assert_eq!(b.source_kelvin,          a.source_kelvin);
         assert_eq!(b.source_kelvin_detected, a.source_kelvin_detected);
         assert_eq!(b.target_kelvin,          a.target_kelvin);
         assert_eq!(b.tint,                   a.tint);
         assert_eq!(b.lut_strength,           a.lut_strength);
         assert_eq!(b.lut_name,               a.lut_name);
+        assert_eq!(b.output_color_space,     a.output_color_space);
+        assert_eq!(b.output_range,           a.output_range);
+    }
+
+    /// Both output-declaration fields are stored as stable string ids rather than as numbers,
+    /// so a round trip is the only thing that proves the id tables on the two sides agree.
+    #[test]
+    fn output_space_and_range_round_trip_for_every_value() {
+        for space in color::OutputColorSpace::ALL {
+            for range in color::OutputRange::ALL {
+                let mgr = configured_manager(None);
+                {
+                    let mut c = mgr.color.write();
+                    c.output_color_space = space;
+                    c.output_range = range;
+                }
+                let restored = round_trip(&mgr);
+                let b = restored.color.read();
+                assert_eq!(b.output_color_space, space, "space {:?} with range {:?}", space, range);
+                assert_eq!(b.output_range,       range, "range {:?} with space {:?}", range, space);
+            }
+        }
+    }
+
+    /// An id written by a newer build, or typed by hand, must leave the value alone rather than
+    /// resetting it - the whole point of the fallback comment at the import site.
+    #[test]
+    fn unknown_output_ids_leave_the_current_value_alone() {
+        let mgr = configured_manager(None);
+        {
+            let mut c = mgr.color.write();
+            c.output_color_space = color::OutputColorSpace::Rec709;
+            c.output_range = color::OutputRange::Limited;
+        }
+        let mut json = mgr.export_gyroflow_data(GyroflowProjectType::WithGyroData, "{}", None).unwrap();
+        json = json.replace("\"output_color_space\": \"rec709\"", "\"output_color_space\": \"rec2100_future\"")
+                   .replace("\"output_range\": \"limited\"",     "\"output_range\": \"narrow_future\"");
+
+        let restored = StabilizationManager::default();
+        {
+            let mut c = restored.color.write();
+            c.output_color_space = color::OutputColorSpace::Srgb;
+            c.output_range = color::OutputRange::Full;
+        }
+        let mut is_preset = false;
+        restored.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+
+        let b = restored.color.read();
+        assert_eq!(b.output_color_space, color::OutputColorSpace::Srgb);
+        assert_eq!(b.output_range,       color::OutputRange::Full);
+    }
+
+    #[test]
+    fn denoise_settings_round_trip_through_the_project_file() {
+        let mgr = StabilizationManager::default();
+        {
+            let mut d = mgr.denoise.write();
+            d.enabled = true;
+            d.quality = denoise::DenoiseQuality::High;
+            d.luma_strength = 0.25;
+            d.chroma_strength = 0.75;
+        }
+        let restored = round_trip(&mgr);
+
+        let a = mgr.denoise.read();
+        let b = restored.denoise.read();
+        assert_eq!(a.enabled, b.enabled);
+        assert_eq!(a.quality, b.quality);
+        assert_eq!(a.luma_strength, b.luma_strength);
+        assert_eq!(a.chroma_strength, b.chroma_strength);
+    }
+
+    #[test]
+    fn denoise_import_clamps_hand_edited_values() {
+        let mgr = StabilizationManager::default();
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"denoise":{"enabled":true,"luma_strength":99.0,"chroma_strength":-99.0}}"#);
+        let d = mgr.denoise.read();
+        assert_eq!(d.luma_strength, denoise::MAX_STRENGTH);
+        assert_eq!(d.chroma_strength, denoise::MIN_STRENGTH);
+    }
+
+    #[test]
+    fn denoise_import_falls_back_on_an_unknown_quality_id() {
+        let mgr = StabilizationManager::default();
+        mgr.denoise.write().quality = denoise::DenoiseQuality::High;
+        // An id written by a newer build must leave the current value alone
+        // rather than fail the import, matching how output_color_space behaves.
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"denoise":{"quality":"ultra"}}"#);
+        assert_eq!(mgr.denoise.read().quality, denoise::DenoiseQuality::High);
     }
 
     #[test]
@@ -2604,11 +2793,11 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_eq!(c.exposure,      5.0);
         assert_eq!(c.contrast,     -1.0);
         assert_eq!(c.saturation,    1.0);
-        assert_eq!(c.source_kelvin, 1667.0);
+        assert_eq!(c.source_kelvin, color::MIN_KELVIN);
         assert_eq!(c.target_kelvin, 25000.0);
         assert_eq!(c.tint,         -1.0);
         assert_eq!(c.lut_strength,  1.0);
-        assert!(c.to_kernel_params(c.exposure, c.contrast, c.saturation, c.target_kelvin, c.tint, c.lut_strength).exposure_gain.is_finite());
+        assert!(c.to_kernel_params(color::ResolvedScalars { exposure: c.exposure, contrast: c.contrast, saturation: c.saturation, shadows: c.shadows, highlights: c.highlights, target_kelvin: c.target_kelvin, tint: c.tint, lut_strength: c.lut_strength }).exposure_gain.is_finite());
     }
 
     #[test]
@@ -2631,5 +2820,62 @@ DOMAIN_MAX 1.0 1.0 1.0
         let kf = restored.keyframes.read();
         assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorExposure,    1000.0), Some(1.5));
         assert_eq!(kf.value_at_video_timestamp(&KeyframeType::ColorLutStrength, 2000.0), Some(0.25));
+    }
+
+    /// `get_cloned` is what the Export button renders with: `RenderQueue::add`
+    /// (`render_queue.rs`) clones the live manager and hands the clone to `render`, which
+    /// reads `stab.color` to decide whether to bake. A field missing here is therefore not a
+    /// cosmetic omission - it silently un-grades every export while the preview, which uses
+    /// the live manager, still shows the grade. There is no warning, because the "not baking"
+    /// warnings only fire once `bake_color` is already true.
+    #[test]
+    fn get_cloned_preserves_the_colour_grade() {
+        let mgr = configured_manager(Some("C:/luts/round-trip.cube".into()));
+        let cloned = mgr.get_cloned();
+
+        let (a, b) = (mgr.color.read(), cloned.color.read());
+        assert!(b.is_active(),      "clone must still be active - this is what gates baking");
+        assert!(b.bake_in_render,   "clone lost bake_in_render, so render() would skip baking");
+        assert!(b.lut.is_some(),    "clone lost the LUT, which is the whole grade for a log clip");
+        assert_eq!(b.lut_name, a.lut_name);
+        assert_eq!(b.lut_path, a.lut_path);
+        assert_scalars_match(&a, &b);
+    }
+
+    /// The clone must be a *snapshot*, not a shared handle. `color` is an `Arc<RwLock<..>>`,
+    /// so cloning the `Arc` instead of the value would make a render in progress follow later
+    /// slider moves. Distinct from the test above: that one fails when the field is dropped,
+    /// this one fails when it is shared.
+    #[test]
+    fn get_cloned_snapshots_colour_rather_than_sharing_it() {
+        let mgr = configured_manager(None);
+        let cloned = mgr.get_cloned();
+
+        mgr.color.write().exposure = -3.0;
+
+        assert_eq!(cloned.color.read().exposure, 0.75, "clone followed a later edit to the original");
+    }
+
+    /// The two toolbar toggles under the video are preview-only, but `get_cloned` copies `params`
+    /// wholesale, so the clone the Export button renders with inherits whatever the user last
+    /// left them at. `set_render_params` is the single funnel every job goes through
+    /// (`RenderQueue::add_internal`), alongside the other preview-only resets already there.
+    #[test]
+    fn render_params_clear_the_preview_toggles() {
+        let mgr = StabilizationManager::default();
+        mgr.set_stab_enabled(false);
+        mgr.set_preview_color_enabled(false);
+
+        let cloned = mgr.get_cloned();
+        assert!(!cloned.params.read().stab_enabled,          "precondition: the clone inherits the toggles");
+        assert!(!cloned.params.read().preview_color_enabled, "precondition: the clone inherits the toggles");
+
+        cloned.set_render_params((1920, 1080), (1920, 1080));
+        assert!(cloned.params.read().stab_enabled,          "the export would have rendered unstabilized");
+        assert!(cloned.params.read().preview_color_enabled, "the export would have rendered ungraded");
+
+        // ...and the preview it was cloned from still shows what the user asked it to.
+        assert!(!mgr.params.read().stab_enabled);
+        assert!(!mgr.params.read().preview_color_enabled);
     }
 }

@@ -158,16 +158,39 @@ pub struct KernelParams {
     pub pixel_value_limit:        f32, // 16
     pub light_refraction_coefficient: f32, // 4
     pub plane_index:              i32, // 8
-    pub reserved1:                f32, // 12
-    pub reserved2:                f32, // 16
+    /// Total source frames gathered per output pixel: `2k+1`. `1` disables the
+    /// temporal path entirely — every kernel branches on this before doing any
+    /// extra work, so `k = 0` costs nothing.
+    /// Stored as f32 to keep this slot byte-identical to the `reserved1` it
+    /// replaces; the kernels round it back to an integer count.
+    pub reference_count:          f32, // 12
+    /// Sigma of the rejection Gaussian, in normalised pixel units, for the plane
+    /// currently being processed. Selected per plane by `plane_index`.
+    pub denoise_sigma:            f32, // 16
     pub ewa_coeffs_p:             [f32; 4], // 16
     pub ewa_coeffs_q:             [f32; 4], // 16
     pub color_params_1:           [f32; 4], // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     pub color_params_2:           [f32; 4], // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
-    pub color_params_3:           [f32; 4], // 16 - lut_domain_min, lut_domain_max, unused, unused
+    pub color_params_3:           [f32; 4], // 16 - lut_domain_min, lut_domain_max, shadows, highlights
 }
 unsafe impl bytemuck::Zeroable for KernelParams {}
 unsafe impl bytemuck::Pod for KernelParams {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_params_layout_is_unchanged() {
+        // Mirrored byte-for-byte in opencl_undistort.cl, wgpu_undistort.wgsl,
+        // qt_gpu/undistort.frag and stabilize_spirv/src/types.rs. If this size
+        // changes, all four must change with it.
+        assert_eq!(std::mem::size_of::<KernelParams>() % 16, 0, "struct must stay 16-byte aligned");
+        assert_eq!(std::mem::align_of::<KernelParams>(), 4);
+        // Pinned so a new field cannot be added to one copy and not the other four.
+        assert_eq!(std::mem::size_of::<KernelParams>(), 416);
+    }
+}
 
 #[derive(Default, Debug)]
 pub enum BackendType {
@@ -245,7 +268,7 @@ impl Stabilization {
 
     pub fn get_kernel_flags(&self, frame: usize, buffers: &Buffers) -> KernelParamsFlags {
         let mut kernel_flags = self.kernel_flags.clone();
-        kernel_flags.set(KernelParamsFlags::HAS_DIGITAL_LENS, self.compute_params.digital_lens.is_some());
+        kernel_flags.set(KernelParamsFlags::HAS_DIGITAL_LENS, self.compute_params.digital_lens.is_some() && !self.compute_params.bypass_stabilization);
         kernel_flags.set(KernelParamsFlags::HORIZONTAL_RS, self.compute_params.frame_readout_direction.is_horizontal());
         kernel_flags.set(KernelParamsFlags::HAS_SOURCE_RECT, buffers.input.rect.is_some() || self.size.0 != buffers.input.size.0 || self.size.1 != buffers.input.size.1);
         kernel_flags.set(KernelParamsFlags::HAS_OUTPUT_RECT, buffers.output.rect.is_some() || self.output_size.0 != buffers.output.size.0 || self.output_size.1 != buffers.output.size.1);
@@ -263,11 +286,14 @@ impl Stabilization {
         // only when a LUT is present); `at_timestamp` keeps setting them for its direct callers,
         // which have no `Stabilization` to ask, and the two paths agree by construction.
         let color = &self.compute_params.color;
-        let color_active = color.enabled && (color.is_active() || self.compute_params.keyframes.is_any_color_keyframed());
+        let color_active = !self.compute_params.bypass_color && color.enabled && (color.is_active() || self.compute_params.keyframes.is_any_color_keyframed());
         kernel_flags.set(KernelParamsFlags::COLOR_ENABLED, color_active);
         kernel_flags.set(KernelParamsFlags::HAS_LUT, color_active && self.compute_params.color.lut.is_some());
 
-        {
+        // Bypassed geometry sends no mesh, no per-frame distortion and no IBIS data, so the
+        // matching flags must go too: they are specialization constants, and a pipeline compiled
+        // to read a mesh buffer that `at_timestamp` now leaves empty would read past its end.
+        if !self.compute_params.bypass_stabilization {
             let gyro = self.compute_params.gyro.read();
             let file_metadata = gyro.file_metadata.read();
             if let Some(mc) = file_metadata.mesh_correction.get(frame) {
@@ -358,6 +384,18 @@ impl Stabilization {
         transform.kernel_params.output_rect = Self::get_rect(&buffers.output);
 
         transform
+    }
+
+    /// Build the centre transform plus one matrix block per reference timestamp.
+    /// Each block comes from the same `get_frame_transform_at` the centre frame
+    /// uses, so a reference frame's rolling-shutter matrices are computed
+    /// exactly as that frame's own render would compute them.
+    pub fn get_frame_transform_with_references<T: PixelType>(&self, timestamp_us: i64, reference_timestamps: &[i64], frame: Option<usize>, buffers: &Buffers) -> FrameTransform {
+        let mut t = self.get_frame_transform_at::<T>(timestamp_us, frame, buffers);
+        t.reference_matrices = reference_timestamps.iter()
+            .map(|ts| self.get_frame_transform_at::<T>(*ts, None, buffers).matrices)
+            .collect();
+        t
     }
 
     pub fn ensure_stab_data_at_timestamp<T: PixelType>(&mut self, timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers, is_pixel_normalized: bool) {
@@ -817,7 +855,7 @@ mod color_cache_key_tests {
     use super::*;
 
     fn buffers() -> Buffers<'static> {
-        Buffers { input: BufferDescription::default(), output: BufferDescription::default() }
+        Buffers { input: BufferDescription::default(), output: BufferDescription::default(), references: Vec::new() }
     }
 
     fn stab_with(color: crate::color::ColorAdjustments) -> Stabilization {
@@ -913,7 +951,7 @@ mod cross_backend_color_tests {
 
     const COLOR_PARAMS_1: [f32; 4] = [1.2, 1.1, 0.8, 0.5]; // exposure, contrast, saturation, lut_strength
     const COLOR_PARAMS_2: [f32; 4] = [1.05, 1.0, 0.95, 2.0]; // wb r/g/b, lut_size
-    const COLOR_PARAMS_3: [f32; 4] = [0.0, 1.0, 0.0, 0.0]; // domain_min, domain_max
+    const COLOR_PARAMS_3: [f32; 4] = [0.0, 1.0, 0.3, -0.2]; // domain_min, domain_max, shadows, highlights
 
     /// Inverts every channel; bilinear interpolation of a linear function is exact, so
     /// `sample_trilinear` returns exactly `[1-c0, 1-c1, 1-c2]`. Same LUT the CPU test uses.
@@ -967,6 +1005,15 @@ mod cross_backend_color_tests {
         p.lens_correction_amount = 1.0; // skips the lens-correction block entirely
         p.source_rect = [0, 0, W, H];
         p.output_rect = [0, 0, W, H];
+        // Must cover the whole frame, and leaving it at the default [0,0,0,0] is not neutral.
+        // `draw_safe_area` in the wgpu/OpenCL/SPIR-V kernels is *not* behind a flag: it runs on
+        // every pixel and multiplies rgb by 0.5 outside the rect, then by 0.5 again within 5px
+        // of its edge. At [0,0,0,0] every pixel is "outside", and every pixel with x < 5 is also
+        // "border", which is exactly the 1/2-and-1/4 attenuation this harness was measuring and
+        // misreading as a geometric divergence. Production sets this rect from the output size
+        // (see `undistort_image`), so the darkening is inert there - only a hand-built
+        // KernelParams like this one can trip it. The CPU path has no safe-area code at all.
+        p.safe_area_rect = [0.0, 0.0, W as f32, H as f32];
         p.max_pixel_value = 1.0;
         p.pixel_value_limit = f32::MAX;
         p.light_refraction_coefficient = 1.0;
@@ -979,6 +1026,7 @@ mod cross_backend_color_tests {
             // Identity 3x3 in the first 9 fields; the trailing 5 stay zero, which disables
             // the extra shift/angle adjustment.
             matrices: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            reference_matrices: Vec::new(),
             kernel_params: p,
             fov: 1.0,
             minimal_fov: 1.0,
@@ -1002,6 +1050,8 @@ mod cross_backend_color_tests {
             saturation_factor: COLOR_PARAMS_1[2],
             lut_strength:      COLOR_PARAMS_1[3],
             wb_gains:          [COLOR_PARAMS_2[0], COLOR_PARAMS_2[1], COLOR_PARAMS_2[2]],
+            shadows:           COLOR_PARAMS_3[2],
+            highlights:        COLOR_PARAMS_3[3],
             lut_size:          COLOR_PARAMS_2[3] as u32,
             domain_min:        COLOR_PARAMS_3[0],
             domain_max:        COLOR_PARAMS_3[1],
@@ -1018,17 +1068,42 @@ mod cross_backend_color_tests {
     /// legitimate skip, from "wgpu is present but the run failed", which is a failure and
     /// must not be mistaken for a skip. Collapsing the two is how a test ends up asserting
     /// nothing while looking green.
+    ///
+    /// **The half-pixel correction is essential and is not a fudge.** The CPU path feeds the
+    /// transform the integer pixel index (`cpu_undistort.rs:597`, `Vector2::new(x, y)`),
+    /// while the wgpu *fragment* path feeds `@builtin(position)`, which is the pixel centre
+    /// `(x + 0.5, y + 0.5)`. Verified directly by instrumenting the shader to emit
+    /// `@builtin(position)` and `undistort_coord`: the coordinate maths is an exact identity
+    /// on both, and the only *geometric* difference is that half pixel — at `uv = 0.5` the sampler
+    /// lands on the half-pixel coefficient row and blends two texels, where the CPU lands
+    /// exactly on one.
+    ///
+    /// `translation2d` is added to `out_pos` at the top of `undistort_coord`
+    /// (`wgpu_undistort.wgsl:561`), so -0.5 puts both backends on the same sampling grid.
+    /// Without it this test would be comparing two different resamplings and could say
+    /// nothing about colour. See the note on the backend divergence in the design spec: the
+    /// offset itself is a real, pre-existing, non-colour inconsistency between backends.
+    ///
+    /// The offset was necessary but *not sufficient*, and on its own it left the identity
+    /// control still failing. The rest of the original divergence was not geometric at all:
+    /// it was `draw_safe_area` attenuating rgb because `identity_transform` left
+    /// `safe_area_rect` at its default — see the note there. The two were easy to conflate
+    /// because the sampling-map probes decode a position *from channel values*, so a
+    /// multiplicative scale on the values is indistinguishable from one on the position. If
+    /// this control ever regresses, rule out value scaling before re-deriving the geometry.
     fn run_wgpu(flags: i32, lut: Option<Arc<Lut3D>>) -> Result<Vec<[f32; 4]>, String> {
         if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() {
             return Err("UNAVAILABLE: no usable wgpu adapter".into());
         }
 
-        let itm = identity_transform(flags);
+        let mut itm = identity_transform(flags);
+        itm.kernel_params.translation2d = [-0.5, -0.5];
         let mut input = input_bytes();
         let mut output = vec![0u8; (STRIDE * H) as usize];
         let mut buffers = Buffers {
             input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
             output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+            references: Vec::new(),
         };
 
         let inst = crate::gpu::wgpu::WgpuWrapper::new(
@@ -1058,6 +1133,7 @@ mod cross_backend_color_tests {
             let mut buffers = Buffers {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
             };
             let ok = Stabilization::undistort_image_cpu::<2, RGBAf>(&mut buffers, &itm.kernel_params, &DistortionModel::default(), None, &itm.matrices, &[], &[], &coeffs);
             assert!(ok, "undistort_image_cpu returned false");
@@ -1109,6 +1185,130 @@ mod cross_backend_color_tests {
         }
     }
 
+    /// Same probe in `RGBA8`. `RGBAf` is 16 bytes per pixel and is flagged non-unorm in
+    /// `wgpu_format`, while `RGBA8`/`RGBA16` are 4/8 bytes and unorm — and the shader is
+    /// generated per format. `RGBAf` is also a format the render path never produces (float
+    /// sources are refused, see OQ1), so if the divergence is `RGBAf`-specific the fixture
+    /// was testing a configuration that cannot occur.
+    #[test]
+    #[ignore = "diagnostic; run with: cargo test -- --ignored"]
+    fn wgpu_sampling_map_probe_rgba8() {
+        const BPP8: i32 = 4;
+        const STRIDE8: i32 = W * BPP8;
+
+        // red ramps across x, green ramps down y, both 0..=255.
+        let mut input = vec![0u8; (STRIDE8 * H) as usize];
+        for i in 0..N {
+            let x = i % W as usize;
+            let y = i / W as usize;
+            let o = i * 4;
+            input[o]     = (x * 255 / (W as usize - 1)) as u8;
+            input[o + 1] = (y * 255 / (H as usize - 1)) as u8;
+            input[o + 2] = 0;
+            input[o + 3] = 255;
+        }
+
+        let mut itm = identity_transform(0);
+        itm.kernel_params.stride = STRIDE8;
+        itm.kernel_params.output_stride = STRIDE8;
+        itm.kernel_params.bytes_per_pixel = BPP8;
+        itm.kernel_params.max_pixel_value = 255.0;
+
+        let mut inp_buf = input.clone();
+        let mut output = vec![0u8; (STRIDE8 * H) as usize];
+        {
+            let mut buffers = Buffers {
+                input:  BufferDescription { size: (W as usize, H as usize, STRIDE8 as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut inp_buf }, texture_copy: false },
+                output: BufferDescription { size: (W as usize, H as usize, STRIDE8 as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
+            };
+            if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { println!("SKIPPED: no wgpu adapter"); return; }
+            let inst = match crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, RGBA8::wgpu_format().unwrap(), DistortionModel::default(), None, &buffers, 0, None) {
+                Ok(i) => i,
+                Err(e) => { println!("WgpuWrapper::new failed: {e:?}"); return; }
+            };
+            if !inst.undistort_image(&mut buffers, &itm, &[]) { println!("undistort_image false"); return; }
+        }
+
+        let mut exact = 0;
+        println!("RGBA8: out (x,y) -> decoded src (col,row)");
+        for i in 0..N {
+            let x = i % W as usize;
+            let y = i / W as usize;
+            let col = output[i * 4]     as f32 * (W - 1) as f32 / 255.0;
+            let row = output[i * 4 + 1] as f32 * (H - 1) as f32 / 255.0;
+            if output[i * 4] == input[i * 4] && output[i * 4 + 1] == input[i * 4 + 1] { exact += 1; }
+            if i < 6 || x == 0 { println!("  {i:2} ({x:2},{y}) -> ({col:6.3},{row:6.3})"); }
+        }
+        println!("RGBA8 exact matches: {exact}/{N}");
+    }
+
+    /// Evidence-gathering, not a fix: the input's red channel encodes its own linear index
+    /// (`red = i / (N-1)`), so decoding the output's red channel says exactly which input
+    /// position each output pixel was sampled from. Guessing at the ratio from a handful of
+    /// values was not converging; this shows the mapping directly.
+    #[test]
+    #[ignore = "diagnostic; run with: cargo test -- --ignored"]
+    fn wgpu_sampling_map_probe() {
+        // red = i/(N-1) exactly; green/blue mark the row and column so a transposed or
+        // wrapped read is visible rather than being decoded as some fractional index.
+        let mut input = vec![0u8; (STRIDE * H) as usize];
+        for i in 0..N {
+            let x = (i % W as usize) as f32;
+            let y = (i / W as usize) as f32;
+            let p: [f32; 4] = [i as f32 / (N - 1) as f32, x / W as f32, y / H as f32, 1.0];
+            input[i * 16..i * 16 + 16].copy_from_slice(bytemuck::bytes_of(&p));
+        }
+
+        let mut itm = identity_transform(0);
+        itm.kernel_params.translation2d = [-0.5, -0.5];
+        let mut inp_buf = input.clone();
+        let mut output = vec![0u8; (STRIDE * H) as usize];
+        {
+            let mut buffers = Buffers {
+                input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut inp_buf }, texture_copy: false },
+                output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
+            };
+            if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() {
+                println!("SKIPPED: no wgpu adapter"); return;
+            }
+            let inst = match crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, RGBAf::wgpu_format().unwrap(), DistortionModel::default(), None, &buffers, 0, None) {
+                Ok(i) => i,
+                Err(e) => { println!("WgpuWrapper::new failed: {e:?}"); return; }
+            };
+            if !inst.undistort_image(&mut buffers, &itm, &[]) { println!("undistort_image false"); return; }
+        }
+
+        // The same frame through the CPU path, so the two maps can be compared directly
+        // rather than one being compared against an assumption.
+        let coeffs = crate::stabilization::build_coeffs_buffer(None);
+        let mut cpu_in = input.clone();
+        let mut cpu_out = vec![0u8; (STRIDE * H) as usize];
+        {
+            let mut b = Buffers {
+                input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_in }, texture_copy: false },
+                output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_out }, texture_copy: false },
+                references: Vec::new(),
+            };
+            // The CPU path must NOT get the wgpu half-pixel correction - it already feeds
+            // integer pixel coordinates. Applying it here would shift the CPU instead.
+            let cpu_itm = identity_transform(0);
+            assert!(Stabilization::undistort_image_cpu::<2, RGBAf>(&mut b, &cpu_itm.kernel_params, &DistortionModel::default(), None, &cpu_itm.matrices, &[], &[], &coeffs));
+        }
+
+        let out = read_pixels(&output);
+        let cpu = read_pixels(&cpu_out);
+        println!("out (x,y) -> RAW wgpu channels [r,g,b,a] | cpu src (col,row)");
+        for i in 0..N {
+            let x = i % W as usize;
+            let y = i / W as usize;
+            let (cc, cr) = (cpu[i][1] * W as f32, cpu[i][2] * H as f32);
+            let (gc, gr) = (out[i][1] * W as f32, out[i][2] * H as f32);
+            println!("  {i:2} ({x:2},{y}) -> wgpu({gc:7.3},{gr:6.3}) | cpu({cc:6.2},{cr:5.2})");
+        }
+    }
+
     /// The control. Every tolerance below is only meaningful while this passes, which is why
     /// it demands bit-exact equality with the input rather than a bound.
     ///
@@ -1116,16 +1316,42 @@ mod cross_backend_color_tests {
     /// byte-identical `KernelParams` and the same identity matrix, the CPU path is exactly
     /// bit-exact (`identity_geometry_is_bit_exact_on_cpu`, which does pass) while wgpu
     /// resamples: its output is a smooth ramp at roughly a quarter of the input's rate.
-    /// Ruled out so far: the output-rect flag (bit 64, unset here), the lens-correction
-    /// branch (skipped at `lens_correction_amount` 1.0), and `canvas_scale`. The remaining
-    /// suspects are the WGSL coordinate math in `undistort_coord` / `rotate_and_distort`
-    /// (`gpu/wgpu_undistort.wgsl:462,553`) and whether the wgpu path needs parameters that
-    /// only `FrameTransform::at_timestamp` computes, rather than hand-built ones.
+    /// Ruled out **with evidence**, by `wgpu_sampling_map_probe` (which decodes, per output
+    /// pixel, exactly which input position each backend sampled):
+    ///
+    /// - *Not* the pixel format or bytes-per-pixel. `RGBA8` (4 bytes, unorm) diverges the
+    ///   same way as `RGBAf` (16 bytes, non-unorm) — see `wgpu_sampling_map_probe_rgba8`.
+    /// - *Not* frame size. The divergence is unchanged when only `H` is doubled.
+    /// - *Not* lens distortion. `KernelParams::default()` leaves `k` zero, and the injected
+    ///   `opencv_fisheye.wgsl:49` early-outs to the identity for all-zero `k`, as do the
+    ///   OpenCL and GLSL copies. Only the rust-gpu copy
+    ///   (`stabilize_spirv/src/distortion_models/opencv_fisheye.rs:71`) lacks that early-out,
+    ///   and it is not on this path. The WGSL params struct layout was checked against
+    ///   `KernelParams` field by field, so `k1` really is zero rather than misaligned.
+    /// - *Not* the output-rect flag (bit 64, unset), the lens-correction branch (skipped at
+    ///   `lens_correction_amount` 1.0), or `canvas_scale`.
+    ///
+    /// **Found and corrected: a half-pixel offset.** Instrumenting the shader to emit
+    /// `@builtin(position)` and `undistort_coord` directly showed the coordinate maths is an
+    /// exact identity on both backends, and that the fragment path (which is what runs for a
+    /// `BufferSource::Cpu` buffer, since `init_texture` makes `uses_textures` true) is handed
+    /// the pixel *centre* `(x + 0.5, y + 0.5)` while the CPU path is handed the integer index
+    /// `(x, y)` (`cpu_undistort.rs:597`). `run_wgpu` cancels it via `translation2d`, which
+    /// made the **y axis exactly correct** and fixed pixel 0.
+    ///
+    /// **Residual, still unexplained:** with y exact, x is compressed 4x — output x of
+    /// 0,1,2,3,4 samples input x of 0.00,0.25,0.50,0.75,1.00, then breaks pattern at x=5.
+    /// A factor of 4 on x alone, with y unaffected, is the shape of a stride/element-count
+    /// error rather than a geometric one, and 4 is exactly
+    /// `bytes_per_pixel / pix_element_count` for this format — but the texture branch of
+    /// `read_input_at` uses `textureLoad` and never touches those. Worth checking next
+    /// whether the `interpolation`, `bytes_per_pixel` and `pix_element_count` pipeline
+    /// override constants actually arrive with the values passed to `WgpuWrapper::new`.
     ///
     /// Until it passes, no cross-backend colour claim can be made - which is exactly what
     /// this test existing and failing is for. Run it with `cargo test -- --ignored`.
     #[test]
-    #[ignore = "needs a GPU, and the wgpu identity control is not yet solved - see the note above"]
+    #[ignore = "needs a GPU; run with: cargo test -- --ignored"]
     fn identity_geometry_is_bit_exact_on_every_backend() {
         let mut ran_any = false;
 
@@ -1141,13 +1367,12 @@ mod cross_backend_color_tests {
         assert!(ran_any, "no backend was available, so this test asserted nothing");
     }
 
-    /// **Blocked on `identity_geometry_is_bit_exact_on_every_backend`.** Any number this
-    /// produces while the control fails is measuring wgpu's resampling, not its colour
-    /// stage, so treat a failure here as unread until the control passes. It is committed
-    /// now because the harness, the reference comparison and the tolerance are the settled
-    /// parts; only the geometry fixture is open.
+    /// **Read `identity_geometry_is_bit_exact_on_every_backend` first.** It is the control:
+    /// while it fails, any number this test produces is measuring wgpu's resampling rather
+    /// than its colour stage, and must be treated as unread. It currently passes bit-exactly,
+    /// so the figure below is a genuine measurement of the colour kernel.
     #[test]
-    #[ignore = "needs a GPU, and is blocked on the identity control above"]
+    #[ignore = "needs a GPU; run with: cargo test -- --ignored"]
     fn color_stage_matches_the_reference_on_every_backend() {
         let expected = reference();
         let lut = Some(Arc::new(inverting_lut()));

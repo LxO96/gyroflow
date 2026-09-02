@@ -111,6 +111,26 @@ pub fn get_plane_buffer<'a>(frame: &'a mut Video, size: (usize, usize), plane_in
     }
 }
 
+/// Like `get_plane_buffer`, but for a frame the caller only holds a shared reference to.
+///
+/// The temporal window used for denoising hands out `&Video` for both the centre frame and
+/// its references, because the centre frame doubles as a reference for its neighbours - no
+/// `&mut` can exist alongside those shared borrows. `get_plane_buffer` needs `&mut Video`
+/// only to obtain a byte slice (`BufferSource::Cpu`'s `buffer` field is `&mut [u8]`, sized
+/// for the general case where the destination *is* written); a reference frame's data is
+/// only ever read here (uploaded to the GPU, never written back), so casting away the
+/// shared borrow is sound as long as nothing else mutates the same frame while the
+/// resulting `BufferDescription` is alive - guaranteed by the window not being pushed again
+/// until the caller is done with the current `Emission`.
+#[allow(invalid_reference_casting)]
+pub fn get_plane_buffer_ref<'a>(frame: &'a Video, size: (usize, usize), plane_index: usize, render_globals: &mut RenderGlobals, wgpu_format: Option<gyroflow_core::WgpuTextureFormat>) -> BufferDescription<'a> {
+    // SAFETY: only read from (uploaded to the GPU, never written back); see the doc comment
+    // above and `super::as_mut_video`, which documents the same reasoning for the sibling
+    // cast used elsewhere in the render path.
+    let frame_mut = unsafe { &mut *(frame as *const Video as *mut Video) };
+    get_plane_buffer(frame_mut, size, plane_index, render_globals, wgpu_format)
+}
+
 // -------------------------------------------------------------------
 // ------------------------------ macOS ------------------------------
 // -------------------------------------------------------------------

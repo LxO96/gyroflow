@@ -479,6 +479,29 @@ impl<'a> FfmpegProcessor<'a> {
                 }
             }
             if !self.ranges_ms.is_empty() && !cancel_flag.load(Relaxed) {
+                // Emit whatever a delayed processor is still holding BEFORE moving to the next
+                // range. Two things depend on it: those frames belong to the range that is
+                // ending, so emitting them after the seek would drop them into the middle of
+                // the next range's timeline carrying the previous range's timestamps; and
+                // `add_video` below is derived from `last_video`, which is only the true end
+                // of this range once the held frames have actually been encoded. Draining is
+                // idempotent - the window is left empty, so the next range starts clean and
+                // never gathers across the cut.
+                if let Some(mut cb) = self.video.on_finish_callback.take() {
+                    let mut rate_control = ffmpeg_video::RateControl::default();
+                    let result = cb(&mut self.video, &mut rate_control, &mut octx, &mut self.ost_time_bases);
+                    self.video.on_finish_callback = Some(cb);
+                    result?;
+                }
+                // Frames the drain just emitted are the real end of this range, so the next
+                // range must be offset past them, not past the last live frame.
+                // Only the position moves. `last_duration_video` stays the per-frame
+                // interval the live path measured - deriving it from the gap here would
+                // measure the whole drained tail (k frames) and push the next range that
+                // much further out, lengthening the file by k-1 frames.
+                if let Some(ts) = self.video.last_extra_video_ts.take() {
+                    self.frame_ts.last_video = Some(ts);
+                }
                 let next_range = self.ranges_ms.remove(0);
                 if let Some(start) = next_range.0 {
                     start_ms = Some(start);
@@ -501,6 +524,21 @@ impl<'a> FfmpegProcessor<'a> {
             self.video.decoder.as_mut().ok_or(Error::DecoderNotFound)?.send_eof()?;
             // self.video.decoder.as_mut().ok_or(Error::DecoderNotFound)?.flush();
             self.video.receive_and_process_video_frames(output_size, bitrate, Some(&mut octx), &mut self.ost_time_bases, start_ms, end_ms, &mut self.frame_ts)?;
+
+            // Decoding is genuinely finished here (the decoder has just been drained after
+            // its own EOF) and the encoder is still alive and accepting frames. Emit any
+            // frames a delayed processor (eg. temporal denoising, which holds back `k`
+            // frames) is still holding, but only if the user did not cancel the render --
+            // tail frames from a cancelled render belong to an export that is not happening.
+            if !cancel_flag.load(Relaxed) {
+                if let Some(mut cb) = self.video.on_finish_callback.take() {
+                    let mut rate_control = ffmpeg_video::RateControl::default();
+                    let result = cb(&mut self.video, &mut rate_control, &mut octx, &mut self.ost_time_bases);
+                    self.video.on_finish_callback = Some(cb);
+                    result?;
+                }
+            }
+
             self.video.encoder.as_mut().ok_or(Error::EncoderNotFound)?.send_eof()?;
             if let Err(e) = self.video.receive_and_process_encoded_packets(&mut octx, ost_time_base) {
                 log::error!("Failed to flush last packet: {e:?}");
@@ -601,6 +639,9 @@ impl<'a> FfmpegProcessor<'a> {
 
     pub fn on_frame<F>(&mut self, cb: F) where F: FnMut(i64, &mut frame::Video, Option<&mut frame::Video>, &mut ffmpeg_video_converter::Converter, &mut ffmpeg_video::RateControl) -> Result<(), FFmpegError> + 'a {
         self.video.on_frame_callback = Some(Box::new(cb));
+    }
+    pub fn on_finish<F>(&mut self, cb: F) where F: FnMut(&mut VideoTranscoder<'a>, &mut ffmpeg_video::RateControl, &mut format::context::Output, &mut Vec<Rational>) -> Result<(), FFmpegError> + 'a {
+        self.video.on_finish_callback = Some(Box::new(cb));
     }
     pub fn on_encoder_initialized<F>(&mut self, cb: F) where F: FnMut(&encoder::video::Video) -> Result<(), FFmpegError> + 'a {
         self.video.on_encoder_initialized = Some(Box::new(cb));

@@ -3,7 +3,7 @@
 
 mod ffmpeg_audio;
 mod ffmpeg_video;
-mod ffmpeg_video_converter;
+pub(crate) mod ffmpeg_video_converter; // `Converter::set_color_details` is also needed by the denoised preview's reference conversion in controller.rs
 mod audio_resampler;
 pub mod ffmpeg_processor;
 pub mod ffmpeg_hw;
@@ -11,6 +11,7 @@ pub mod render_queue;
 pub mod mdk_processor;
 pub mod video_processor;
 pub mod zero_copy;
+pub mod temporal_window;
 use gyroflow_core::settings;
 use zero_copy::*;
 #[cfg(target_os = "android")]
@@ -20,6 +21,7 @@ pub use self::video_processor::VideoProcessor;
 pub use self::ffmpeg_processor::{ FfmpegProcessor, FFmpegError };
 use render_queue::RenderOptions;
 use crate::core::{ StabilizationManager, stabilization::* };
+use crate::core::color::{ OutputColorSpace, OutputRange };
 use ffmpeg_next::{ format::Pixel, frame::Video, codec, Error, ffi };
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -274,12 +276,241 @@ fn tag_limited_range_for_prores_videotoolbox(out_frame: &mut Video, is_prores_vi
     }
 }
 
+/// Declares on the output what the baked grade actually produced.
+///
+/// Only the tags change - not one pixel. The export otherwise inherits the source's colour
+/// tags verbatim (`ffmpeg_video.rs`, which reads all four off the output frame), and Sony XAVC
+/// leaves matrix, transfer and primaries unspecified at the container level. The result was a
+/// file declaring `color_range=pc` and nothing else; with no matrix declared, players fall back
+/// to their own defaults and enough of them assume limited range for 10-bit YUV that a correct
+/// full-range export gets visibly stretched on playback.
+///
+/// Called only from the baking path, and that is the point: the tag describes what the LUT
+/// produced, so it may only be written when the grade was actually baked in. Tagging Rec.709
+/// on a file whose pixels are still S-Log3 would be a worse lie than saying nothing.
+fn tag_output_color_space(out_frame: &mut Video, space: OutputColorSpace) {
+    use ffmpeg_next::util::color::{ Primaries, TransferCharacteristic, Space };
+    let (primaries, transfer, matrix) = match space {
+        // The user has not said, so keep inheriting the source as before.
+        OutputColorSpace::Unspecified => return,
+        OutputColorSpace::Rec709      => (Primaries::BT709,    TransferCharacteristic::BT709,        Space::BT709),
+        OutputColorSpace::Srgb        => (Primaries::BT709,    TransferCharacteristic::IEC61966_2_1, Space::BT709),
+        // P3 D65 shares the 709 transfer and matrix; only the primaries differ.
+        OutputColorSpace::DciP3D65    => (Primaries::SMPTE432, TransferCharacteristic::BT709,        Space::BT709),
+        OutputColorSpace::Rec2020Pq   => (Primaries::BT2020,   TransferCharacteristic::SMPTE2084,    Space::BT2020NCL),
+        OutputColorSpace::Rec2020Hlg  => (Primaries::BT2020,   TransferCharacteristic::ARIB_STD_B67, Space::BT2020NCL),
+    };
+    out_frame.set_color_primaries(primaries);
+    out_frame.set_color_transfer_characteristic(transfer);
+    out_frame.set_color_space(matrix);
+}
+
+/// Chooses the range the output is encoded in, converting the pixels to match.
+///
+/// This is the one place in this file that changes samples rather than tags, and the mechanism
+/// is the same one `tag_limited_range_for_prores_videotoolbox` relies on: swscale applies the
+/// range as part of the RGB->YUV matrix, but only if the destination frame declares it, so
+/// declaring it here is what performs the conversion. `ffmpeg_video.rs` then reads the range
+/// back off the frame and tags the encoder to match, so the file describes what it holds.
+///
+/// Why anyone would want it: a baked log-to-display LUT expands contrast into the full code
+/// range, and a great many players ignore `color_range=pc` for YUV and assume video range
+/// anyway - stretching the picture by 1023/876 about a pivot at code 445, which reads as
+/// crushed blacks and clipped highlights. Encoding video range instead means those players are
+/// right by construction. The cost is ~15% of the code range, which matters if the file is
+/// going back into a grading suite and does not if it is going to a viewer.
+///
+/// Baking-only, and unlike the colour-space tag that is a hard technical limit rather than a
+/// policy: without baking the frame never becomes RGB, swscale never builds an RGB->YUV matrix,
+/// and the only range machinery in play is the kernels' own `remap_colorrange`, which is driven
+/// by `FIX_COLOR_RANGE` per plane. Routing this through that instead would mean touching all
+/// five hand-maintained kernels. The UI gates on baking for the same reason.
+///
+/// Called before the first conversion, next to the other two, because the swscale contexts read
+/// the frame's range when they are built and are cached from then on - and *before*
+/// `tag_limited_range_for_prores_videotoolbox`, deliberately: that one works around an encoder
+/// bug and has to win, so a user asking for `Full` on prores NV12 still gets the limited-range
+/// samples that encoder requires rather than a broken file.
+fn set_output_range(out_frame: &mut Video, range: OutputRange) {
+    use ffmpeg_next::util::color::Range;
+    match range {
+        // Keep whatever the decoded source carried, which is what happened before this existed.
+        OutputRange::SameAsSource => { },
+        OutputRange::Limited => out_frame.set_color_range(Range::MPEG),
+        OutputRange::Full    => out_frame.set_color_range(Range::JPEG),
+    }
+}
+
 /// The colour stage is RGB-only, so it must never run on a plane that cannot carry RGB:
 /// a single-channel `Luma8` / `Luma16` / `R32f` plane or a two-channel `UV8` / `UV16` one.
 /// This is applied to every plane `create_planes_proc!` builds, so no dispatch arm can
 /// bypass it whatever the flags say.
 fn should_bake_color<T: PixelType>(bake_color: bool) -> bool {
     bake_color && T::COUNT >= 3
+}
+
+/// Whether `timestamp_us` falls outside every trim range, i.e. this output frame should be
+/// replaced with the configured background rather than real (trimmed-away) content.
+/// Factored out so the trailing frames a temporal window drains after decoding ends
+/// (`timestamp_us` no longer arriving from the decode loop) can compute the same thing the
+/// live per-frame path does.
+fn compute_fill_with_background(pad_with_black: bool, trim_ranges: &[(f64, f64)], duration_ms: f64, timestamp_us: i64) -> bool {
+    pad_with_black && !trim_ranges.is_empty() &&
+        !trim_ranges.iter().any(|x| timestamp_us >= (x.0 * duration_ms * 1000.0).round() as i64 &&
+                                    timestamp_us <= (x.1 * duration_ms * 1000.0).round() as i64)
+}
+
+/// A decoded frame plus the two per-frame values that must travel with it through the
+/// temporal window.
+///
+/// Emission is delayed by `k` frames, so anything derived from the frame's own position in
+/// the timeline has to be captured at push time and restored at emit time. Recomputing
+/// either from the *centre* timestamp at emit time is wrong:
+///
+/// - `out_ts` is the normalised output PTS (`ffmpeg_video.rs` builds it as
+///   `ts - frame_ts.first + frame_ts.add_video`, then applies the speed ramp on top). The
+///   window's `centre_ts` is the raw decoder timestamp - a *different domain*. Substituting
+///   one for the other is a no-op on an untrimmed, unscaled, single-range clip and silently
+///   shifts or breaks every other export.
+/// - `fill_bg` is compared against `trim_ranges`, which are fractions of the *unscaled*
+///   duration, so it must be computed before the `fps_scale` division.
+struct WindowFrame {
+    out_ts: i64,
+    /// The frame-rate/speed-ramp duplication counts computed for *this* frame. Like
+    /// `out_ts`, they describe the frame they were computed for, so emitting frame `N - k`
+    /// while `rate_control` still holds frame `N`'s counts would duplicate the wrong frame
+    /// and collide with the next frame's timestamp slot.
+    repeat_times: i64,
+    repeat_interval: i64,
+    fill_bg: bool,
+    frame: Video,
+}
+
+/// Reborrows a shared frame reference as mutable, for APIs (`data_mut`, `swscale::Context::run`
+/// as the source) that only ever read through it despite requiring `&mut` in their signature.
+///
+/// Needed because the temporal window used for denoising hands out `&Video` for the centre
+/// frame and its references alike - the centre frame doubles as a reference for its
+/// neighbours, so no genuine `&mut` can coexist with those shared borrows. Every call site
+/// here only *reads* through the result; the window's contract (no `push` while an `Emission`
+/// is alive) is what makes that sound despite going through `&mut`.
+///
+/// `rustc`'s `invalid_reference_casting` lint flags the direct `&T as *const T as *mut T`
+/// shape as always-UB regardless of usage, so this is deliberately exempted rather than
+/// worked around - the point of centralising it in one function is that the actual safety
+/// argument (read-only use, no concurrent mutation) lives in exactly one place to audit.
+#[allow(invalid_reference_casting)]
+fn as_mut_video(v: &Video) -> &mut Video {
+    unsafe { &mut *(v as *const Video as *mut Video) }
+}
+
+/// Converts `src` to `target` format, into a freshly-allocated frame. Used only for
+/// temporal-window reference frames that need format conversion before undistortion: unlike
+/// the centre frame (which can reuse `Converter`'s single cached scratch buffer across
+/// calls, since only one is ever alive at a time), every reference has to keep its own
+/// independent buffer alive simultaneously alongside the centre and every other reference -
+/// reusing one shared scratch buffer across them would make each conversion silently
+/// overwrite the last.
+///
+/// `color_aware` mirrors `Converter::convert_pixel_format_color_aware` vs
+/// `convert_pixel_format`, and must match whichever one the *centre* frame goes through -
+/// the gather compares references against the centre by value, so the two have to land in
+/// the same value space. Getting this wrong does not merely tint the references: the
+/// rejection Gaussian measures the difference between a reference and the centre, so a
+/// systematic offset makes it reject them. On BT.709 footage swscale's default (601)
+/// coefficients diverge only on saturated colour, which would switch denoising off on
+/// coloured areas while leaving it working on grey; on a full-range source tagged
+/// `Range::JPEG` (see `ffmpeg_video.rs`'s retagging), a default `srcRange = 0` applies a
+/// ~1.16 gain about black to every reference pixel and rejects all of them, leaving a
+/// gather that costs full price and does nothing.
+fn convert_frame_to_format(src: &Video, target: Pixel, interpolation: ffmpeg_next::software::scaling::flag::Flags, color_aware: bool) -> Result<Video, FFmpegError> {
+    if src.format() == target {
+        return Ok(src.clone());
+    }
+    let mut out = Video::new(target, src.width(), src.height());
+    let mut conv = ffmpeg_next::software::scaling::Context::get(src.format(), src.width(), src.height(), target, src.width(), src.height(), interpolation)?;
+    if color_aware {
+        // The intermediate is packed RGB, which is full range by convention - the same
+        // reasoning, and the same arguments, as the centre frame's conversion.
+        out.set_color_range(ffmpeg_next::util::color::Range::JPEG);
+        unsafe { ffmpeg_video_converter::Converter::set_color_details(&mut conv, src.color_space(), src.color_range(), out.color_range()); }
+    } else {
+        // The unknown-format -> YUV444P16LE fallback is YUV->YUV and round-trips through
+        // swscale's defaults on the centre frame too, so leaving the context unconfigured
+        // is what keeps the two sides matched here.
+        out.set_color_range(src.color_range());
+    }
+    conv.run(as_mut_video(src), &mut out)?;
+    Ok(out)
+}
+
+/// Runs every plane closure over one frame (plus its temporal references) into `output_frame`.
+type PlaneClosures = Vec<Box<dyn FnMut(i64, &Video, &[&Video], &[i64], &mut Video, usize, bool)>>;
+fn run_planes(planes: &mut PlaneClosures, timestamp_us: i64, frame: &Video, references: &[&Video], reference_timestamps: &[i64], out_frame: &mut Video, fill_with_background: bool) {
+    for (i, cb) in planes.iter_mut().enumerate() {
+        (*cb)(timestamp_us, frame, references, reference_timestamps, out_frame, i, fill_with_background);
+    }
+}
+
+/// The per-frame dispatch that used to live inline as the `undistort_frame` closure plus the
+/// `color_convert_to`/format-match block around it. Pulled out to a free function, parameterised
+/// over everything it used to capture, so both the live decode path (`on_frame`) and the
+/// temporal window's drain (`on_finish`, run once decoding has already finished) can call the
+/// exact same logic on a centre frame plus its references.
+#[allow(clippy::too_many_arguments)]
+fn process_and_undistort(
+    planes: &mut PlaneClosures,
+    converter: &mut ffmpeg_video_converter::Converter,
+    color_convert_to: Option<Pixel>,
+    output_range: OutputRange,
+    output_color_space: OutputColorSpace,
+    is_prores_videotoolbox: bool,
+    ffmpeg_interpolation: ffmpeg_next::software::scaling::flag::Flags,
+    timestamp_us: i64,
+    frame: &Video,
+    references: &[&Video],
+    reference_timestamps: &[i64],
+    output_frame: &mut Video,
+    fill_with_background: bool,
+) -> Result<(), FFmpegError> {
+    if let Some(target) = color_convert_to {
+        set_output_range(output_frame, output_range);
+        tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
+        tag_output_color_space(output_frame, output_color_space);
+        let mut owned_refs: Vec<Video> = Vec::with_capacity(references.len());
+        for r in references {
+            owned_refs.push(convert_frame_to_format(r, target, ffmpeg_interpolation, true)?);
+        }
+        let ref_slices: Vec<&Video> = owned_refs.iter().collect();
+        converter.convert_pixel_format_color_aware(as_mut_video(frame), output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
+            run_planes(planes, timestamp_us, converted_frame, &ref_slices, reference_timestamps, converted_output, fill_with_background);
+        })?;
+    } else {
+        match frame.format() {
+            Pixel::VIDEOTOOLBOX | // Pixel::D3D11 |
+            Pixel::NV12 | Pixel::NV21 | Pixel::YUV420P | Pixel::YUVJ420P |
+            Pixel::P010LE | Pixel::P016LE | Pixel::P210LE | Pixel::P216LE | Pixel::P410LE | Pixel::P416LE |
+            Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
+            Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
+            Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE |
+            Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE |
+            Pixel::AYUV64LE | Pixel::GBRAPF32LE | Pixel::GBRPF32LE |
+            Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE => {
+                run_planes(planes, timestamp_us, frame, references, reference_timestamps, output_frame, fill_with_background);
+            },
+            _ => {
+                let mut owned_refs: Vec<Video> = Vec::with_capacity(references.len());
+                for r in references {
+                    owned_refs.push(convert_frame_to_format(r, Pixel::YUV444P16LE, ffmpeg_interpolation, false)?);
+                }
+                let ref_slices: Vec<&Video> = owned_refs.iter().collect();
+                converter.convert_pixel_format(as_mut_video(frame), output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
+                    run_planes(planes, timestamp_us, converted_frame, &ref_slices, reference_timestamps, converted_output, fill_with_background);
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &gyroflow_core::InputFile, render_options: &RenderOptions, gpu_decoder_index: i32, trim_range_ind: Option<usize>, cancel_flag: Arc<AtomicBool>, pause_flag: Arc<AtomicBool>, encoder_initialized: F2) -> Result<(), FFmpegError>
@@ -339,7 +570,27 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     if cfg!(target_os = "android") {
         decoder_options.set("ndk_codec", "1");
     }
-    let gpu_decoding = stab.gpu_decoding.load(std::sync::atomic::Ordering::SeqCst);
+    // How many past/future neighbours each output frame is denoised against. Computed from
+    // the *input* frame size (not the output/render size) because that's what the cost of
+    // gathering references scales with. `0` means denoising is off - the window below then
+    // emits every frame immediately, on push, with no reference gathering at all.
+    let denoise_k = {
+        let (w, h) = stab.params.read().size;
+        stab.denoise.read().radius_for_size(w, h)
+    };
+
+    let mut gpu_decoding = stab.gpu_decoding.load(std::sync::atomic::Ordering::SeqCst);
+    if denoise_k > 0 && gpu_decoding {
+        // Ruling 12: reference upload (Task 7) only handles `BufferSource::Cpu`. The
+        // zero-copy GPU-interop sources (D3D11, CUDA, Metal, Vulkan) log and skip
+        // references, which would make denoising silently do nothing on the majority of
+        // exports (GPU decoding is the default) - the user waits through a whole render and
+        // gets an unchanged file back. Forcing CPU decoding here is a modest extra cost
+        // (denoising already pays for a multi-frame gather) in exchange for the feature
+        // actually working.
+        log::info!("Denoising requires CPU-decoded frames (radius {denoise_k}); forcing software decoding for this render.");
+        gpu_decoding = false;
+    }
     let mut proc = FfmpegProcessor::from_file(&input_file.url, gpu_decoding && gpu_decoder_index >= 0, gpu_decoder_index as usize, Some(decoder_options))?;
 
     let render_options_dict = render_options.get_encoder_options_dict();
@@ -517,7 +768,10 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
 
     log::debug!("start_us: {}, render_duration: {}, render_frame_count: {}", start_us, render_duration, render_frame_count);
 
-    let mut planes = Vec::<Box<dyn FnMut(i64, &mut Video, &mut Video, usize, bool)>>::new();
+    // Shared between the live decode path (`on_frame`) and the drain of the temporal
+    // window's tail (`on_finish`), which runs as a separate closure after decoding has
+    // already finished - see `process_and_undistort`.
+    let planes: Rc<RefCell<PlaneClosures>> = Rc::new(RefCell::new(Vec::new()));
 
     // Colour adjustments are baked into the render only when the user asked for it.
     // Read once, so the decision (and the pixel format it implies) cannot change between
@@ -529,21 +783,60 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
         let c = stab.color.read();
         c.is_active() && c.bake_in_render
     };
+    // Read once, next to `bake_color`, because the two must describe the same decision: the
+    // tag is only ever written where the grade was actually baked in.
+    let output_color_space = stab.color.read().output_color_space;
+    // Same reasoning, and the same gate: converting range is only possible on the baking path,
+    // because that is the only one that produces a full-range RGB intermediate for swscale to
+    // convert *from*. See `set_output_range`.
+    let output_range = stab.color.read().output_range;
     // The packed RGB format the source must be converted to for the colour stage, decided
     // once when the planes are built and reused by the per-frame dispatch below, so the two
-    // cannot disagree about the layout the closures were built for.
-    let mut color_convert_to: Option<Pixel> = None;
+    // cannot disagree about the layout the closures were built for. `Cell` (not a plain
+    // `Option`) for the same reason `planes` is behind an `Rc<RefCell<_>>`: `on_finish`'s
+    // drain needs to read the value the first `on_frame` call settled on.
+    let color_convert_to: Rc<std::cell::Cell<Option<Pixel>>> = Rc::new(std::cell::Cell::new(None));
 
     let is_prores_videotoolbox = proc.video_codec.as_deref() == Some("prores_videotoolbox");
 
     let progress2 = progress.clone();
-    let mut process_frame = 0;
+    let progress_finish = progress.clone();
+    // `Rc<Cell<_>>` rather than a plain local: the drain (`on_finish`) needs to keep counting
+    // from wherever the live decode path left off, and to remain accurate for the progress
+    // report on both sides, it counts *emitted* frames (see the `on_frame`/`on_finish` bodies
+    // below) rather than decoded ones - with output delayed by `denoise_k`, counting decoded
+    // frames would run `denoise_k` ahead and finish short of 100%.
+    let process_frame = Rc::new(std::cell::Cell::new(0usize));
     if let Some(i) = trim_range_ind {
         for x in 0..i {
             let x = org_trim_ranges[x];
-            process_frame += ((x.1 - x.0) * total_frame_count as f64).round() as usize;
+            process_frame.set(process_frame.get() + ((x.1 - x.0) * total_frame_count as f64).round() as usize);
         }
     }
+
+    // Delays output by `denoise_k` frames so each denoised frame sees both its past and
+    // future neighbours; see `temporal_window`. At `denoise_k == 0` the window is bypassed
+    // entirely (see `on_frame`), so denoising off costs neither a clone nor a delay.
+    //
+    // The window is drained at every trim-range boundary as well as at end of decode (see
+    // `ffmpeg_processor.rs`), so it never spans a cut. That matters for more than image
+    // quality: frames held across a seam would be emitted *after* the next range started,
+    // carrying their own `out_ts` into the middle of the new range's timeline, and the
+    // `add_video` the next range is offset by is derived from the last emitted frame - so a
+    // window left full at a seam makes PTS jump backwards there.
+    let window: Rc<RefCell<temporal_window::TemporalWindow<WindowFrame>>> = Rc::new(RefCell::new(temporal_window::TemporalWindow::new(denoise_k)));
+    let window_finish = window.clone();
+    let planes_finish = planes.clone();
+    let color_convert_to_finish = color_convert_to.clone();
+    let process_frame_finish = process_frame.clone();
+    // Owns the buffer the drain writes denoised pixels into before encoding. Deliberately
+    // *not* `vt.buffers.output_frame_pre`/`output_frame_post` (the live path's buffer):
+    // `encode_extra_frame` needs `&mut VideoTranscoder` to reach the encoder, and that
+    // buffer is itself a field of `VideoTranscoder` - passing a borrow derived from `vt`
+    // back into a method that also wants `&mut vt` doesn't borrow-check. A fully independent
+    // owned frame avoids that self-borrow; it's (re)sized to match the live buffer's
+    // format/dimensions the first time the drain runs.
+    let drain_output_frame: Rc<RefCell<Option<Video>>> = Rc::new(RefCell::new(None));
 
     proc.on_encoder_initialized(|enc: &ffmpeg_next::encoder::video::Video| {
         encoder_initialized(enc.codec().map(|x| x.name().to_string()).unwrap_or_default());
@@ -562,9 +855,9 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     let render_globals = Rc::new(RefCell::new(zero_copy::RenderGlobals::default()));
 
     proc.on_frame(move |mut timestamp_us, input_frame, output_frame, converter, rate_control| {
-        let fill_with_background = render_options.pad_with_black && !trim_ranges.is_empty() &&
-            !trim_ranges.iter().any(|x| timestamp_us >= (x.0 * duration_ms * 1000.0).round() as i64 &&
-                                        timestamp_us <= (x.1 * duration_ms * 1000.0).round() as i64);
+        // Computed before the `fps_scale` division below, because `trim_ranges` are
+        // fractions of the unscaled duration.
+        let fill_with_background = compute_fill_with_background(render_options.pad_with_black, &trim_ranges, duration_ms, timestamp_us);
 
         if let Some(scale) = fps_scale {
             timestamp_us = (timestamp_us as f64 / scale).round() as i64;
@@ -577,7 +870,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             prev_real_ts = rate_control.out_timestamp_us;
             if ramped_ts < (final_ts as f64 + interval as f64 / 2.0) { // interval/2 because we want frame in the middle of the range, not in the end
                 rate_control.repeat_times = 0; // skip this frame
-                process_frame += 1;
+                process_frame.set(process_frame.get() + 1);
                 return Ok(());
             } else {
                 let repeat_times = current_interval / interval as f64;
@@ -636,21 +929,33 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     plane.init_size(org_sizes.0, org_sizes.1);
                     plane.set_compute_params(compute_params);
                     let render_globals = render_globals.clone();
-                    $planes.push(Box::new(move |timestamp_us: i64, in_frame_data: &mut Video, out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
+                    let denoise = stab.denoise.clone();
+                    $planes.borrow_mut().push(Box::new(move |timestamp_us: i64, in_frame_data: &Video, references: &[&Video], reference_timestamps: &[i64], out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
                         let mut g = render_globals.borrow_mut();
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
                         let timestamp_us = timestamp_us + offset_us;
+                        // The references go through the same `get_frame_transform_at`, in the same
+                        // timestamp domain, so the frame offset has to apply to them too. Shifting
+                        // only the centre warps every reference with `frame_offset` frames' worth of
+                        // stale camera orientation, which on a pan lands them tens of pixels away:
+                        // the rejection weight then discards them in textured areas and blends them
+                        // into directional smearing in flat ones.
+                        let reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
                         let mut buffers = Buffers {
-                            input:  get_plane_buffer(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
-                            output: get_plane_buffer(out_frame_data, out_size, plane_index, &mut g, wgpu_format)
+                            input:  get_plane_buffer_ref(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
+                            output: get_plane_buffer(out_frame_data, out_size, plane_index, &mut g, wgpu_format),
+                            references: references.iter().map(|r| {
+                                let ref_size = zero_copy::get_plane_size(*r, plane_index);
+                                get_plane_buffer_ref(*r, ref_size, plane_index, &mut g, wgpu_format)
+                            }).collect(),
                         };
 
                         if plane.initialized_backend.is_none() || plane.pending_device_change.is_some() {
                             plane.ensure_ready_for_processing::<$t>(timestamp_us, None, &mut buffers);
                             plane.stab_data.clear();
                         }
-                        let mut transform = plane.get_frame_transform_at::<$t>(timestamp_us, None, &mut buffers);
+                        let mut transform = plane.get_frame_transform_with_references::<$t>(timestamp_us, &reference_timestamps, None, &buffers);
                         transform.kernel_params.pixel_value_limit = $max_val;
                         transform.kernel_params.max_pixel_value = $max_val;
                         if plane.initialized_backend.is_wgpu() && $t::wgpu_format().map(|x| x.2).unwrap_or_default() {
@@ -658,6 +963,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                             transform.kernel_params.max_pixel_value = 1.0;
                         }
                         transform.kernel_params.plane_index = plane_index as i32;
+                        transform.kernel_params.denoise_sigma = denoise.read().sigma_for_plane(plane_index as i32);
                         if fill_with_background {
                             transform.kernel_params.flags |= KernelParamsFlags::FILL_WITH_BACKGROUND.bits();
                         }
@@ -669,7 +975,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             };
         }
 
-        if planes.is_empty() {
+        if planes.borrow().is_empty() {
             // Good reference about video formats: https://source.chromium.org/chromium/chromium/src/+/master:media/base/video_frame.cc
             // https://gist.github.com/Jim-Bar/3cbba684a71d1a9d468a6711a6eddbeb
 
@@ -693,8 +999,8 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     ::log::warn!("Colour baking is not supported for hardware frames ({:?}); rendering without colour adjustments", input_frame.format());
                     bake_color = false;
                 } else {
-                    color_convert_to = packed_color_format(format);
-                    if color_convert_to.is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA) {
+                    color_convert_to.set(packed_color_format(format));
+                    if color_convert_to.get().is_none() && !matches!(format, Pixel::RGB24 | Pixel::RGBA) {
                         // `packed_color_format` also returns `None` when swscale cannot
                         // handle the format, and those sources dispatch to 3- and 4-channel
                         // plane types that `should_bake_color` would happily grade - as YUV,
@@ -706,14 +1012,16 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 }
             }
 
-            if let Some(target) = color_convert_to {
+            if let Some(target) = color_convert_to.get() {
                 // Baking: the colour stage grades R, G and B of one pixel at once, so the
                 // frame it sees must be packed RGB. `packed_color_format` picks the target
                 // and guarantees it is one of these two.
                 ::log::info!("Baking colour adjustments: converting {:?} to {:?}", format, target);
                 // Must happen before the first conversion: the swscale contexts read the
                 // frame's range when they are built, and they are cached from then on.
+                set_output_range(output_frame, output_range);
                 tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
+                tag_output_color_space(output_frame, output_color_space);
                 converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
                     if target == Pixel::RGBA {
                         create_planes_proc!(planes, (RGBA8,  converted_frame, converted_output, 0, [], 255.0), );
@@ -813,50 +1121,136 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 }
             }
         }
-        if planes.is_empty() {
+        if planes.borrow().is_empty() {
             return Err(FFmpegError::UnknownPixelFormat(input_frame.format()));
         }
 
-        let mut undistort_frame = |frame: &mut Video, out_frame: &mut Video| {
-            for (i, cb) in planes.iter_mut().enumerate() {
-                (*cb)(timestamp_us, frame, out_frame, i, fill_with_background);
-            }
-            progress2((process_frame as f64 / render_frame_count as f64, process_frame, render_frame_count, false, false));
-        };
+        if denoise_k == 0 {
+            // Denoising off: render the frame as it arrives, exactly as before this feature
+            // existed. No window, and - importantly - no `input_frame.clone()`, which would
+            // otherwise cost a full `av_frame_get_buffer` + `av_frame_copy` (~12 MB/frame at
+            // 4K 8-bit 4:2:0) on every export for nothing, and cannot copy a hardware frame
+            // at all. `rate_control.out_timestamp_us` keeps the value `ffmpeg_video.rs`
+            // computed for it.
+            process_and_undistort(
+                &mut planes.borrow_mut(),
+                converter,
+                color_convert_to.get(),
+                output_range,
+                output_color_space,
+                is_prores_videotoolbox,
+                ffmpeg_interpolation,
+                timestamp_us,
+                input_frame,
+                &[],
+                &[],
+                output_frame,
+                fill_with_background,
+            )?;
+            process_frame.set(process_frame.get() + 1);
+            progress2((process_frame.get() as f64 / render_frame_count as f64, process_frame.get(), render_frame_count, false, false));
+            return Ok(());
+        }
 
-        if let Some(target) = color_convert_to {
-            // The plane closures above were built for this converted packed RGB frame, so
-            // the frame handed to them must go through the same conversion. `color_convert_to`
-            // is the one value both decisions read, so they cannot disagree.
-            tag_limited_range_for_prores_videotoolbox(output_frame, is_prores_videotoolbox);
-            converter.convert_pixel_format_color_aware(input_frame, output_frame, target, ffmpeg_interpolation, |converted_frame, converted_output| {
-                undistort_frame(converted_frame, converted_output);
-            })?;
-        } else {
-            match input_frame.format() {
-                Pixel::VIDEOTOOLBOX | // Pixel::D3D11 |
-                Pixel::NV12 | Pixel::NV21 | Pixel::YUV420P | Pixel::YUVJ420P |
-                Pixel::P010LE | Pixel::P016LE | Pixel::P210LE | Pixel::P216LE | Pixel::P410LE | Pixel::P416LE |
-                Pixel::YUV420P10LE | Pixel::YUV420P12LE | Pixel::YUV420P14LE | Pixel::YUV420P16LE |
-                Pixel::YUV422P10LE | Pixel::YUV422P12LE | Pixel::YUV422P14LE | Pixel::YUV422P16LE |
-                Pixel::YUV444P10LE | Pixel::YUV444P12LE | Pixel::YUV444P14LE | Pixel::YUV444P16LE |
-                Pixel::YUVA444P10LE | Pixel::YUVA444P12LE | Pixel::YUVA444P16LE |
-                Pixel::AYUV64LE | Pixel::GBRAPF32LE | Pixel::GBRPF32LE |
-                Pixel::RGB24 | Pixel::RGBA | Pixel::RGB48BE | Pixel::RGBA64BE => {
-                    undistort_frame(input_frame, output_frame)
-                },
-                _ => {
-                    converter.convert_pixel_format(input_frame, output_frame, Pixel::YUV444P16LE, ffmpeg_interpolation, |converted_frame, converted_output| {
-                        undistort_frame(converted_frame, converted_output);
-                    })?;
-                }
+        // Delayed by `denoise_k` frames so each output frame sees both its past and future
+        // neighbours (see `temporal_window`). `out_ts` and `fill_bg` are captured here and
+        // restored on emission - see `WindowFrame` for why recomputing them from the centre
+        // timestamp is wrong.
+        let item = WindowFrame {
+            out_ts: rate_control.out_timestamp_us,
+            repeat_times: rate_control.repeat_times,
+            repeat_interval: rate_control.repeat_interval,
+            fill_bg: fill_with_background,
+            frame: input_frame.clone(),
+        };
+        match window.borrow_mut().push(timestamp_us, item) {
+            Some(emission) => {
+                rate_control.out_timestamp_us  = emission.centre.out_ts;
+                rate_control.repeat_times      = emission.centre.repeat_times;
+                rate_control.repeat_interval   = emission.centre.repeat_interval;
+                let references: Vec<&Video> = emission.references.iter().map(|r| &r.frame).collect();
+                process_and_undistort(
+                    &mut planes.borrow_mut(),
+                    converter,
+                    color_convert_to.get(),
+                    output_range,
+                    output_color_space,
+                    is_prores_videotoolbox,
+                    ffmpeg_interpolation,
+                    emission.centre_ts,
+                    &emission.centre.frame,
+                    &references,
+                    &emission.reference_timestamps,
+                    output_frame,
+                    emission.centre.fill_bg,
+                )?;
+                process_frame.set(process_frame.get() + 1);
+                progress2((process_frame.get() as f64 / render_frame_count as f64, process_frame.get(), render_frame_count, false, false));
+            }
+            None => {
+                // The window is still filling: nothing new was written into `output_frame`
+                // this call, so suppress the encode for this decoded frame - the same lever
+                // the frame-rate conversion path above uses to skip a frame.
+                rate_control.repeat_times = 0;
             }
         }
 
-        process_frame += 1;
-        // log::debug!("process_frame: {}, timestamp_us: {}", process_frame, timestamp_us);
-
         Ok(())
+    });
+
+    proc.on_finish(move |vt, rate_control, octx, ost_time_bases| {
+        // The last `denoise_k` frames are still in the window's ring: without this they are
+        // silently dropped and the output is `denoise_k` frames short of the input - a
+        // failure that is very easy to miss, since the file still plays fine.
+        let mut result = Ok(());
+        window_finish.borrow_mut().drain_each(|emission| {
+            if result.is_err() { return; }
+            let outcome = (|| -> Result<(), FFmpegError> {
+                let mut buf_cell = drain_output_frame.borrow_mut();
+                if buf_cell.is_none() {
+                    let template = vt.output_frame_template().ok_or(FFmpegError::FrameEmpty)?;
+                    let mut nf = Video::new(template.format(), template.width(), template.height());
+                    // The same prop copy the live path's output frames get (`ffmpeg_video.rs`),
+                    // not just the colour range: `copy_frame_props` also carries
+                    // colour primaries/trc/space and chroma location, and a drained tail frame
+                    // arriving tagged differently from every other frame is an asymmetry with no
+                    // upside. `pts` is copied too but is overwritten per frame by
+                    // `encode_extra_frame`'s `set_pts`.
+                    unsafe { ffmpeg_video::VideoTranscoder::copy_frame_props(nf.as_mut_ptr(), template.as_ptr()); }
+                    *buf_cell = Some(nf);
+                }
+                let output_frame = buf_cell.as_mut().unwrap();
+
+                rate_control.out_timestamp_us = emission.centre.out_ts;
+                rate_control.repeat_times     = emission.centre.repeat_times.max(1);
+                rate_control.repeat_interval  = emission.centre.repeat_interval;
+                let references: Vec<&Video> = emission.references.iter().map(|r| &r.frame).collect();
+                process_and_undistort(
+                    &mut planes_finish.borrow_mut(),
+                    &mut vt.converter,
+                    color_convert_to_finish.get(),
+                    output_range,
+                    output_color_space,
+                    is_prores_videotoolbox,
+                    ffmpeg_interpolation,
+                    emission.centre_ts,
+                    &emission.centre.frame,
+                    &references,
+                    &emission.reference_timestamps,
+                    output_frame,
+                    emission.centre.fill_bg,
+                )?;
+                if vt.encode_extra_frame(output_frame, rate_control, octx, ost_time_bases)? {
+                    process_frame_finish.set(process_frame_finish.get() + 1);
+                    progress_finish((process_frame_finish.get() as f64 / render_frame_count as f64, process_frame_finish.get(), render_frame_count, false, false));
+                }
+                Ok(())
+            })();
+            if let Err(e) = outcome {
+                result = Err(e);
+            }
+        });
+        result
     });
 
     let mut filename = render_options.output_filename.clone();
@@ -1045,6 +1439,104 @@ unsafe fn show_help_children(mut class: *const ffi::AVClass, flags: c_int) {
     // }
 }
 
+/// What the pixel format warning in Export settings needs to know, decided before any render.
+///
+/// The check the renderer performs at `ffmpeg_video.rs` - "is the frame's format in the encoder's
+/// `pix_fmts`?" - needs nothing that only exists mid-render: the list is a static property of the
+/// encoder, read straight out of ffmpeg. Running it up front is what lets the answer be a warning
+/// beside the codec picker rather than a modal with twenty-one buttons after the export has
+/// already started and failed.
+///
+/// `source_format` is the raw ffmpeg name from the file (`stream.video[0].codec.format_name`),
+/// e.g. `"yuv422p10le"`. Fields in the returned object:
+///
+/// - `ok` - the export can run as configured. Everything below is then absent.
+/// - `encoder` - which encoder the codec/GPU choice actually resolves to, for the message.
+/// - `source` - the source format, echoed back so QML does not have to normalise it.
+/// - `suggestion` - the format to encode as instead, ready to put in `RenderOptions::pixel_format`.
+/// - `same_quality` - the suggestion keeps the source's bit depth *and* chroma subsampling, so
+///   accepting it costs nothing. False means it is still the best available, but it does lose
+///   something, and the message has to say so.
+/// - `cpu_only` - no format works on this encoder at all; the only way out is CPU encoding.
+///
+/// `ok` is also returned when the source format is unknown to ffmpeg or the encoder cannot be
+/// resolved. Neither is a reason to warn: there is nothing to suggest, and the runtime dialog is
+/// still there to catch it.
+/// The answer, as plain data. A struct rather than a JSON value so the decision can be tested
+/// without Qt in the picture; `render_queue.rs` does the conversion for QML.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PixelFormatCheck {
+    pub ok: bool,
+    pub encoder: String,
+    pub source: String,
+    pub suggestion: String,
+    pub same_quality: bool,
+    pub cpu_only: bool,
+}
+
+pub fn check_export_pixel_format(codec: &str, gpu: bool, source_format: &str) -> PixelFormatCheck {
+    use std::str::FromStr;
+    let ok = PixelFormatCheck { ok: true, ..Default::default() };
+
+    let Ok(source) = Pixel::from_str(&source_format.to_ascii_lowercase()) else {
+        ::log::debug!("check_export_pixel_format: unknown source format {source_format:?}");
+        return ok;
+    };
+
+    let encoder_name = get_default_encoder(codec, gpu);
+    let Some(enc) = ffmpeg_next::encoder::find_by_name(&encoder_name) else { return ok; };
+    let supported = unsafe {
+        if enc.as_ptr().is_null() { return ok; }
+        ffmpeg_hw::pix_formats_to_vec((*enc.as_ptr()).pix_fmts)
+    };
+    // An encoder that advertises nothing takes anything as far as this check is concerned - the
+    // renderer's own test is `!supported.contains(..)`, which is false for an empty list too.
+    if supported.is_empty() { return ok; }
+
+    // The advertised list is necessary but not sufficient: it comes from the ffmpeg build, while
+    // the refusal comes from the hardware. Both questions have to be asked, in that order - the
+    // list is free, the probe is not.
+    if supported.contains(&source) && ffmpeg_hw::encoder_accepts_format(&encoder_name, source) { return ok; }
+
+    // Rank, probe the winner, and on refusal drop it and rank again. Ranking the whole list
+    // through the probe instead would mean opening an encoder session per candidate - twenty-one
+    // of them for NVENC, at ~100 ms each, on the UI thread. In practice this settles in one or
+    // two rounds; the cap is there so a thoroughly broken encoder cannot spin.
+    let mut remaining = supported.clone();
+    let mut suggestion = None;
+    for _ in 0..4 {
+        let Some(candidate) = ffmpeg_hw::find_best_matching_codec(source, &remaining) else { break };
+        if ffmpeg_hw::encoder_accepts_format(&encoder_name, candidate) {
+            suggestion = Some(candidate);
+            break;
+        }
+        remaining.retain(|&f| f != candidate);
+    }
+    ::log::debug!("check_export_pixel_format: {encoder_name} cannot take {source:?}, suggesting {suggestion:?}");
+
+    PixelFormatCheck {
+        ok:           false,
+        encoder:      encoder_name,
+        source:       format!("{source:?}").to_ascii_lowercase(),
+        suggestion:   suggestion.map(|f| format!("{f:?}").to_ascii_lowercase()).unwrap_or_default(),
+        same_quality: suggestion.map(|f| same_visual_quality(source, f)).unwrap_or(false),
+        cpu_only:     suggestion.is_none(),
+    }
+}
+
+/// Whether swapping `from` for `to` keeps every bit the source carried: same component depth and
+/// same chroma subsampling. Layout differences (planar versus semi-planar) do not count - the
+/// pixels are identical, only the memory order differs.
+fn same_visual_quality(from: Pixel, to: Pixel) -> bool {
+    unsafe {
+        let (a, b) = (ffi::av_pix_fmt_desc_get(from.into()), ffi::av_pix_fmt_desc_get(to.into()));
+        if a.is_null() || b.is_null() { return false; }
+        (*a).comp[0].depth   == (*b).comp[0].depth &&
+        (*a).log2_chroma_w   == (*b).log2_chroma_w &&
+        (*a).log2_chroma_h   == (*b).log2_chroma_h
+    }
+}
+
 pub fn get_default_encoder(codec: &str, gpu: bool) -> String {
     let encoder = ffmpeg_hw::find_working_encoder(&get_possible_encoders(codec, gpu), None);
     encoder.0.to_string()
@@ -1154,6 +1646,140 @@ pub fn test_decode() {
     let _ = proc.start_decoder_only(vec![(0.0, 1000.0)], Arc::new(AtomicBool::new(false)));
     ::log::debug!("Done in {:.3} ms", _time.elapsed().as_micros() as f64 / 1000.0);
 }*/
+
+#[cfg(test)]
+mod pixel_format_check_tests {
+    use super::*;
+    use ffmpeg_hw::find_best_matching_codec;
+
+    /// What `hevc_nvenc` reports on the machine this was written against, verbatim from
+    /// `Codec formats:` in gyroflow.log. Hardcoded so the ranking tests below are the same
+    /// everywhere, including on a machine with no NVIDIA GPU at all.
+    const NVENC_HEVC: &[Pixel] = &[
+        Pixel::YUV420P, Pixel::NV12, Pixel::P010LE, Pixel::YUV444P, Pixel::P016LE, Pixel::NV16,
+        Pixel::P210LE, Pixel::P216LE, Pixel::YUV444P16LE, Pixel::BGRA, Pixel::RGBA,
+        Pixel::X2RGB10LE, Pixel::X2BGR10LE, Pixel::GBRP, Pixel::GBRP16LE, Pixel::CUDA, Pixel::D3D11,
+    ];
+
+    /// The case the warning exists for: Sony 4:2:2 10-bit into the GPU H.265 encoder. `P210LE` is
+    /// the same layout with interleaved chroma, so the substitution is free - which is exactly
+    /// what makes it worth offering up front instead of a twenty-one button dialog after failure.
+    #[test]
+    fn a_422_10bit_source_is_offered_the_free_substitution() {
+        let picked = find_best_matching_codec(Pixel::YUV422P10LE, NVENC_HEVC);
+        assert_eq!(picked, Some(Pixel::P210LE));
+        assert!(same_visual_quality(Pixel::YUV422P10LE, Pixel::P210LE), "P210LE should cost nothing");
+    }
+
+    #[test]
+    fn a_supported_format_is_returned_unchanged() {
+        for f in [Pixel::YUV420P, Pixel::P010LE, Pixel::NV12] {
+            assert_eq!(find_best_matching_codec(f, NVENC_HEVC), Some(f));
+        }
+    }
+
+    /// Depth outranks chroma. A 10-bit 4:2:2 source offered a choice between "same chroma, 8 bit"
+    /// and "same depth, 4:2:0" must take the depth: chroma softening is recoverable-looking on
+    /// real footage, two lost bits in a gradient are not.
+    #[test]
+    fn keeping_bit_depth_beats_keeping_chroma() {
+        let supported = [Pixel::YUV422P, Pixel::YUV420P10LE];
+        assert_eq!(find_best_matching_codec(Pixel::YUV422P10LE, &supported), Some(Pixel::YUV420P10LE));
+    }
+
+    /// ...and when depth cannot be kept exactly, round up rather than down.
+    #[test]
+    fn depth_rounds_up_when_it_cannot_be_matched() {
+        let supported = [Pixel::YUV420P, Pixel::YUV420P12LE];
+        assert_eq!(find_best_matching_codec(Pixel::YUV420P10LE, &supported), Some(Pixel::YUV420P12LE));
+    }
+
+    /// An encoder advertises its hardware surfaces and its RGB layouts alongside real formats.
+    /// Neither is a substitute for a YUV source: `CUDA` is not a pixel layout, and `BGRA` would
+    /// silently insert a colour conversion. With nothing else on offer the honest answer is none,
+    /// which is what drives the "CPU encoding" wording in the warning.
+    #[test]
+    fn hardware_and_rgb_formats_are_not_offered_for_a_yuv_source() {
+        for supported in [
+            vec![Pixel::CUDA, Pixel::D3D11],
+            vec![Pixel::BGRA, Pixel::RGBA, Pixel::X2RGB10LE],
+            vec![Pixel::CUDA, Pixel::BGRA],
+        ] {
+            assert_eq!(find_best_matching_codec(Pixel::YUV422P10LE, &supported), None, "{supported:?}");
+        }
+    }
+
+    #[test]
+    fn an_encoder_that_advertises_nothing_yields_nothing() {
+        assert_eq!(find_best_matching_codec(Pixel::YUV422P10LE, &[]), None);
+    }
+
+    /// `same_visual_quality` is what decides whether the message promises the swap is free, so it
+    /// has to be strict about both axes, and indifferent to memory layout.
+    #[test]
+    fn same_visual_quality_compares_depth_and_chroma_only() {
+        assert!(same_visual_quality(Pixel::YUV420P10LE, Pixel::P010LE));   // planar vs semi-planar
+        assert!(same_visual_quality(Pixel::YUV420P,     Pixel::NV12));
+        assert!(!same_visual_quality(Pixel::YUV422P10LE, Pixel::P010LE));  // 4:2:2 -> 4:2:0
+        assert!(!same_visual_quality(Pixel::YUV420P10LE, Pixel::YUV420P)); // 10 bit -> 8 bit
+    }
+
+    /// A format string ffmpeg does not recognise must not produce a warning: there is nothing to
+    /// suggest, and a scary message about a file we failed to parse is worse than silence.
+    #[test]
+    fn an_unrecognised_source_format_never_warns() {
+        for s in ["", "not_a_format", "yuv422p10le_typo"] {
+            assert!(check_export_pixel_format("H.265/HEVC", true, s).ok, "{s:?} produced a warning");
+        }
+    }
+
+    /// The probe has to be able to say yes as well as no, or the warning would decide every
+    /// encoder is useless and always recommend CPU. libx264 is present in every build here and
+    /// takes yuv420p; nothing takes a planar float layout, and it is not in x264's list either.
+    #[test]
+    fn the_probe_distinguishes_a_usable_format_from_an_impossible_one() {
+        if ffmpeg_next::encoder::find_by_name("libx264").is_none() { return; }
+        assert!( ffmpeg_hw::encoder_accepts_format("libx264", Pixel::YUV420P));
+        assert!(!ffmpeg_hw::encoder_accepts_format("libx264", Pixel::GBRPF32LE));
+    }
+
+    /// A name ffmpeg has never heard of must be a clean `false`, not a panic or a null deref -
+    /// `get_default_encoder` can return one when a codec has no encoder on this machine.
+    #[test]
+    fn probing_an_encoder_that_does_not_exist_is_false() {
+        assert!(!ffmpeg_hw::encoder_accepts_format("no_such_encoder", Pixel::YUV420P));
+        assert!(!ffmpeg_hw::encoder_accepts_format("", Pixel::YUV420P));
+    }
+
+    /// Machine-independent invariant, run against whatever encoders this machine really has: if
+    /// the check says no, the way out it offers must actually exist. Suggesting a format the
+    /// encoder cannot take would replace one failed export with another.
+    #[test]
+    fn any_suggestion_is_one_the_resolved_encoder_accepts() {
+        for codec in ["H.264/AVC", "H.265/HEVC", "AV1", "ProRes", "DNxHD", "PNG Sequence"] {
+            for gpu in [true, false] {
+                for source in ["yuv422p10le", "yuv420p", "yuv444p12le", "gbrpf32le"] {
+                    let c = check_export_pixel_format(codec, gpu, source);
+                    if c.ok { continue; }
+
+                    assert_eq!(c.suggestion.is_empty(), c.cpu_only, "{codec} gpu={gpu} {source}: cpu_only must mean no suggestion");
+                    if c.cpu_only { continue; }
+
+                    let enc = ffmpeg_next::encoder::find_by_name(&c.encoder).expect("resolved encoder must exist");
+                    let supported = unsafe { ffmpeg_hw::pix_formats_to_vec((*enc.as_ptr()).pix_fmts) };
+                    let suggested = supported.iter().find(|f| format!("{f:?}").to_ascii_lowercase() == c.suggestion);
+                    assert!(suggested.is_some(), "{codec} gpu={gpu} {source}: suggested {} which {} does not advertise", c.suggestion, c.encoder);
+
+                    // The stronger half, and the one that matters: advertised is not the same as
+                    // usable. This is what stops the warning offering P210LE on a card with no
+                    // 4:2:2 encode block.
+                    assert!(ffmpeg_hw::encoder_accepts_format(&c.encoder, *suggested.unwrap()),
+                        "{codec} gpu={gpu} {source}: suggested {} which {} advertises but will not open with", c.suggestion, c.encoder);
+                }
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod packed_color_format_tests {

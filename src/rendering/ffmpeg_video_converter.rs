@@ -37,7 +37,7 @@ impl<'a> Converter {
     ///
     /// `yuv_space` is the colour space of whichever side is YUV; it is ignored for the RGB
     /// side, which has no matrix of its own.
-    unsafe fn set_color_details(ctx: &mut software::scaling::Context, yuv_space: util::color::Space, src_range: util::color::Range, dst_range: util::color::Range) {
+    pub(crate) unsafe fn set_color_details(ctx: &mut software::scaling::Context, yuv_space: util::color::Space, src_range: util::color::Range, dst_range: util::color::Range) {
         use std::os::raw::c_int;
         let src_range: c_int = if src_range == util::color::Range::JPEG { 1 } else { 0 };
         let dst_range: c_int = if dst_range == util::color::Range::JPEG { 1 } else { 0 };

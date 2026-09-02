@@ -380,6 +380,84 @@ pub fn initialize_hwframes_context(encoder_ctx: *mut ffi::AVCodecContext, _frame
     Ok(())
 }
 
+/// Answers, by actually trying it, whether this machine's encoder will open with `pix_fmt`.
+///
+/// An encoder's advertised `pix_fmts` list belongs to the ffmpeg build, not to the hardware. On
+/// this machine `hevc_nvenc` lists `P210LE`, but an Ampere card has no 4:2:2 NVENC block at all
+/// (that arrived with Blackwell), and the truth only surfaces inside `avcodec_open2`:
+///
+/// ```text
+///   [hevc_nvenc] YUV422P not supported
+///   [hevc_nvenc] Provided device doesn't support required NVENC features
+/// ```
+///
+/// That is a hard failure at render time, not the recoverable "unsupported pixel format" dialog,
+/// so a warning built on the advertised list alone would send the user straight into it. Opening
+/// a throwaway 640x480 encoder is the same question the renderer asks, asked early.
+///
+/// Cached: opening an NVENC session costs on the order of 100 ms, and this is called from the UI
+/// thread while the user is picking a codec. The answer cannot change while the app is running -
+/// it is a property of the hardware and the driver.
+pub fn encoder_accepts_format(encoder_name: &str, pix_fmt: format::Pixel) -> bool {
+    // Keyed on the raw AVPixelFormat value: `format::Pixel` is comparable but not hashable.
+    static PROBES: LazyLock<Mutex<HashMap<(String, i32), bool>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let key = (encoder_name.to_string(), Into::<ffi::AVPixelFormat>::into(pix_fmt) as i32);
+    if let Some(&cached) = PROBES.lock().get(&key) { return cached; }
+
+    let accepted = unsafe {
+        let Ok(name) = CString::new(encoder_name) else { return false; };
+        let codec = ffi::avcodec_find_encoder_by_name(name.as_ptr());
+        if codec.is_null() { return false; }
+
+        let mut ctx = ffi::avcodec_alloc_context3(codec);
+        if ctx.is_null() { return false; }
+
+        // Big enough to clear every encoder's minimum (NVENC's is 33x17) and small enough that
+        // allocating the session costs nothing. Dimensions are not what is being tested here.
+        (*ctx).width  = 640;
+        (*ctx).height = 480;
+        (*ctx).pix_fmt = pix_fmt.into();
+        (*ctx).time_base = ffi::AVRational { num: 1, den: 30 };
+        (*ctx).framerate = ffi::AVRational { num: 30, den: 1 };
+        (*ctx).bit_rate = 10_000_000;
+
+        // The probe deliberately provokes encoder errors, and those go through the same ffmpeg
+        // log callback that fills the buffer shown in the export error dialog. Silence ffmpeg
+        // around the call and put the level back, so a successful export never carries the noise
+        // from a format we merely asked about.
+        let prev_level = ffi::av_log_get_level();
+        ffi::av_log_set_level(ffi::AV_LOG_QUIET);
+        let ret = ffi::avcodec_open2(ctx, codec, std::ptr::null_mut());
+        ffi::av_log_set_level(prev_level);
+
+        ffi::avcodec_free_context(&mut ctx);
+        ret >= 0
+    };
+
+    log::debug!("Encoder probe: {encoder_name} + {pix_fmt:?} -> {}", if accepted { "ok" } else { "rejected" });
+    PROBES.lock().insert(key, accepted);
+    accepted
+}
+
+/// The pixel format an encoder should be asked for when it cannot take the source's own.
+///
+/// Ranked, not first-match. The order below is what "closest" means, and it matters because the
+/// answer is offered to the user as *the* alternative:
+///
+/// 1. The source format itself, when the encoder takes it. Nothing to choose.
+/// 2. The hand-written pairs. These are the same layout under two names - `P210LE` is
+///    `YUV422P10LE` with the chroma planes interleaved - so they are exact, not approximations,
+///    and they stay ahead of the scoring so this function's long-standing answers cannot drift.
+/// 3. Highest score, where the score prefers keeping the source's bit depth first and its chroma
+///    subsampling second. Depth first because banding in a gradient is more visible than chroma
+///    softening on any real footage, and because a 10-bit source dropped to 8 bits cannot be
+///    recovered by a later grade.
+///
+/// Hardware and non-YUV formats are excluded from the scoring: an encoder advertises `CUDA` and
+/// `D3D11` as "supported", but they are surfaces rather than layouts, and offering `BGRA` for a
+/// YUV source would silently add a colour conversion the user did not ask for. Both remain
+/// reachable through the exact-pair rules if a source genuinely is RGB.
 pub fn find_best_matching_codec(codec: format::Pixel, supported: &[format::Pixel]) -> Option<format::Pixel> {
     if supported.is_empty() { return None; }
 
@@ -396,9 +474,65 @@ pub fn find_best_matching_codec(codec: format::Pixel, supported: &[format::Pixel
         if codec == b && supported.contains(&a) { return Some(a); }
     }
 
-    super::append_log(&format!("No matching codec, we need {:?} and supported are: {:?}\n", codec, supported));
+    if let Some(best) = best_by_layout(codec, supported) {
+        return Some(best);
+    }
+
+    super::append_log(&format!("No matching codec, we need {:?} and supported are: {:?}
+", codec, supported));
 
     None
+}
+
+/// Bit depth, chroma subsampling as (log2 width, log2 height), and whether the format is a plain
+/// software YUV layout - the only kind worth offering as a substitute for another YUV format.
+///
+/// `None` for anything ffmpeg has no descriptor for, which excludes it from the scoring rather
+/// than letting it score as a zero-depth match.
+fn layout_of(format: format::Pixel) -> Option<(i32, (i32, i32), bool)> {
+    unsafe {
+        let desc = ffi::av_pix_fmt_desc_get(format.into());
+        if desc.is_null() { return None; }
+        let flags = (*desc).flags;
+        let is_hw    = (flags & ffi::AV_PIX_FMT_FLAG_HWACCEL as u64) != 0;
+        let is_rgb   = (flags & ffi::AV_PIX_FMT_FLAG_RGB     as u64) != 0;
+        let is_pal   = (flags & ffi::AV_PIX_FMT_FLAG_PAL     as u64) != 0;
+        let is_float = (flags & ffi::AV_PIX_FMT_FLAG_FLOAT   as u64) != 0;
+        Some((
+            (*desc).comp[0].depth,
+            ((*desc).log2_chroma_w as i32, (*desc).log2_chroma_h as i32),
+            !is_hw && !is_rgb && !is_pal && !is_float && (*desc).nb_components >= 3,
+        ))
+    }
+}
+
+/// The best software YUV substitute for `codec` among `supported`, or `None` when there is none.
+///
+/// Scored rather than sorted so the tie-breaks are visible: an exact depth match is worth more
+/// than any chroma match, a deeper format is preferred to a shallower one at equal distance
+/// (rounding up never destroys source information), and chroma is compared on both axes.
+fn best_by_layout(codec: format::Pixel, supported: &[format::Pixel]) -> Option<format::Pixel> {
+    let (want_depth, want_chroma, want_yuv) = layout_of(codec)?;
+    if !want_yuv { return None; }
+
+    supported.iter()
+        .filter_map(|&f| {
+            let (depth, chroma, is_yuv) = layout_of(f)?;
+            if !is_yuv { return None; }
+
+            // Depth dominates: the worst possible chroma penalty (4 below) can never outweigh
+            // one bit of depth (100 per bit), so no amount of chroma gain buys a depth loss.
+            let depth_penalty = (depth - want_depth).abs() * 100
+                              + if depth < want_depth { 50 } else { 0 }; // prefer rounding up
+            let chroma_penalty = (chroma.0 - want_chroma.0).abs()
+                               + (chroma.1 - want_chroma.1).abs();
+            Some((f, -(depth_penalty + chroma_penalty)))
+        })
+        // `max_by_key` returns the *last* maximum; the encoder lists its own preferred formats
+        // first, so reverse the iteration to keep the earliest on a tie.
+        .collect::<Vec<_>>().into_iter().rev()
+        .max_by_key(|&(_, score)| score)
+        .map(|(f, _)| f)
 }
 
 // pub fn get_supported_pixel_formats(name: &str) -> Vec<ffi::AVPixelFormat> {

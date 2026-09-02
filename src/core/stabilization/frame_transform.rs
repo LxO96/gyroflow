@@ -11,6 +11,9 @@ use crate::util::{ MapClosest, map_coord };
 #[derive(Default, Clone)]
 pub struct FrameTransform {
     pub matrices: Vec<[f32; 14]>,
+    /// One matrix block per reference frame, in the same order as
+    /// `Buffers::references`. Each block has the same length as `matrices`.
+    pub reference_matrices: Vec<Vec<[f32; 14]>>,
     pub kernel_params: super::KernelParams,
     pub fov: f64,
     pub minimal_fov: f64,
@@ -176,15 +179,17 @@ impl FrameTransform {
         let color = &params.color;
         // `is_active` only sees the static scalars, so a project whose colour lives entirely
         // in keyframes would be gated off before the keyframes below are ever read.
-        let color_kernel = if color.enabled && (color.is_active() || params.keyframes.is_any_color_keyframed()) {
-            Some(color.to_kernel_params(
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorExposure,    timestamp_ms).unwrap_or(color.exposure),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorContrast,    timestamp_ms).unwrap_or(color.contrast),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorSaturation,  timestamp_ms).unwrap_or(color.saturation),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTemperature, timestamp_ms).unwrap_or(color.target_kelvin),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTint,        timestamp_ms).unwrap_or(color.tint),
-                params.keyframes.value_at_video_timestamp(&KeyframeType::ColorLutStrength, timestamp_ms).unwrap_or(color.lut_strength),
-            ))
+        let color_kernel = if !params.bypass_color && color.enabled && (color.is_active() || params.keyframes.is_any_color_keyframed()) {
+            Some(color.to_kernel_params(crate::color::ResolvedScalars {
+                exposure:      params.keyframes.value_at_video_timestamp(&KeyframeType::ColorExposure,    timestamp_ms).unwrap_or(color.exposure),
+                contrast:      params.keyframes.value_at_video_timestamp(&KeyframeType::ColorContrast,    timestamp_ms).unwrap_or(color.contrast),
+                saturation:    params.keyframes.value_at_video_timestamp(&KeyframeType::ColorSaturation,  timestamp_ms).unwrap_or(color.saturation),
+                shadows:       params.keyframes.value_at_video_timestamp(&KeyframeType::ColorShadows,     timestamp_ms).unwrap_or(color.shadows),
+                highlights:    params.keyframes.value_at_video_timestamp(&KeyframeType::ColorHighlights,  timestamp_ms).unwrap_or(color.highlights),
+                target_kelvin: params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTemperature, timestamp_ms).unwrap_or(color.target_kelvin),
+                tint:          params.keyframes.value_at_video_timestamp(&KeyframeType::ColorTint,        timestamp_ms).unwrap_or(color.tint),
+                lut_strength:  params.keyframes.value_at_video_timestamp(&KeyframeType::ColorLutStrength, timestamp_ms).unwrap_or(color.lut_strength),
+            }))
         } else {
             None
         };
@@ -202,6 +207,40 @@ impl FrameTransform {
             input_vertical_stretch,
             focal_length) = Self::get_lens_data_at_timestamp(params, timestamp_ms, false);
         // ----------- Lens -----------
+
+        // ----------- Preview: stabilization bypassed -----------
+        // The toolbar toggle used to be a `return` in the controller, which threw away the grade
+        // along with the geometry. Instead the pass still runs and the geometry is made an exact
+        // identity, so the colour toggle next to it is the only thing that touches colour.
+        //
+        // Exact, not approximate. The kernel maps an output pixel `p` to a source pixel with
+        // `uv = f * distort((new_k * r)^-1 * p) + c`. With `r = I`, zero distortion coefficients
+        // and no stretch that collapses to `uv = f * (new_k^-1 * p) + c`, so picking
+        //     new_k = [[1, 0, ow/2], [0, 1, oh/2]]      (i_r is a pure recentre)
+        //     f = (w/ow, h/oh),  c = (w/2, h/2)         (scale back out, recentre on the source)
+        // gives `uv = (p - out_centre) * (in/out) + in_centre`: the source stretched to the
+        // output buffer, which is what the pass does by default when there is no rect. When the
+        // sizes match - every preview - it is the identity, sampled at exact pixel centres.
+        //
+        // Everything else the geometry stage can do is switched off alongside: `fov` (the zoom),
+        // `lens_correction_amount` (the "add distortion back" branch), the zoom centre offset,
+        // rolling shutter, the mesh and digital-lens warps, and IBIS/OIS. The matching kernel
+        // *flags* are cleared in `Stabilization::get_kernel_flags`.
+        let bypass = params.bypass_stabilization;
+        let (camera_matrix, distortion_coeffs, radial_distortion_limit, input_horizontal_stretch, input_vertical_stretch) = if bypass {
+            let mut k = Matrix3::identity();
+            k[(0, 0)] = params.width  as f64 / params.output_width.max(1)  as f64;
+            k[(1, 1)] = params.height as f64 / params.output_height.max(1) as f64;
+            k[(0, 2)] = params.width  as f64 / 2.0;
+            k[(1, 2)] = params.height as f64 / 2.0;
+            (k, [0.0f64; 12], 0.0, 1.0, 1.0)
+        } else {
+            (camera_matrix, distortion_coeffs, radial_distortion_limit, input_horizontal_stretch, input_vertical_stretch)
+        };
+        let lens_correction_amount = if bypass { 1.0 } else { lens_correction_amount };
+        let adaptive_zoom_center_x  = if bypass { 0.0 } else { adaptive_zoom_center_x };
+        if bypass { adaptive_zoom_center_y = 0.0; }
+        // ----------- Preview: stabilization bypassed -----------
 
         let fl_compensation = Self::focal_length_fov_compensation(params, frame);
         let mut fov = Self::get_fov(params, frame, true, timestamp_ms, false) * fl_compensation;
@@ -222,19 +261,34 @@ impl FrameTransform {
             focal_length
         };
 
+        if bypass { fov = 1.0; ui_fov = 1.0; }
+
         let scaled_k = camera_matrix;
-        let new_k = Self::get_new_k(&params, &camera_matrix, fov);
+        // Not `get_new_k`: that one bakes in the lens profile's anamorphic ratio and the zoom,
+        // both of which are exactly what the bypass is switching off.
+        let new_k = if bypass {
+            let mut k = Matrix3::identity();
+            k[(0, 2)] = params.output_width  as f64 / 2.0;
+            k[(1, 2)] = params.output_height as f64 / 2.0;
+            k
+        } else {
+            Self::get_new_k(&params, &camera_matrix, fov)
+        };
 
         let gyro = params.gyro.read();
         let file_metadata = gyro.file_metadata.read();
 
         let mut mesh_data = Vec::new();
-        if let Some(mc) = file_metadata.mesh_correction.get(frame) {
-            mesh_data = mc.1.clone(); // undistorting mesh
+        if !bypass {
+            if let Some(mc) = file_metadata.mesh_correction.get(frame) {
+                mesh_data = mc.1.clone(); // undistorting mesh
+            }
         }
 
         // ----------- Rolling shutter correction -----------
-        let frame_readout_time = Self::get_frame_readout_time(&params, true, timestamp_ms, &file_metadata);
+        // Zero when bypassed, which also collapses `matrices` to a single row and skips the
+        // kernel's per-row resample.
+        let frame_readout_time = if bypass { 0.0 } else { Self::get_frame_readout_time(&params, true, timestamp_ms, &file_metadata) };
 
         let row_readout_time = frame_readout_time / if params.frame_readout_direction.is_horizontal() { params.width } else { params.height } as f64;
         let timestamp_ms = timestamp_ms + file_metadata.per_frame_time_offsets.get(frame).unwrap_or(&0.0);
@@ -308,6 +362,12 @@ impl FrameTransform {
                     sx = 0.0; sy = 0.0; ra = 0.0; ox = 0.0; oy = 0.0;
                 }
             }
+            if bypass {
+                // Unconditionally, unlike `suppress_rotation` above: leaving the IBIS/OIS shift in
+                // would still move the picture, and the point of the toggle is that nothing does.
+                r = Matrix3::identity();
+                sx = 0.0; sy = 0.0; ra = 0.0; ox = 0.0; oy = 0.0;
+            }
 
             let i_r = (new_k * r).pseudo_inverse(0.000001);
             if let Err(err) = i_r {
@@ -326,7 +386,7 @@ impl FrameTransform {
         drop(gyro);
 
         let mut digital_lens_params = [0f32; 16];
-        if let Some(p) = &params.digital_lens_params {
+        if let Some(p) = params.digital_lens_params.as_ref().filter(|_| !bypass) {
             for (i, v) in p.iter().take(16).enumerate() {
                 digital_lens_params[i] = *v as f32;
             }
@@ -358,13 +418,14 @@ impl FrameTransform {
         if let Some(c) = color_kernel {
             kernel_params.color_params_1 = [c.exposure_gain, c.contrast_factor, c.saturation_factor, c.lut_strength];
             kernel_params.color_params_2 = [c.wb_gains[0], c.wb_gains[1], c.wb_gains[2], c.lut_size as f32];
-            kernel_params.color_params_3 = [c.domain_min, c.domain_max, 0.0, 0.0];
+            kernel_params.color_params_3 = [c.domain_min, c.domain_max, c.shadows, c.highlights];
             kernel_params.flags |= KernelParamsFlags::COLOR_ENABLED.bits();
             if c.lut_size > 0 { kernel_params.flags |= KernelParamsFlags::HAS_LUT.bits(); }
         }
 
         Self {
             matrices,
+            reference_matrices: Vec::new(),
             kernel_params,
             fov: ui_fov,
             minimal_fov: *params.minimal_fovs.get(frame).unwrap_or(&1.0),
@@ -459,5 +520,88 @@ impl FrameTransform {
         }
 
         (scaled_k, distortion_coeffs, new_k, rotations, shifts, mesh_correction, fov)
+    }
+}
+
+#[cfg(test)]
+mod preview_toggle_tests {
+    use super::*;
+
+    const W: usize = 1920;
+    const H: usize = 1080;
+
+    /// A clip with a real grade on it and nothing else set, so anything that moves in the
+    /// geometry assertions below came from the bypass rather than from a lens profile.
+    fn graded(bypass_stabilization: bool, bypass_color: bool) -> ComputeParams {
+        ComputeParams {
+            width: W, height: H, output_width: W, output_height: H,
+            color: crate::color::ColorAdjustments { enabled: true, exposure: 1.0, ..Default::default() },
+            bypass_stabilization,
+            bypass_color,
+            ..Default::default()
+        }
+    }
+    fn has_color(t: &FrameTransform) -> bool {
+        t.kernel_params.flags & KernelParamsFlags::COLOR_ENABLED.bits() != 0
+    }
+
+    /// The bug this whole change exists to fix: "Toggle stabilization" used to `return` out of
+    /// the render pass in the controller, so it took the grade with it.
+    #[test]
+    fn bypassing_stabilization_keeps_the_grade() {
+        let t = FrameTransform::at_timestamp(&graded(true, false), 0.0, 0);
+        assert!(has_color(&t), "the grade went out with the geometry");
+        assert!(t.kernel_params.color_params_1[0] > 1.0, "exposure gain of +1 EV was not applied");
+    }
+
+    /// ...and the converse, so the new button is not just the old one under another name.
+    #[test]
+    fn bypassing_color_keeps_the_geometry() {
+        let with = FrameTransform::at_timestamp(&graded(false, true), 0.0, 0);
+        let without = FrameTransform::at_timestamp(&graded(false, false), 0.0, 0);
+        assert!(!has_color(&with), "the colour stage stayed on");
+        assert_eq!(with.matrices, without.matrices, "turning colour off moved the picture");
+        assert_eq!(with.kernel_params.fov, without.kernel_params.fov);
+    }
+
+    /// The bypass has to be an *exact* identity, not merely "no stabilization": the kernel maps
+    /// `uv = f * distort(i_r * p) + c`, so a stray focal length or principal point would resample
+    /// the frame and the toggle would soften the picture instead of leaving it alone.
+    #[test]
+    fn bypassing_stabilization_maps_every_pixel_to_itself() {
+        let t = FrameTransform::at_timestamp(&graded(true, false), 0.0, 0);
+        let p = &t.kernel_params;
+
+        assert_eq!(t.matrices.len(), 1, "rolling shutter should collapse to one matrix");
+        // `i_r` comes out of `pseudo_inverse`, which leaves ~1e-11 on the off-diagonals; over the
+        // widest span in the frame that is a 4e-8 pixel error, so compare with a tolerance here
+        // and let `the_identity_holds_at_the_corners` make the exact claim about the result.
+        let expected = [1.0, 0.0, -(W as f32) / 2.0,
+                        0.0, 1.0, -(H as f32) / 2.0,
+                        0.0, 0.0, 1.0];
+        for (got, want) in t.matrices[0][..9].iter().zip(expected) {
+            assert!((got - want).abs() < 1e-6, "matrix is {:?}, wanted {expected:?}", &t.matrices[0][..9]);
+        }
+        assert_eq!(&t.matrices[0][9..], &[0.0; 5], "IBIS/OIS shift survived the bypass");
+        assert_eq!(p.f, [1.0, 1.0]);
+        assert_eq!(p.c, [W as f32 / 2.0, H as f32 / 2.0]);
+        assert_eq!(p.k, [0.0; 12], "distortion coefficients survived the bypass");
+        assert_eq!(p.fov, 1.0);
+        assert_eq!(p.r_limit, 0.0);
+        assert_eq!(p.lens_correction_amount, 1.0, "anything below 1 re-enables the add-distortion-back branch");
+        assert_eq!(p.translation2d, [0.0, 0.0], "the zoom centre offset survived the bypass");
+        assert!(t.mesh_data.is_empty());
+    }
+
+    /// Composing the two: `uv = f * (i_r * p) + c` with the values above, checked at the corners
+    /// and the centre rather than trusting the matrix by inspection.
+    #[test]
+    fn the_identity_holds_at_the_corners() {
+        let t = FrameTransform::at_timestamp(&graded(true, false), 0.0, 0);
+        let (m, f, c) = (&t.matrices[0], t.kernel_params.f, t.kernel_params.c);
+        for (x, y) in [(0.0, 0.0), (W as f32, H as f32), (W as f32 / 2.0, H as f32 / 2.0), (37.0, 991.0)] {
+            let (_x, _y, _w) = (x * m[0] + y * m[1] + m[2], x * m[3] + y * m[4] + m[5], x * m[6] + y * m[7] + m[8]);
+            assert_eq!((f[0] * (_x / _w) + c[0], f[1] * (_y / _w) + c[1]), (x, y));
+        }
     }
 }

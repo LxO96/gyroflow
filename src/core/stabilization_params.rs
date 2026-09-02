@@ -108,7 +108,12 @@ pub struct StabilizationParams {
     pub framebuffer_inverted: bool,
     pub is_calibrator: bool,
 
+    /// The two toolbar toggles under the video. Both are *preview* affordances - they let you
+    /// A/B the shot without stabilization or without the grade - and neither may ever reach a
+    /// render. `get_cloned` copies this struct wholesale, so every render entry point calls
+    /// `StabilizationManager::clear_preview_overrides` first to force them back on.
     pub stab_enabled: bool,
+    pub preview_color_enabled: bool,
     pub show_detected_features: bool,
     pub show_optical_flow: bool,
 
@@ -135,6 +140,7 @@ impl Default for StabilizationParams {
             fovs: vec![],
             minimal_fovs: vec![],
             stab_enabled: true,
+            preview_color_enabled: true,
             show_detected_features: true,
             show_optical_flow: true,
             frame_readout_time: 0.0,
@@ -285,6 +291,7 @@ impl StabilizationParams {
     pub fn clear(&mut self) {
         *self = StabilizationParams {
             stab_enabled:              self.stab_enabled,
+            preview_color_enabled:     self.preview_color_enabled,
             show_detected_features:    self.show_detected_features,
             show_optical_flow:         self.show_optical_flow,
             background:                self.background,

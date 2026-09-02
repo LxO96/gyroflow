@@ -304,7 +304,16 @@ The colour-disabled row is the load-bearing one: **the two backends already disa
 
 Colour roughly doubles the divergence, which is what an S-Log3→Rec.709 LUT should do to a pre-existing difference: the curve is steep through shadows and midtones, so it amplifies whatever disagreement it is handed. That is the most plausible reading, but **this measurement cannot separate amplification from a genuine colour-stage divergence**, because the baseline is already far above the threshold.
 
-The consequence for the planned test is concrete: cross-backend equivalence must be asserted on **a synthetic frame through the colour stage in isolation**, exactly as this spec's testing section originally specified, and never by diffing full renders. A full-render diff can only ever measure the pipeline's pre-existing backend disagreement. That isolated test remains unwritten and unrun.
+The consequence for the planned test is concrete: cross-backend equivalence must be asserted on **a synthetic frame through the colour stage in isolation**, exactly as this spec's testing section originally specified, and never by diffing full renders. A full-render diff can only ever measure the pipeline's pre-existing backend disagreement.
+
+**That isolated test is now written and passing** (`stabilization/mod.rs`, `cross_backend_color_tests`). On a 16×4 synthetic frame the wgpu identity control is **bit-exact** against the input, and the colour stage differs from the `apply_color` reference by **5.96e-8** — about 8000× inside the 1/1024 tolerance. Both tests need a GPU and deliberately fail rather than skip when no backend is available, so they are `#[ignore]`d and run with `cargo test -- --ignored`.
+
+Getting there took two corrections, both worth recording because each produced a confident and wrong intermediate conclusion:
+
+1. **A half-pixel offset.** The CPU path feeds the transform the integer pixel index, the wgpu fragment path feeds `@builtin(position)`, which is the pixel centre. Real, pre-existing, and unrelated to colour; the harness compensates with `translation2d = [-0.5, -0.5]`.
+2. **`draw_safe_area` attenuating the output.** It is not behind a flag in the wgpu, OpenCL or SPIR-V kernels: it halves rgb outside `safe_area_rect` and halves it again within 5px of the edge. The harness built `KernelParams` by hand and left the rect at `[0,0,0,0]`, so every pixel was "outside" and every pixel with `x < 5` was also "border" — exactly a ½-and-¼ split at the observed boundary. Production sets the rect from the output size, so the darkening is inert in the app and this was purely a harness bug.
+
+The trap worth remembering: the sampling-map probes decode a source position *from channel values*, so a multiplicative scale on the values is indistinguishable from a scale on the sampled position. That is how (2) was misread as "wgpu maps output x to a nonlinear curve" and chased as a geometry problem. Rule out value scaling before re-deriving geometry.
 
 **CPU-only rendering does not work at all.** Setting both `NO_OPENCL=1` and `NO_WGPU=1` fails with `No cached wgpu found for key: …` rather than falling back to the CPU pixel path, so the CPU backend could not be included above. Reproduced with colour disabled, so pre-existing and not attributable to this branch — but it does mean the CPU colour stage (Task 8) has never been executed through a real render, only through unit tests.
 
@@ -322,7 +331,9 @@ Found by review of the finished branch, confirmed by reading, **not fixed**. The
 
 This breaks the invariant the five-way duplication rests on: the implementations must be arithmetically identical, and reviewers verify that rather than flagging the duplication. The correct target is the CPU order — grade the composited pixel once — because that is what the reference `apply_color` describes and what the preview already does.
 
-It is deliberately left for a change that can be verified. Moving the call site in two GPU kernels is exactly the kind of edit that needs the cross-backend equivalence test to confirm, and that test's wgpu identity control is not yet solved (see below), so a fix today could not be checked by anything except reading. The edge cases involved — clipped fisheye arcs, and the feather band with a LUT — are narrow enough to be worth less than a silently wrong "fix".
+It was deliberately left for a change that could be verified. Moving the call site in two GPU kernels is exactly the kind of edit that needs the cross-backend equivalence test to confirm, and at the time that test's wgpu identity control was unsolved, so a fix could not have been checked by anything except reading.
+
+**That blocker is now gone** — the identity control is bit-exact and the colour stage is verified against the reference (see the cross-backend section above). The fix is therefore actionable: move the `apply_color` call in `wgpu_undistort.wgsl` and `opencl_undistort.cl` out of `sample_input_at` and onto the composited pixel, matching the CPU order. Note the existing harness will *not* catch a regression here on its own: it runs an identity transform with no background region and no feather band, so it exercises neither consequence. Extending it with a case that hits the sentinel path and one with `background_mode == 3` plus a LUT is part of the work, not a follow-up to it.
 
 ## Manual verification checklist
 
@@ -340,6 +351,7 @@ Everything below needs a human at a running GUI. The export path has been verifi
 10. **Preset authoring.** Save a preset and confirm the new "Color adjustments" category appears with its six rows, that the LUT row is unticked by default, and that ticking it embeds the LUT.
 11. **Mobile layout.** With `forceMobileLayout`, the panel and its `Hr` appear in the Parameters tab below Stabilization.
 12. **Localisation/RTL**, including the "Choose file…" ellipsis, in a non-English locale.
+13. **Preview LUT texture lifetime — do this one first, and note it is not colour-specific.** Load a clip, let the preview run, then load a second clip, and repeat several times; then load LUTs of two different sizes (e.g. a 17³ and the 33³ `SL3SG3Ctos709.cube`) back to back so the texture is reallocated. No crash. This is the repro for the three lifetime faults fixed in `qt_gpu/qrhi_undistort.cpp` — a use-after-free in the LUT upload plus two resources freed while frames were still in flight. **It reproduced with colour disabled**, because `init()` always uploads an identity LUT to keep binding 6 bound, so any regression here hits every user, not only those grading. The fault is timing- and allocator-dependent (it typically survived the first clip), so a single clean pass is weak evidence — repeat it, and prefer a debug build or a heap-verifying tool. On D3D11 the access violation surfaces inside `d3d11.dll` on a later frame, nowhere near the offending call.
 
 On macOS, Android and iOS the panel is compiled in through `qmlcachegen` rather than the `resources_qml.rs` qrc list. Both lists are updated, but that is a different code path from the one exercised on Windows and has never been run.
 

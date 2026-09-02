@@ -68,6 +68,19 @@ pub struct VideoTranscoder<'a> {
     pub buffers: FrameBuffers,
 
     pub on_frame_callback: Option<Box<dyn FnMut(i64, &mut frame::Video, Option<&mut frame::Video>, &mut Converter, &mut RateControl) -> Result<(), FFmpegError> + 'a>>,
+    /// Called once after the decode loop ends, so a processor holding frames back
+    /// (temporal denoising delays output by `k`) can emit its tail. Without this,
+    /// those frames are silently dropped and the output is `k` frames short.
+    ///
+    /// Takes `&mut VideoTranscoder` itself (not just `&mut Converter`) because emitting a
+    /// tail frame has to reach the encoder too - `Converter` alone has no path to it. The
+    /// `octx`/`ost_time_bases` parameters are the same ones `render()` already threads
+    /// through `receive_and_process_video_frames`, needed here for the same reason: writing
+    /// encoded packets out.
+    pub on_finish_callback: Option<Box<dyn FnMut(&mut VideoTranscoder<'a>, &mut RateControl, &mut format::context::Output, &mut Vec<Rational>) -> Result<(), FFmpegError> + 'a>>,
+    /// Output timestamp of the last frame `encode_extra_frame` wrote, for the caller to fold
+    /// into `FrameTimestamps` - that path never sees `frame_ts` itself.
+    pub last_extra_video_ts: Option<i64>,
     pub on_encoder_initialized: Option<Box<dyn FnMut(&encoder::video::Video) -> Result<(), FFmpegError> + 'a>>,
 
     pub processing_order: ProcessingOrder,
@@ -483,6 +496,130 @@ impl<'a> VideoTranscoder<'a> {
         Ok(status)
     }
 
+    /// The buffer the normal decode loop writes processed pixels into before encoding -
+    /// whichever of `output_frame_pre`/`output_frame_post` is live for the current
+    /// `processing_order`. A delayed processor's drain hook reads this only to learn the
+    /// format/size/colour tags an *extra* frame needs to match; it must not write into this
+    /// buffer directly; see `encode_extra_frame`, which takes its own owned frame instead
+    /// specifically to avoid aliasing this one.
+    pub fn output_frame_template(&self) -> Option<&frame::Video> {
+        match self.processing_order {
+            ProcessingOrder::PreConversion  => self.buffers.output_frame_pre.as_ref(),
+            ProcessingOrder::PostConversion => self.buffers.output_frame_post.as_ref(),
+        }
+    }
+
+    /// Encodes a single already-processed frame that did not arrive through the normal
+    /// decode loop - used for the trailing `k` frames a temporal window is still holding
+    /// once decoding has finished (`on_finish_callback`).
+    ///
+    /// By the time this runs, at least one real frame has already gone through
+    /// `receive_and_process_video_frames`, so the encoder exists and `encoder_params.pixel_format`
+    /// / `encoder_converter` are already whatever that path settled on - this only has to
+    /// match that target format and hand off to the encoder. It does not re-detect a codec,
+    /// initialise the encoder, or handle hardware upload: denoising forces CPU decoding
+    /// (Ruling 12), so a delayed frame is never a hardware frame.
+    /// Returns whether a frame was actually encoded. `false` is not an error - there is
+    /// simply no encoder to hand this to - but the caller must not count it as progress, or
+    /// a render that encoded nothing would still report 100%.
+    pub fn encode_extra_frame(&mut self, final_frame_in: &mut frame::Video, rate_control: &mut RateControl, octx: &mut format::context::Output, ost_time_bases: &mut Vec<Rational>) -> Result<bool, FFmpegError> {
+        if self.decode_only || self.encoder.is_none() {
+            // decode_only never encodes at all; encoder.is_none() means nothing was ever
+            // encoded (e.g. a zero-frame input) and there is no pipeline to hand this to.
+            return Ok(false);
+        }
+
+        let in_format = final_frame_in.format();
+        let target_format = self.encoder_params.pixel_format.unwrap_or(in_format);
+        let mut final_frame: &mut frame::Video = final_frame_in;
+        if in_format != target_format {
+            if self.encoder_converter.is_none() {
+                let mut conv = software::scaling::Context::get(
+                    final_frame.format(), final_frame.width(), final_frame.height(),
+                    target_format, final_frame.width(), final_frame.height(),
+                    software::scaling::flag::Flags::from_bits_truncate(self.ffmpeg_interpolation),
+                )?;
+                // Same coefficients the live path sets when it builds this converter. Without
+                // them a drained tail frame built through this fallback would be converted
+                // with swscale's BT.601/limited-range defaults while every other frame in the
+                // file got 709 - a visible shift on the last k frames.
+                unsafe {
+                    use std::os::raw::c_int;
+                    let mut src_range: c_int = 0;
+                    let mut dst_range: c_int = 0;
+                    let coefs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
+                    if final_frame.color_range() == util::color::Range::JPEG { src_range |= 1; }
+                    if self.buffers.converted_frame.color_range() == util::color::Range::JPEG { dst_range |= 1; }
+                    ffi::sws_setColorspaceDetails(conv.as_mut_ptr(), coefs, src_range, coefs, dst_range, 0, 1 << 16, 1 << 16);
+                }
+                self.encoder_converter = Some(conv);
+            }
+            if self.buffers.converted_frame.format() != target_format || self.buffers.converted_frame.width() != final_frame.width() || self.buffers.converted_frame.height() != final_frame.height() {
+                self.buffers.converted_frame = frame::Video::new(target_format, final_frame.width(), final_frame.height());
+            }
+            unsafe { Self::copy_frame_props(self.buffers.converted_frame.as_mut_ptr(), final_frame.as_ptr()) }
+            let conv = self.encoder_converter.as_mut().ok_or(FFmpegError::EncoderConverterEmpty)?;
+            let buff = &mut self.buffers.converted_frame;
+            conv.run(final_frame, buff)?;
+            final_frame = buff;
+        }
+
+        let time_base = self.encoder_params.time_base.unwrap();
+        let mut ts = rate_control.out_timestamp_us;
+        let clone_frames = self.clone_frames;
+        let output_index = self.output_index.unwrap_or_default();
+        let mut output_hw_frame = None;
+        {
+            let encoder = self.encoder.as_mut().ok_or(FFmpegError::EncoderNotFound)?;
+            encoder.set_format(final_frame.format());
+            encoder.set_color_range(final_frame.color_range());
+
+            // Some encoders only accept hardware frames, and that is a property of the
+            // ENCODER, not of how the input was decoded - Ruling 12 forces software decoding
+            // when denoising, which says nothing about what the encoder wants. Without this
+            // upload a drained tail frame reaches `send_frame` as a plain software frame and
+            // is rejected, failing the whole export after all the work is done. Mirrors the
+            // live path's upload; keyed off the encoder's own frames context rather than
+            // re-deriving the format, so it cannot disagree with what the encoder expects.
+            if !unsafe { (*encoder.as_mut_ptr()).hw_frames_ctx.is_null() } {
+                let mut hw = frame::Video::empty();
+                unsafe {
+                    let frame_ptr = hw.as_mut_ptr();
+                    let err = ffi::av_hwframe_get_buffer((*encoder.as_mut_ptr()).hw_frames_ctx, frame_ptr, 0);
+                    if err < 0 { return Err(FFmpegError::ToHWBufferError(err)); }
+                    if (*frame_ptr).hw_frames_ctx.is_null() { return Err(FFmpegError::NoFramesContext); }
+                    let err = ffi::av_hwframe_transfer_data(frame_ptr, final_frame.as_mut_ptr(), 0);
+                    if err < 0 { return Err(FFmpegError::ToHWTransferError(err)); }
+                    Self::copy_frame_props(frame_ptr, final_frame.as_ptr());
+                }
+                output_hw_frame = Some(hw);
+                final_frame = output_hw_frame.as_mut().ok_or(FFmpegError::FrameEmpty)?;
+            }
+
+            for _ in 0..rate_control.repeat_times.max(1) {
+                let timestamp = Some(ts.rescale((1, 1000000), time_base));
+                final_frame.set_pts(timestamp);
+                final_frame.set_kind(picture::Type::None);
+                if clone_frames {
+                    encoder.send_frame(&final_frame.clone())?;
+                } else {
+                    encoder.send_frame(final_frame)?;
+                }
+                ts += rate_control.repeat_interval;
+            }
+        }
+        // The live path updates `frame_ts.last_video` after every encode; this path cannot
+        // reach `frame_ts`, so it records the last timestamp it wrote and the caller folds it
+        // in. Without that, a trim seam computes `add_video` from the last *live* frame and
+        // the next range's timestamps collide with the frames the drain just emitted - the
+        // muxer silently drops one frame per collision.
+        self.last_extra_video_ts = Some(ts - rate_control.repeat_interval);
+
+        let ost_time_base = ost_time_bases[output_index];
+        self.receive_and_process_encoded_packets(octx, ost_time_base)?;
+        Ok(true)
+    }
+
     pub fn receive_and_process_encoded_packets(&mut self, octx: &mut format::context::Output, ost_time_base: Rational) -> Result<(), FFmpegError> {
         if !self.decode_only {
             let time_base = self.encoder_params.time_base.unwrap();//self.decoder.as_ref().ok_or(FFmpegError::DecoderNotFound)?.time_base();
@@ -517,7 +654,7 @@ impl<'a> VideoTranscoder<'a> {
         }
     }*/
 
-    unsafe fn copy_frame_props(dst: *mut ffi::AVFrame, src: *const ffi::AVFrame) {
+    pub(crate) unsafe fn copy_frame_props(dst: *mut ffi::AVFrame, src: *const ffi::AVFrame) {
         unsafe {
             // (*dst).key_frame              = (*src).key_frame;
             (*dst).pict_type              = (*src).pict_type;

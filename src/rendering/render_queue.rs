@@ -246,6 +246,7 @@ pub struct RenderQueue {
     get_next_item_id: qt_method!(fn(&self, job_id: u32) -> u32),
     get_encoder_options: qt_method!(fn(&self, encoder: String) -> String),
     get_default_encoder: qt_method!(fn(&self, codec: String, gpu: bool) -> String),
+    check_export_pixel_format: qt_method!(fn(&self, codec: String, gpu: bool, source_format: String) -> QJsonObject),
     get_active_render_count: qt_method!(fn(&self) -> usize),
 
     apply_to_all: qt_method!(fn(&mut self, data: String, additional_data: String, to_job_id: u32)),
@@ -1193,6 +1194,13 @@ impl RenderQueue {
                 if let Ok(mut render_options) = serde_json::from_value(out.clone()) as serde_json::Result<RenderOptions> {
                     render_options.update_from_json(out);
                     let smoothing = stabilizer.smoothing.read().clone();
+                    // Inherited from the UI for the same reason as `smoothing` and the params
+                    // below: a file added to the queue picks up the settings currently on
+                    // screen. Without this the job renders with a default (ungraded) colour
+                    // state while the preview still shows the grade. Any project or preset
+                    // imported for this file further down overrides it, which is correct -
+                    // the file's own saved grade should win over the ambient UI one.
+                    let color = stabilizer.color.read().clone();
                     let params = stabilizer.params.read();
 
                     let stab = StabilizationManager {
@@ -1222,6 +1230,7 @@ impl RenderQueue {
                     };
 
                     *stab.smoothing.write() = smoothing;
+                    *stab.color.write() = color;
 
                     let stab = Arc::new(stab);
 
@@ -1344,6 +1353,26 @@ impl RenderQueue {
                                     if let Ok(mut file) = filesystem::open_file(&gyro_url, false, false) {
                                         let filesize = file.size;
                                         let _ = stab.load_gyro_data(file.get_file(), filesize, &gyro_url, is_main_video, &Default::default(), |_|(), Arc::new(AtomicBool::new(false)));
+                                    }
+                                }
+
+                                // The grade was inherited from whatever clip was on screen,
+                                // `source_kelvin` included. Re-anchor it to *this* file's own
+                                // reading so the user's temperature offset is measured from the
+                                // right neutral; without this a batch of mixed-white-balance
+                                // clips is every one of them graded against the first clip's
+                                // camera. See `ColorAdjustments::reanchor_source_kelvin`.
+                                {
+                                    let settings = stab.gyro.read().file_metadata.read()
+                                        .additional_data.get("recording_settings").cloned();
+                                    if let Some(settings) = settings {
+                                        let src = core::color::SourceExposure::from_recording_settings(&settings);
+                                        let (kelvin, detected) = match src.white_balance_k {
+                                            Some(k) => (k, true),
+                                            None    => (core::color::DEFAULT_KELVIN, false),
+                                        };
+                                        ::log::debug!("Re-anchoring white balance to this file: {kelvin} K (detected: {detected})");
+                                        stab.color.write().reanchor_source_kelvin(kelvin, detected);
                                     }
                                 }
 
@@ -1657,6 +1686,17 @@ impl RenderQueue {
         false
     }
 
+    fn check_export_pixel_format(&self, codec: String, gpu: bool, source_format: String) -> QJsonObject {
+        let c = rendering::check_export_pixel_format(&codec, gpu, &source_format);
+        let mut ret = QJsonObject::default();
+        ret.insert("ok",           c.ok.into());
+        ret.insert("encoder",      QString::from(c.encoder).into());
+        ret.insert("source",       QString::from(c.source).into());
+        ret.insert("suggestion",   QString::from(c.suggestion).into());
+        ret.insert("same_quality", c.same_quality.into());
+        ret.insert("cpu_only",     c.cpu_only.into());
+        ret
+    }
     fn get_default_encoder(&self, codec: String, gpu: bool) -> String {
         rendering::get_default_encoder(&codec, gpu)
     }

@@ -44,6 +44,146 @@ struct CalibrationItem {
     pub is_forced: bool,
 }
 
+/// One neighbour frame for the denoised preview, already converted into the *exact* RGBA8
+/// geometry of the preview's own input - not the source resolution.
+///
+/// Both GPU back-ends `debug_assert` that every reference's height and stride equal the
+/// centre's, and `gpu::reference_frame_pitch` does its offset arithmetic on that assumption,
+/// so a reference that merely has the right pixels in the wrong stride reads as garbage.
+struct ReferenceFrame {
+    timestamp_us: i64,
+    pixels: Vec<u8>,
+}
+
+/// The +-k source frames around the paused playhead, fetched with a second decoder.
+///
+/// The mdk player owns preview decoding and seeks arbitrarily, so there is no forward window
+/// during playback. Pausing is the only moment a symmetric window can be assembled, and it is
+/// also the only moment the user is actually judging the result.
+///
+/// Keyed by centre timestamp, radius *and* preview geometry: the preview re-renders on every
+/// unrelated slider move, and re-seeking on each one would make the UI unusable, so a hit here
+/// is the common case while tuning. The geometry is part of the key because changing the
+/// preview resolution invalidates every cached frame's stride.
+#[derive(Default)]
+struct ReferenceCache {
+    /// Includes the clip and its fps, not just the position: two clips of the same
+    /// resolution paused at the same timestamp would otherwise hit each other's cache and
+    /// denoise one clip against the other's neighbours.
+    key: Option<(String, i64, usize, (usize, usize, usize), u64)>,
+    frames: Vec<ReferenceFrame>,
+}
+
+impl ReferenceCache {
+    fn get(&mut self, url: &str, timestamp_us: i64, k: usize, fps: f64, size: (usize, usize, usize)) -> &mut [ReferenceFrame] {
+        let key = (url.to_string(), timestamp_us, k, size, fps.to_bits());
+        if self.key.as_ref() != Some(&key) {
+            self.key = Some(key);
+            self.frames = if k > 0 && fps > 0.0 && !url.is_empty() {
+                Self::fetch(url, timestamp_us, k, fps, size)
+            } else {
+                Vec::new()
+            };
+        }
+        &mut self.frames
+    }
+
+    /// Drop the window and its memory.
+    ///
+    /// Reached from the pixel callback whenever the radius is 0. Note that on the
+    /// GPU-texture preview pipeline a *playing* frame is accepted by `onProcessTexture` and
+    /// never reaches the pixel callback at all, so the window is released on the next paused
+    /// render rather than immediately when playback starts.
+    fn clear(&mut self) {
+        if self.key.is_some() {
+            self.key = None;
+            self.frames = Vec::new();
+        }
+    }
+
+    /// Decode the window and hand back whatever of it was actually available.
+    ///
+    /// Every failure here - the file not opening, a seek landing short, an unexpected frame
+    /// size - returns fewer frames (possibly none), which leaves the preview showing the
+    /// *undenoised* image. That is the recoverable failure; a preview showing something the
+    /// export will not produce is not.
+    fn fetch(url: &str, timestamp_us: i64, k: usize, fps: f64, size: (usize, usize, usize)) -> Vec<ReferenceFrame> {
+        let _time = std::time::Instant::now();
+        let interval_us = (1_000_000.0 / fps).round().max(1.0) as i64;
+        let span_us = k as i64 * interval_us;
+        // Half an interval of slack on each end so a timestamp that rounds differently between
+        // mdk and ffmpeg cannot drop the outermost neighbour.
+        let start_us = (timestamp_us - span_us - interval_us / 2).max(0);
+        let end_us = timestamp_us + span_us + interval_us / 2;
+
+        let collected: std::rc::Rc<RefCell<Vec<ReferenceFrame>>> = std::rc::Rc::new(RefCell::new(Vec::with_capacity(2 * k + 1)));
+
+        // Ruling 12: reference upload only handles `BufferSource::Cpu`, so the references have
+        // to be CPU frames - GPU decoding off.
+        match VideoProcessor::from_file(url, false, 0, None) {
+            Ok(mut proc) => {
+                let collected2 = collected.clone();
+                let mut scaler: Option<(ffmpeg_next::software::scaling::Context, (u32, u32, ffmpeg_next::format::Pixel))> = None;
+                let mut rgba = ffmpeg_next::frame::Video::new(ffmpeg_next::format::Pixel::RGBA, size.0 as u32, size.1 as u32);
+                let r = proc.decode_only_range(start_us as f64 / 1000.0, end_us as f64 / 1000.0, 2 * k + 1, move |ts, frame, _converter| {
+                    if ts < start_us || ts > end_us { return; }
+                    // The centre frame is already in hand as the preview's own input; counting
+                    // it again here would weight it double in the gather.
+                    if (ts - timestamp_us).abs() < interval_us / 2 { return; }
+
+                    let src = (frame.width(), frame.height(), frame.format());
+                    if scaler.as_ref().map(|x| x.1) != Some(src) {
+                        // Colour details matter here for the same reason they do on the render
+                        // path (R9-3): the gather compares references against the centre *by
+                        // value*, so letting swscale fall back to its BT.601/limited-range
+                        // defaults on a BT.709 source would offset every reference pixel and
+                        // make the rejection Gaussian throw them all away.
+                        match ffmpeg_next::software::scaling::Context::get(src.2, src.0, src.1, ffmpeg_next::format::Pixel::RGBA, size.0 as u32, size.1 as u32, ffmpeg_next::software::scaling::Flags::BILINEAR) {
+                            Ok(mut ctx) => {
+                                unsafe { crate::rendering::ffmpeg_video_converter::Converter::set_color_details(&mut ctx, frame.color_space(), frame.color_range(), ffmpeg_next::util::color::Range::JPEG); }
+                                scaler = Some((ctx, src));
+                            },
+                            Err(e) => { ::log::warn!("Denoise preview: cannot build a scaler for {src:?}: {e:?}"); return; }
+                        }
+                    }
+                    if let Some((ref mut ctx, _)) = scaler {
+                        if let Err(e) = ctx.run(frame, &mut rgba) { ::log::warn!("Denoise preview: scaling failed: {e:?}"); return; }
+                    }
+
+                    let row_bytes = size.0 * 4;
+                    let src_stride = rgba.stride(0);
+                    let src_data = rgba.data(0);
+                    if src_stride < row_bytes || src_data.len() < (size.1 - 1) * src_stride + row_bytes || size.2 < row_bytes { return; }
+                    let mut pixels = vec![0u8; size.1 * size.2];
+                    for y in 0..size.1 {
+                        pixels[y * size.2..y * size.2 + row_bytes].copy_from_slice(&src_data[y * src_stride..y * src_stride + row_bytes]);
+                    }
+                    // Never hand back more than the gather can hold. `max_frames` bounds the
+                    // decode, but the centre is only excluded when a decoded timestamp lands
+                    // within half a frame of it - and mdk's playhead and ffmpeg's PTS are
+                    // different domains, so at high frame rates that can miss. Without this
+                    // cap the extra reference makes the backends' size guard fail and (on
+                    // OpenCL) return Ok(()) with the previous frame still in the output.
+                    if collected2.borrow().len() < gyroflow_core::gpu::MAX_GATHER_FRAMES - 1 {
+                        collected2.borrow_mut().push(ReferenceFrame { timestamp_us: ts, pixels });
+                    }
+                });
+                if let Err(e) = r {
+                    ::log::warn!("Denoise preview: decoding references around {timestamp_us} failed: {e:?}");
+                }
+            },
+            Err(e) => {
+                ::log::warn!("Denoise preview: cannot open {url} for reference frames: {e:?}");
+            }
+        }
+
+        let mut frames = std::rc::Rc::try_unwrap(collected).map(|x| x.into_inner()).unwrap_or_default();
+        frames.sort_by_key(|f| f.timestamp_us);
+        ::log::debug!("Denoise preview: {} reference frames around {timestamp_us} (k={k}) in {:.1}ms", frames.len(), _time.elapsed().as_micros() as f64 / 1000.0);
+        frames
+    }
+}
+
 #[derive(Default, QObject)]
 pub struct Controller {
     base: qt_base_class!(trait QObject),
@@ -79,11 +219,22 @@ pub struct Controller {
     get_smoothing_status: qt_method!(fn(&self) -> QJsonArray),
     set_smoothing_param: qt_method!(fn(&self, name: QString, val: f64)),
     set_color_param: qt_method!(fn(&self, name: QString, val: f64)),
+    pick_white_balance: qt_method!(fn(&self, img: QImage, x0: f64, y0: f64, x1: f64, y1: f64) -> QJsonObject),
     set_color_enabled: qt_method!(fn(&self, enabled: bool, bake_in_render: bool)),
     load_lut: qt_method!(fn(&mut self, url: QUrl) -> QString),
     clear_lut: qt_method!(fn(&mut self)),
     get_lut_name: qt_method!(fn(&self) -> QString),
+    get_output_color_space: qt_method!(fn(&self) -> QString),
+    set_output_color_space: qt_method!(fn(&mut self, id: QString)),
+    get_output_color_spaces: qt_method!(fn(&self) -> QJsonArray),
+    get_output_range: qt_method!(fn(&self) -> QString),
+    set_output_range: qt_method!(fn(&mut self, id: QString)),
+    get_output_ranges: qt_method!(fn(&self) -> QJsonArray),
     get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
+    set_denoise_param: qt_method!(fn(&self, name: QString, val: f64)),
+    set_denoise_enabled: qt_method!(fn(&self, enabled: bool)),
+    set_denoise_quality: qt_method!(fn(&self, id: QString)),
+    get_denoise_quality: qt_method!(fn(&self) -> QString),
     set_horizon_lock: qt_method!(fn(&self, lock_percent: f64, roll: f64, lock_pitch: bool, pitch: f64, automatic_lock: bool, turn_threshold: f64, turn_smoothing_ms: f64, turn_multiplier: f64, tilt_accel_limit: f64)),
     get_turn_speed: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
     get_x_angle: qt_method!(fn(&self, timestamp_ms: f64) -> f64),
@@ -128,6 +279,7 @@ pub struct Controller {
     request_recompute: qt_signal!(),
 
     stab_enabled: qt_property!(bool; WRITE set_stab_enabled),
+    preview_color_enabled: qt_property!(bool; WRITE set_preview_color_enabled),
     show_detected_features: qt_property!(bool; WRITE set_show_detected_features),
     show_optical_flow: qt_property!(bool; WRITE set_show_optical_flow),
     fov: qt_property!(f64; WRITE set_fov),
@@ -854,19 +1006,16 @@ impl Controller {
 
                     // Anchor the white balance to what the camera recorded. `source_kelvin` is
                     // the neutral point the grade is measured from, so it always follows the
-                    // file. `target_kelvin` only follows it along while the user hasn't turned
-                    // colour adjustments on - once they have, their chosen temperature is theirs
-                    // and loading another file must not move it.
+                    // file, and the user's offset from it travels along - see
+                    // `reanchor_source_kelvin`. Loading a warmer or cooler clip therefore keeps
+                    // "400 K warmer than the camera saw it" rather than keeping the number.
                     if let Some(settings) = md_data.get("recording_settings") {
                         let src = core::color::SourceExposure::from_recording_settings(settings);
-                        let mut c = stab.color.write();
                         let (kelvin, detected) = match src.white_balance_k {
                             Some(k) => (k, true),
                             None    => (core::color::DEFAULT_KELVIN, false),
                         };
-                        c.set_param("source_kelvin", kelvin);
-                        c.source_kelvin_detected = detected;
-                        if !c.enabled { c.set_param("target_kelvin", kelvin); }
+                        stab.color.write().reanchor_source_kelvin(kelvin, detected);
                     }
 
                     additional_data.as_object_mut().unwrap().insert("frame_readout_time".to_owned(), serde_json::to_value(stab.params.read().frame_readout_time.abs()).unwrap());
@@ -1020,6 +1169,23 @@ impl Controller {
             let stab = self.stabilizer.clone();
             let preview_pipeline = self.preview_pipeline.clone();
             let out_pixels = RefCell::new(Vec::new());
+            let ref_cache = RefCell::new(ReferenceCache::default());
+            // Same unbounded-lifetime reborrow as `vid1` above; used only to read `playing`.
+            let vid2: &MDKVideoItem = unsafe { &*(&*vid as *const MDKVideoItem) };
+
+            /// `k` for the preview, or 0 when this frame must not be denoised.
+            ///
+            /// Denoising needs the *whole* +-k window, which only exists while the player is
+            /// paused - during playback mdk owns decoding, seeks arbitrarily and has no forward
+            /// window at all, so the preview stays undenoised and costs exactly what it costs
+            /// today. Computed from the input video size, not the preview size, so the preview
+            /// and the export agree about the radius.
+            fn preview_denoise_radius(stab: &StabilizationManager, playing: bool) -> usize {
+                if playing { return 0; }
+                let (w, h) = stab.params.read().size;
+                stab.denoise.read().radius_for_size(w, h)
+            }
+
             let update_info = util::qt_queued_callback_mut(QPointer::from(self as &Self), move |this, (fov, minimal_fov, focal_length, info): (f64, f64, Option<f64>, QString)| {
                 this.current_fov = fov;
                 this.current_minimal_fov = minimal_fov;
@@ -1033,7 +1199,17 @@ impl Controller {
             vid.onProcessTexture(Box::new(move |frame, timestamp_ms, width, height, backend_id, ptr1, ptr2, ptr3, ptr4, ptr5| -> bool {
                 if width < 4 || height < 4 || backend_id == 0 { return false; }
 
-                if !stab.params.read().stab_enabled { return true; }
+                // Denoising gathers its reference frames from CPU buffers: `BufferSource::Cpu`
+                // is the only source either back-end uploads references from, and a natively
+                // imported texture (Metal/Vulkan/D3D11 zero-copy) aliases single-layer external
+                // memory that cannot be widened into the texture array the wgpu gather samples.
+                // So a paused denoised frame is handed over to the *pixel* callback instead of
+                // this one, by declining it here - mdk then reads the frame back and calls
+                // `onProcessPixels`, which builds CPU references and calls the same
+                // `process_pixels::<RGBA8>`. This is a change of hand-over, not of renderer:
+                // OpenCL/wgpu still do the work. It costs one readback per pause, and nothing
+                // at all during playback.
+                if preview_denoise_radius(&stab, vid2.playing) > 0 { return false; }
 
                 let _time = std::time::Instant::now();
 
@@ -1041,6 +1217,7 @@ impl Controller {
                     let mut buffers = Buffers{
                         input:  BufferDescription { size: (width as usize, height as usize, width as usize * 4), ..Default::default() },
                         output: BufferDescription { size: (width as usize, height as usize, width as usize * 4), ..Default::default() },
+                        references: Vec::new(),
                     };
 
                     let (offset, fps) = {
@@ -1080,6 +1257,7 @@ impl Controller {
                                         context: ptr2 as *mut std::ffi::c_void
                                     }, ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "OpenGL"))
                         },
@@ -1095,6 +1273,7 @@ impl Controller {
                                     texture_copy: true,
                                     data: BufferSource::Metal { texture: ptr1 as *mut std::ffi::c_void, command_queue: ptr3 as *mut std::ffi::c_void }, ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "Metal"))
                         },
@@ -1119,6 +1298,7 @@ impl Controller {
                                         device_context: ptr3 as *mut std::ffi::c_void
                                     }, ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "DirectX11"))
                         },
@@ -1137,6 +1317,7 @@ impl Controller {
                                     data: BufferSource::Vulkan { texture: ptr1, device: ptr2, physical_device: ptr4, instance: ptr5 },
                                     ..Default::default()
                                 },
+                                references: Vec::new(),
                             },
                             "Vulkan"))
                         }
@@ -1166,7 +1347,6 @@ impl Controller {
 
                 // TODO: cache in atomics instead of locking the mutex every time
                 let params = stab.params.read();
-                if !params.stab_enabled { return (0, 0, 0, std::ptr::null_mut()); }
                 let (ow, oh) = params.output_size;
                 let os = ow * 4; // Assume RGBA8 - 4 bytes per pixel
                 drop(params);
@@ -1174,9 +1354,31 @@ impl Controller {
                 let mut out_pixels = out_pixels.borrow_mut();
                 out_pixels.resize_with(os*oh, u8::default);
 
-                let ret = stab.process_pixels::<RGBA8>((timestamp_ms * 1000.0).round() as i64, Some(frame as usize), &mut Buffers {
+                let timestamp_us = (timestamp_ms * 1000.0).round() as i64;
+                let in_size = (width as usize, height as usize, stride as usize);
+
+                // Paused-only: fetch the +-k window with a second decoder. `radius == 0` (playing,
+                // or denoising off) leaves `references` empty, which is what sets
+                // `reference_count = 1` and takes the existing zero-cost path.
+                let k = preview_denoise_radius(&stab, vid2.playing);
+                let mut ref_cache = ref_cache.borrow_mut();
+                let references: &mut [ReferenceFrame] = if k > 0 {
+                    let (url, fps) = (stab.input_file.read().url.clone(), stab.params.read().fps);
+                    ref_cache.get(&url, timestamp_us, k, fps, in_size)
+                } else {
+                    ref_cache.clear();
+                    &mut []
+                };
+                let reference_timestamps: Vec<i64> = references.iter().map(|r| r.timestamp_us).collect();
+                let reference_buffers: Vec<BufferDescription> = references.iter_mut().map(|r| BufferDescription {
+                    size: in_size,
+                    data: BufferSource::Cpu { buffer: &mut r.pixels },
+                    ..Default::default()
+                }).collect();
+
+                let ret = stab.process_pixels_with_references::<RGBA8>(timestamp_us, Some(frame as usize), &mut Buffers {
                     input: BufferDescription {
-                        size: (width as usize, height as usize, stride as usize),
+                        size: in_size,
                         data: BufferSource::Cpu { buffer: pixels },
                         ..Default::default()
                     },
@@ -1185,7 +1387,8 @@ impl Controller {
                         data: BufferSource::Cpu { buffer: &mut out_pixels },
                         ..Default::default()
                     },
-                });
+                    references: reference_buffers,
+                }, &reference_timestamps);
                 match ret {
                     Ok(bk) => {
                         update_info2((bk.fov, bk.minimal_fov, bk.focal_length, QString::from(format!("Processing {}x{} using {} took {:.2}ms", width, height, bk.backend, _time.elapsed().as_micros() as f64 / 1000.0))));
@@ -1255,6 +1458,92 @@ impl Controller {
         self.request_recompute();
     }
 
+    // Denoising is a render-only parameter in exactly the sense colour is: it changes pixels
+    // but not the stabilization maths, so it reaches the kernels only through `ComputeParams`
+    // (compute_params.rs clones `mgr.denoise`) and `request_recompute()` is the one thing that
+    // installs a fresh `ComputeParams`. Without it the preview keeps the old settings and the
+    // panel looks dead. Each setter recomputes on success only - a rejected value changed
+    // nothing, so re-rendering would be pure waste.
+    fn set_denoise_param(&mut self, name: QString, val: f64) {
+        let name = name.to_string();
+        if !self.stabilizer.denoise.write().set_param(&name, val) {
+            ::log::warn!("Rejected denoise parameter: {name} = {val}");
+            return;
+        }
+        self.request_recompute();
+    }
+
+    fn set_denoise_enabled(&mut self, enabled: bool) {
+        self.stabilizer.denoise.write().enabled = enabled;
+        self.request_recompute();
+    }
+
+    fn set_denoise_quality(&mut self, id: QString) {
+        let id = id.to_string();
+        match core::denoise::DenoiseQuality::from_id(&id) {
+            Some(q) => { self.stabilizer.denoise.write().quality = q; }
+            // An unrecognised id is ignored rather than reset to the default: QML builds the
+            // dropdown from these ids and should never send another one, and silently changing
+            // the user's choice would be worse than doing nothing.
+            None => { ::log::warn!("Unknown denoise quality: {id}"); return; }
+        }
+        self.request_recompute();
+    }
+
+    fn get_denoise_quality(&self) -> QString {
+        QString::from(self.stabilizer.denoise.read().quality.id())
+    }
+
+    /// Solve temperature and tint from a region of the preview the user says should be grey.
+    ///
+    /// `img` is what `vid.grabToImage` handed back - the *graded* frame as it appears on screen -
+    /// and `x0,y0`-`x1,y1` are the dragged rectangle as fractions of the item, 0..1, in any
+    /// order. A click arrives as a degenerate rectangle and is widened to a small block by
+    /// `average_patch`, so both gestures take the same path. Fractions rather than pixels because
+    /// the grab is taken at the window's device pixel ratio, which QML would have to guess at and
+    /// which differs between the click coordinates and the image.
+    ///
+    /// Returns `{ kelvin, tint }` on success or `{ error: "..." }` with a message to show; QML
+    /// decides what to do with either, so nothing here touches the sliders directly.
+    ///
+    /// This function is deliberately only an adapter: which pixels a pick averages, and which of
+    /// them are worth averaging, is colour-picker knowledge and lives with the rest of it in
+    /// `core/color/picker.rs`, where it can be tested without Qt.
+    fn pick_white_balance(&self, img: QImage, x0: f64, y0: f64, x1: f64, y1: f64) -> QJsonObject {
+        let mut ret = QJsonObject::default();
+
+        let size = img.size();
+        let (w, h) = (size.width as i32, size.height as i32);
+        if w < 1 || h < 1 {
+            ret.insert("error", QString::from("The preview could not be read.").into());
+            return ret;
+        }
+
+        let patch = core::color::average_patch(w, h, [x0, y0, x1, y1], |x, y| {
+            let (r, g, b, _) = img.get_pixel_color(x, y).get_rgba_f();
+            [r as f64, g as f64, b as f64]
+        });
+
+        let params = {
+            let c = self.stabilizer.color.read();
+            (c.to_kernel_params(core::color::ResolvedScalars {
+                exposure: c.exposure, contrast: c.contrast, saturation: c.saturation,
+                shadows: c.shadows, highlights: c.highlights,
+                target_kelvin: c.target_kelvin, tint: c.tint, lut_strength: c.lut_strength,
+            }), c.source_kelvin)
+        };
+
+        match core::color::solve_white_balance(patch, &params.0, params.1) {
+            Ok((kelvin, tint)) => {
+                ::log::debug!("Picked white balance from {patch:?}: {kelvin:.0} K, tint {tint:.3}");
+                ret.insert("kelvin", kelvin.into());
+                ret.insert("tint", tint.into());
+            }
+            Err(e) => { ret.insert("error", QString::from(e.message()).into()); }
+        }
+        ret
+    }
+
     fn set_color_enabled(&mut self, enabled: bool, bake_in_render: bool) {
         {
             let mut c = self.stabilizer.color.write();
@@ -1280,8 +1569,24 @@ impl Controller {
             Ok(lut) => {
                 {
                     let mut c = self.stabilizer.color.write();
+                    let name = filesystem::get_filename(&url);
+                    // Only a first guess, and only when the user has not already chosen.
+                    // Loading a second LUT must not silently overwrite a deliberate pick.
+                    if c.output_color_space == core::color::OutputColorSpace::Unspecified {
+                        let guess = core::color::OutputColorSpace::from_lut_name(&name);
+                        c.output_color_space = guess;
+                        // A LUT that names a *display* space is a deliverable-grade LUT, and a
+                        // deliverable is usually watched rather than re-graded - so seed video
+                        // range with it, which is what players assume and what stops the export
+                        // reading hotter than the preview. Same rules as the guess above: only
+                        // while untouched, and visible in the dropdown before anyone exports.
+                        if guess != core::color::OutputColorSpace::Unspecified
+                            && c.output_range == core::color::OutputRange::SameAsSource {
+                            c.output_range = core::color::OutputRange::Limited;
+                        }
+                    }
                     c.lut = Some(Arc::new(lut));
-                    c.lut_name = Some(filesystem::get_filename(&url));
+                    c.lut_name = Some(name);
                     c.lut_path = Some(url);
                 }
                 self.request_recompute();
@@ -1307,6 +1612,54 @@ impl Controller {
     /// produce - `filesystem::get_filename` always yields at least one character.
     fn get_lut_name(&self) -> QString {
         QString::from(self.stabilizer.color.read().lut_name.clone().unwrap_or_default())
+    }
+
+    /// The colour space the exported file will declare. Tags only - this never changes a
+    /// pixel, so it deliberately does not `request_recompute`.
+    fn get_output_color_space(&self) -> QString {
+        QString::from(self.stabilizer.color.read().output_color_space.id())
+    }
+    fn set_output_color_space(&mut self, id: QString) {
+        // An unrecognised id is ignored rather than reset to the default: QML should never
+        // send one, and silently clearing the user's choice would be worse than doing nothing.
+        if let Some(s) = core::color::OutputColorSpace::from_id(&id.to_string()) {
+            self.stabilizer.color.write().output_color_space = s;
+        }
+    }
+    /// `[{ id, label }, ...]` in declaration order, so the dropdown is built from the Rust
+    /// list and cannot drift out of step with `OutputColorSpace`.
+    fn get_output_color_spaces(&self) -> QJsonArray {
+        let mut arr = QJsonArray::default();
+        for s in core::color::OutputColorSpace::ALL {
+            let mut o = QJsonObject::default();
+            o.insert("id",    QString::from(s.id()).into());
+            o.insert("label", QString::from(s.label()).into());
+            arr.push(o.into());
+        }
+        arr
+    }
+
+    /// The range the exported file is encoded in. This one *does* change pixels, but only in
+    /// the encoder - the stabilization kernels never see it - so like the colour space it must
+    /// not `request_recompute`: the preview is unaffected and re-rendering it would be waste.
+    fn get_output_range(&self) -> QString {
+        QString::from(self.stabilizer.color.read().output_range.id())
+    }
+    fn set_output_range(&mut self, id: QString) {
+        if let Some(r) = core::color::OutputRange::from_id(&id.to_string()) {
+            self.stabilizer.color.write().output_range = r;
+        }
+    }
+    /// `[{ id, label }, ...]` in declaration order, as for the colour spaces.
+    fn get_output_ranges(&self) -> QJsonArray {
+        let mut arr = QJsonArray::default();
+        for r in core::color::OutputRange::ALL {
+            let mut o = QJsonObject::default();
+            o.insert("id",    QString::from(r.id()).into());
+            o.insert("label", QString::from(r.label()).into());
+            arr.push(o.into());
+        }
+        arr
     }
 
     /// What the camera recorded, for the read-only panel readout. Fields the camera didn't
@@ -1532,7 +1885,8 @@ impl Controller {
 
     wrap_simple_method!(override_video_fps,         v: f64, r: bool; recompute; update_offset_model);
     wrap_simple_method!(set_video_rotation,         v: f64; recompute; zooming_data_changed);
-    wrap_simple_method!(set_stab_enabled,           v: bool);
+    wrap_simple_method!(set_stab_enabled,           v: bool; recompute);
+    wrap_simple_method!(set_preview_color_enabled,  v: bool; recompute);
     wrap_simple_method!(set_show_detected_features, v: bool);
     wrap_simple_method!(set_show_optical_flow,      v: bool);
     wrap_simple_method!(set_digital_lens_name,      v: String; recompute);

@@ -222,6 +222,11 @@ public:
     bool createLutTexture(QRhi *rhi, uint32_t size) {
         QScopedPointer<QRhiTexture> tex(rhi->newTexture(m_lutFormat, QSize(int(size * size), int(size)), 1, QRhiTexture::Flags()));
         if (!tex || !tex->create()) { qDebug2("createLutTexture") << "failed to create m_texLut of size" << size; return false; }
+        // Same reasoning as resizeLutTexture: QScopedPointer::reset() would delete any
+        // existing texture immediately, which is unsafe if a frame still references it. At
+        // init() this is a no-op because m_texLut is null; the guard is here so a later
+        // caller cannot reintroduce the fault.
+        if (QRhiTexture *old = m_texLut.take()) old->deleteLater();
         m_texLut.reset(tex.take());
         m_lutSize = size;
         return true;
@@ -261,7 +266,12 @@ public:
             return false;
         }
 
-        delete previous;
+        // deleteLater(), NOT delete. Rebinding the SRB stops *future* frames referencing this
+        // texture, but frames already recorded or in flight still do, and on the D3D11 backend
+        // destroying the underlying ID3D11Texture2D out from under them faults inside
+        // d3d11.dll on a later frame rather than here. QRhi::deleteLater() exists for exactly
+        // this: it holds the resource until the GPU has finished with it.
+        previous->deleteLater();
         m_lutResizeFailureLogged = false;
         return true;
     }
@@ -315,7 +325,23 @@ public:
                 dst[i * 4 + 3] = 255;
             }
         }
-        QRhiTextureSubresourceUploadDescription desc(rgba.constData(), rgba.size());
+        // The QByteArray overload, NOT the (pointer, size) one. That overload does not copy,
+        // it stores the pointer, and `rgba` is a local that dies the moment this function
+        // returns - while the batch is always submitted later. That is true from both call
+        // sites: init() fills `m_initialUpdates`, merged on the first render(), and the
+        // render() path submits its batch after this returns too.
+        //
+        // The result was a use-after-free that read freed heap memory. It survived the first
+        // clip because the bytes usually still happened to be intact, then crashed on a
+        // later load once the allocation had been reused - an access violation on a garbage
+        // pointer, with colour disabled, because init() always uploads the identity LUT to
+        // keep binding 6 bound.
+        //
+        // The other uploadTexture calls in this file use the pointer form safely, but only
+        // because their storage outlives submission: matricesBuffer and meshDataBuffer are
+        // members, and `canvas` is caller-owned. Copying that pattern into a function with a
+        // local buffer, without checking why it was safe there, is what went wrong here.
+        QRhiTextureSubresourceUploadDescription desc(rgba);
         u->uploadTexture(m_texLut.get(), QRhiTextureUploadDescription({ QRhiTextureUploadEntry(0, 0, desc) }));
         return true;
     }

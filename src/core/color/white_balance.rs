@@ -2,9 +2,21 @@
 // Copyright © 2026 Adrian <adrian.eddy at gmail>
 
 /// Correlated colour temperature to CIE 1931 xy, using Kim et al.'s cubic
-/// approximation of the Planckian locus. Valid 1667–25000 K; inputs are clamped.
+/// approximation of the Planckian locus.
+///
+/// Kim's fit is defined from 1667 K, but inputs are clamped to
+/// [`MIN_KELVIN`](super::MIN_KELVIN) instead - a little higher - because below roughly 1902 K the
+/// resulting white point leaves the sRGB gamut and the gains below become meaningless. Clamping
+/// here rather than at the call sites means a project file or a keyframe carrying an old
+/// out-of-range temperature is corrected on the way in, not rendered broken.
 fn cct_to_xy(kelvin: f64) -> (f64, f64) {
-    let t = kelvin.clamp(1667.0, 25000.0);
+    cct_to_xy_unclamped(kelvin.clamp(super::MIN_KELVIN, super::MAX_KELVIN))
+}
+
+/// The fit itself, with no opinion about where it stops being useful. Split out so the test that
+/// pins `MIN_KELVIN` can look below the clamp and see the gamut boundary it was chosen for -
+/// through `cct_to_xy` that boundary is by construction unreachable.
+fn cct_to_xy_unclamped(t: f64) -> (f64, f64) {
     let t2 = t * t;
     let t3 = t2 * t;
 
@@ -28,7 +40,10 @@ fn cct_to_xy(kelvin: f64) -> (f64, f64) {
 
 /// White point at the given temperature as linear sRGB, normalised to Y = 1.
 fn white_point_rgb(kelvin: f64) -> [f64; 3] {
-    let (x, y) = cct_to_xy(kelvin);
+    xy_to_rgb(cct_to_xy(kelvin))
+}
+
+fn xy_to_rgb((x, y): (f64, f64)) -> [f64; 3] {
     let y = if y.abs() < 1e-9 { 1e-9 } else { y };
 
     // xyY -> XYZ with Y = 1
@@ -77,6 +92,36 @@ mod tests {
     use super::*;
 
     fn luma(g: [f32; 3]) -> f32 { 0.2126 * g[0] + 0.7152 * g[1] + 0.0722 * g[2] }
+
+    /// The reason [`MIN_KELVIN`](super::MIN_KELVIN) is 2000 K and not Kim's 1667 K.
+    ///
+    /// sRGB cannot represent the Planckian locus all the way down: the white point's blue
+    /// component crosses zero near 1902 K, and `kelvin_to_rgb_gains` floors the gain at 1e-6 once
+    /// it does. That is not a gradual loss of accuracy but a cliff - the blue gain is 1e-6 at
+    /// 1900 K and 13.8 at 1905 K - so a slider that went below it rendered a frame with no blue
+    /// at all. This pins the bound: in gamut everywhere the slider can reach, out of gamut just
+    /// below, so the constant cannot quietly drift back down.
+    #[test]
+    fn white_point_stays_in_gamut_across_the_slider_range() {
+        let mut k = super::super::MIN_KELVIN;
+        while k <= super::super::MAX_KELVIN {
+            let w = white_point_rgb(k);
+            assert!(w.iter().all(|v| *v > 1e-3), "{k}K is out of gamut: {w:?}");
+            k += 5.0;
+        }
+        // ...and the bound is not needlessly conservative: it really does go bad just below.
+        assert!(xy_to_rgb(cct_to_xy_unclamped(1895.0))[2] <= 0.0, "the crossing moved - re-derive MIN_KELVIN");
+    }
+
+    /// Clamping lives in `cct_to_xy`, so an out-of-range temperature arriving from an old project
+    /// file behaves as the nearest valid one rather than as a broken frame.
+    #[test]
+    fn temperatures_below_the_bound_are_clamped_not_passed_through() {
+        let at_bound = kelvin_to_rgb_gains(5500.0, super::super::MIN_KELVIN, 0.0);
+        for k in [1667.0, 1800.0, 1900.0, 0.0, -5000.0] {
+            assert_eq!(kelvin_to_rgb_gains(5500.0, k, 0.0), at_bound, "{k}K was not clamped");
+        }
+    }
 
     #[test]
     fn neutral_when_target_equals_source() {

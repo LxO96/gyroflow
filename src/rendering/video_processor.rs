@@ -75,4 +75,38 @@ impl<'a> VideoProcessor<'a> {
             Processor::Mdk(x) => x.start_decoder_only(ranges, cancel_flag)
         }
     }
+
+    /// Decode at most `max_frames` frames from `start_ms` to `end_ms` and stop.
+    ///
+    /// A thin wrapper over `start_decoder_only`, which seeks and then runs to the end of its
+    /// range: the denoised preview only ever wants the handful of frames immediately around
+    /// the playhead, so the decode loop is stopped through the same cancel flag as soon as
+    /// the callback has seen `max_frames` of them. Without the frame budget a paused preview
+    /// near the start of a long clip would decode the whole file.
+    ///
+    /// `start_ms` is a *filter* as well as a seek target - `receive_and_process_video_frames`
+    /// drops everything before it - so the frames handed to `cb` are exactly the first
+    /// `max_frames` presented at or after `start_ms`. The trailing frame past `end_ms` that
+    /// the range check lets through before finishing is the caller's to discard.
+    ///
+    /// Lives here rather than on `FfmpegProcessor` so the .braw/.r3d MDK decoder gets it too;
+    /// both back-ends already share `on_frame` and `start_decoder_only`.
+    pub fn decode_only_range<F>(&mut self, start_ms: f64, end_ms: f64, max_frames: usize, mut cb: F) -> Result<(), FFmpegError>
+        where F: FnMut(i64, &mut frame::Video, &mut ffmpeg_video_converter::Converter) + 'static
+    {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag2 = stop_flag.clone();
+        let mut decoded = 0usize;
+        self.on_frame(move |timestamp_us, input_frame, _output_frame, converter, _rate_control| {
+            if decoded < max_frames {
+                cb(timestamp_us, input_frame, converter);
+                decoded += 1;
+            }
+            if decoded >= max_frames {
+                stop_flag2.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        self.start_decoder_only(vec![(start_ms, end_ms)], stop_flag)
+    }
 }

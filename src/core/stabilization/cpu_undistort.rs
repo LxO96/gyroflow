@@ -547,6 +547,8 @@ impl Stabilization {
                     contrast_factor:   params.color_params_1[1],
                     saturation_factor: params.color_params_1[2],
                     lut_strength:      params.color_params_1[3],
+                    shadows:           params.color_params_3[2],
+                    highlights:        params.color_params_3[3],
                     wb_gains:          [params.color_params_2[0], params.color_params_2[1], params.color_params_2[2]],
                     lut_size:          params.color_params_2[3] as u32,
                     domain_min:        params.color_params_3[0],
@@ -908,6 +910,8 @@ mod color_stage_tests {
             contrast_factor:   kp.color_params_1[1],
             saturation_factor: kp.color_params_1[2],
             lut_strength:      kp.color_params_1[3],
+            shadows:           kp.color_params_3[2],
+            highlights:        kp.color_params_3[3],
             wb_gains:          [kp.color_params_2[0], kp.color_params_2[1], kp.color_params_2[2]],
             lut_size:          kp.color_params_2[3] as u32,
             domain_min:        kp.color_params_3[0],
@@ -920,14 +924,20 @@ mod color_stage_tests {
         let mut kp = KernelParams::default();
         kp.color_params_1 = [2.0, 1.5, 0.5, 1.0];
         kp.color_params_2 = [1.1, 1.0, 0.9, 33.0];
-        kp.color_params_3 = [0.0, 1.0, 0.0, 0.0];
+        kp.color_params_3 = [0.0, 1.0, 0.35, -0.5];
 
         let cp = params_from(&kp);
         assert_eq!(cp.exposure_gain, 2.0);
         assert_eq!(cp.lut_size, 33);
+        // The two tone-region slots live in the back half of color_params_3, which used to be
+        // unused padding; this is the check that they are read from the right lanes.
+        assert_eq!(cp.shadows, 0.35);
+        assert_eq!(cp.highlights, -0.5);
 
-        // One stop up on quarter grey lands on half grey.
-        let out = apply_color([0.25, 0.25, 0.25], &ColorKernelParams { contrast_factor: 1.0, saturation_factor: 1.0, wb_gains: [1.0; 3], ..cp }, None);
+        // One stop up on quarter grey lands on half grey. Every other stage is neutralised,
+        // the tone-region pair included - they are non-zero above precisely so the assertions
+        // on them mean something.
+        let out = apply_color([0.25, 0.25, 0.25], &ColorKernelParams { contrast_factor: 1.0, saturation_factor: 1.0, wb_gains: [1.0; 3], shadows: 0.0, highlights: 0.0, ..cp }, None);
         assert!((out[0] - 0.5).abs() < 1e-6, "was {}", out[0]);
     }
 
@@ -967,7 +977,7 @@ mod color_stage_tests {
 
         let color_params_1 = [1.2f32, 1.1, 0.8, 0.5]; // exposure_gain, contrast_factor, saturation_factor, lut_strength
         let color_params_2 = [1.05f32, 1.0, 0.95, 2.0]; // wb_gain_r/g/b, lut_size
-        let color_params_3 = [0.0f32, 1.0, 0.0, 0.0]; // domain_min, domain_max
+        let color_params_3 = [0.0f32, 1.0, 0.3, -0.2]; // domain_min, domain_max, shadows, highlights
 
         fn base_params(flags: i32, color_params_1: [f32; 4], color_params_2: [f32; 4], color_params_3: [f32; 4]) -> KernelParams {
             let mut p = KernelParams::default();
@@ -1017,6 +1027,7 @@ mod color_stage_tests {
             let mut buffers = Buffers {
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+                references: Vec::new(),
             };
             let ok = Stabilization::undistort_image_cpu::<2, RGBAf>(&mut buffers, &params, &distortion_model, None, &matrices, &[], &[], &coeffs);
             assert!(ok, "undistort_image_cpu returned false");
@@ -1039,6 +1050,8 @@ mod color_stage_tests {
             saturation_factor: color_params_1[2],
             lut_strength:      color_params_1[3],
             wb_gains:          [color_params_2[0], color_params_2[1], color_params_2[2]],
+            shadows:           color_params_3[2],
+            highlights:        color_params_3[3],
             lut_size:          color_params_2[3] as u32,
             domain_min:        color_params_3[0],
             domain_max:        color_params_3[1],

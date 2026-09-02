@@ -11,15 +11,53 @@ pub mod wgpu_interop;
 #[cfg(target_os = "windows")]                            pub mod wgpu_interop_directx;
 #[cfg(any(target_os = "windows", target_os = "linux"))]  pub mod wgpu_interop_cuda;
 
-pub mod drawing;
-use std::hash::Hasher;
+pub mod drawing;
+use std::hash::Hasher;
+
+/// Frames an input allocation must hold when temporal denoising is active: the largest
+/// `2k + 1` any quality tier asks for (`DenoiseQuality::High`, k = 3).
+///
+/// Deliberately not `1 + buffers.references.len()`. That count *varies* across a clip -
+/// the temporal window has fewer neighbours to offer at the head and tail than in the
+/// middle - while a GPU wrapper is built once and then reused for every frame, so sizing
+/// it from whichever emission happened to arrive first leaves it too small for the rest.
+pub const MAX_GATHER_FRAMES: usize = 7;
+
+/// Byte pitch between consecutive frames inside a temporal-gather input allocation.
+///
+/// Both kernels step between reference frames with `frame * params.height * params.stride`,
+/// and `KernelParams::height` is the *canvas* (luma) height on every plane - a subsampled
+/// chroma plane's own buffer is only `input.size.1` rows tall, so its true frame size is
+/// half of what the kernel steps by. Laying the frames out at the kernel's pitch is what
+/// makes host and kernel agree; the unwritten rows at the tail of each slot are never read
+/// back, because every sample the kernel takes is bounded by `source_rect`.
+///
+/// The pitch is `params.height * params.stride` and nothing else: it is what the kernels
+/// step by, and the host has no freedom to choose differently. Pitching *larger* to make a
+/// frame fit would be worse than the overlap it avoids - every reference after the first
+/// would then be sampled from an offset the kernel does not use, silently and with no error.
+///
+/// The assertion below is therefore a real invariant, not a bound. It holds because
+/// `params.height` is the canvas height (>= any plane's own height) and `params.stride` is
+/// this plane's stride, so `height * stride >= plane_height * stride == centre_len`. If it
+/// ever fails, the decoded frame's geometry disagrees with `stab.params.size` and the right
+/// answer is to not gather at all, which is what the `None` return asks the caller to do.
+pub fn reference_frame_pitch(params: &crate::stabilization::KernelParams, input: &BufferDescription, centre_len: usize) -> Option<usize> {
+    let pitch = params.height as usize * params.stride as usize;
+    let needed = centre_len.max(input.size.1 * input.size.2);
+    if pitch < needed {
+        log::error!("Reference frame pitch {pitch} (height {} x stride {}) is smaller than one frame ({needed}); refusing to gather", params.height, params.stride);
+        return None;
+    }
+    Some(pitch)
+}
 
 /// The rust-gpu colour stage must be arithmetically identical to `crate::color::apply_color`.
 /// `stabilize_spirv` is a path dependency with `crate-type = ["lib", "dylib"]`, so the very
 /// same source that is compiled to SPIR-V also compiles for the host and can be called here.
 #[cfg(test)]
 mod spirv_color_tests {
-    use crate::color::{ ColorKernelParams, Lut3D, apply_color };
+    use crate::color::{ ColorKernelParams, Lut3D, ResolvedScalars, apply_color };
     use stabilize_spirv::glam::{ Vec4, vec4 };
     use stabilize_spirv::KernelParams as SpirvParams;
 
@@ -50,14 +88,14 @@ mod spirv_color_tests {
         p.max_pixel_value = max_pixel_value;
         p.color_params_1 = vec4(cp.exposure_gain, cp.contrast_factor, cp.saturation_factor, cp.lut_strength);
         p.color_params_2 = vec4(cp.wb_gains[0], cp.wb_gains[1], cp.wb_gains[2], cp.lut_size as f32);
-        p.color_params_3 = vec4(cp.domain_min, cp.domain_max, 0.0, 0.0);
+        p.color_params_3 = vec4(cp.domain_min, cp.domain_max, cp.shadows, cp.highlights);
         p
     }
 
-    fn kernel_params(lut: Option<&Lut3D>, exposure: f64, contrast: f64, saturation: f64, target_kelvin: f64, tint: f64, lut_strength: f64) -> ColorKernelParams {
+    fn kernel_params(lut: Option<&Lut3D>, s: crate::color::ResolvedScalars) -> ColorKernelParams {
         let mut adj = crate::color::ColorAdjustments::default();
         adj.lut = lut.map(|l| std::sync::Arc::new(l.clone()));
-        adj.to_kernel_params(exposure, contrast, saturation, target_kelvin, tint, lut_strength)
+        adj.to_kernel_params(s)
     }
 
     /// Exact f32 equality. Any tolerance here would mean the expressions diverged.
@@ -84,12 +122,12 @@ mod spirv_color_tests {
 
     #[test]
     fn matches_reference_without_lut() {
-        for &(exposure, contrast, saturation, kelvin, tint) in &[
-            (0.0, 0.0, 0.0, 5500.0, 0.0),
-            (1.5, 0.4, -0.3, 7200.0, 0.25),
-            (-2.25, -0.8, 0.9, 3200.0, -0.4),
+        for &(exposure, contrast, saturation, shadows, highlights, kelvin, tint) in &[
+            (0.0, 0.0, 0.0, 0.0, 0.0, 5500.0, 0.0),
+            (1.5, 0.4, -0.3, 0.6, -0.45, 7200.0, 0.25),
+            (-2.25, -0.8, 0.9, -1.0, 1.0, 3200.0, -0.4),
         ] {
-            let cp = kernel_params(None, exposure, contrast, saturation, kelvin, tint, 1.0);
+            let cp = kernel_params(None, ResolvedScalars { exposure, contrast, saturation, shadows, highlights, target_kelvin: kelvin, tint, ..Default::default() });
             let sp = params_and_spirv(&cp, false, 1.0);
             for probe in PROBES {
                 let expected = apply_color(*probe, &cp, None);
@@ -106,8 +144,8 @@ mod spirv_color_tests {
         assert_eq!(coeffs.len(), crate::stabilization::LUT_DATA_OFFSET + 27 * 3);
 
         for strength in [0.0f64, 0.5, 1.0] {
-            for &(exposure, contrast, saturation) in &[(0.0, 0.0, 0.0), (0.75, 0.3, -0.5)] {
-                let cp = kernel_params(Some(&lut), exposure, contrast, saturation, 6500.0, 0.1, strength);
+            for &(exposure, contrast, saturation, shadows, highlights) in &[(0.0, 0.0, 0.0, 0.0, 0.0), (0.75, 0.3, -0.5, -0.35, 0.8)] {
+                let cp = kernel_params(Some(&lut), ResolvedScalars { exposure, contrast, saturation, shadows, highlights, target_kelvin: 6500.0, tint: 0.1, lut_strength: strength });
                 let sp = params_and_spirv(&cp, true, 1.0);
                 for probe in PROBES {
                     // The reference skips the LUT entirely at strength 0, which is what the
@@ -126,7 +164,7 @@ mod spirv_color_tests {
         lut.domain_min = -0.5;
         lut.domain_max = 2.0;
         let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
-        let cp = kernel_params(Some(&lut), 0.25, 0.2, 0.35, 4800.0, -0.2, 1.0);
+        let cp = kernel_params(Some(&lut), ResolvedScalars { exposure: 0.25, contrast: 0.2, saturation: 0.35, shadows: 0.5, highlights: -0.6, target_kelvin: 4800.0, tint: -0.2, ..Default::default() });
         let sp = params_and_spirv(&cp, true, 1.0);
         for probe in PROBES {
             let expected = apply_color(*probe, &cp, Some(&lut));
@@ -141,7 +179,7 @@ mod spirv_color_tests {
     fn normalises_by_max_pixel_value_like_the_cpu_path() {
         let lut = test_lut();
         let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
-        let cp = kernel_params(Some(&lut), 0.5, -0.25, 0.4, 6000.0, 0.15, 0.75);
+        let cp = kernel_params(Some(&lut), ResolvedScalars { exposure: 0.5, contrast: -0.25, saturation: 0.4, shadows: -0.7, highlights: 0.3, target_kelvin: 6000.0, tint: 0.15, lut_strength: 0.75 });
         let max = 255.0f32;
         let sp = params_and_spirv(&cp, true, max);
         let inv_max = 1.0 / max;
@@ -159,7 +197,7 @@ mod spirv_color_tests {
     fn has_lut_flag_gates_the_lut() {
         let lut = test_lut();
         let coeffs = crate::stabilization::build_coeffs_buffer(Some(&lut));
-        let cp = kernel_params(Some(&lut), 0.0, 0.0, 0.0, 5500.0, 0.0, 1.0);
+        let cp = kernel_params(Some(&lut), ResolvedScalars::default());
         let sp = params_and_spirv(&cp, false, 1.0);
         for probe in PROBES {
             let expected = apply_color(*probe, &cp, None);
@@ -247,7 +285,10 @@ pub struct BufferDescription<'a> {
 }
 pub struct Buffers<'a> {
     pub input: BufferDescription<'a>,
-    pub output: BufferDescription<'a>
+    pub output: BufferDescription<'a>,
+    /// Temporal reference frames, in temporal order, excluding the centre frame
+    /// which is `input`. Empty when denoising is off.
+    pub references: Vec<BufferDescription<'a>>,
 }
 
 #[derive(Debug, Default)]
@@ -368,7 +409,71 @@ impl<'a> Buffers<'a> {
         let mut hasher = crc32fast::Hasher::new();
         hasher.write_u32(self.input.get_checksum());
         hasher.write_u32(self.output.get_checksum());
+        // Only *whether* references are present, not how many. The count varies over a
+        // clip - the window has fewer neighbours to offer at the head and tail than in
+        // the middle - and this checksum keys the cached GPU wrapper. Hashing the exact
+        // count would rebuild (and recompile) the whole pipeline several times per
+        // render; the wrapper is instead sized once for `MAX_GATHER_FRAMES`.
+        hasher.write_u8(!self.references.is_empty() as u8);
         hasher.finalize()
+    }
+}
+
+
+#[cfg(test)]
+mod reference_layout_tests {
+    use super::*;
+    use crate::stabilization::KernelParams;
+
+    fn desc(w: usize, h: usize, stride: usize) -> BufferDescription<'static> {
+        BufferDescription { size: (w, h, stride), rect: None, rotation: None, data: BufferSource::None, texture_copy: false }
+    }
+
+    /// The kernels step between reference frames by `params.height * params.stride`, and
+    /// `KernelParams::height` is the canvas (luma) height on *every* plane. A 4:2:0 chroma
+    /// plane is only half that tall, so pitching its reference frames by its own frame size
+    /// puts every frame after the first at the wrong offset - and the last one past the end
+    /// of the allocation, which an OpenCL driver reports as `CL_OUT_OF_RESOURCES`.
+    #[test]
+    fn pitch_follows_the_kernel_not_the_plane_on_subsampled_planes() {
+        let mut params = KernelParams::default();
+        params.height = 2160; // canvas height, shared by all planes
+        params.stride = 1920; // this chroma plane's own stride
+
+        let chroma = desc(1920, 1080, 1920);
+        let plane_frame_bytes = 1080 * 1920;
+
+        assert_eq!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), Some(2160 * 1920));
+        assert_ne!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), Some(plane_frame_bytes),
+                   "pitching by the plane's own frame size is the bug this guards against");
+    }
+
+    /// On the luma plane the two definitions coincide; the helper must not inflate it.
+    #[test]
+    fn pitch_is_exact_on_the_luma_plane() {
+        let mut params = KernelParams::default();
+        params.height = 2160;
+        params.stride = 3840;
+        assert_eq!(reference_frame_pitch(&params, &desc(3840, 2160, 3840), 2160 * 3840), Some(2160 * 3840));
+    }
+
+    /// A frame that does not fit the kernel's fixed pitch must be REFUSED, not re-pitched.
+    /// Pitching larger would make every reference after the first be sampled from an offset
+    /// the kernel never reads - silent wrong output instead of no output.
+    #[test]
+    fn pitch_refuses_a_frame_that_does_not_fit_rather_than_growing() {
+        let mut params = KernelParams::default();
+        params.height = 1080;
+        params.stride = 1920;
+        let padded = 1080 * 1920 + 4096;
+        assert_eq!(reference_frame_pitch(&params, &desc(1920, 1080, 1920), padded), None);
+    }
+
+    /// The largest window any quality tier asks for is `2k + 1` at k = 3. Both backends
+    /// size their allocations from this, so it must stay in step with `DenoiseQuality`.
+    #[test]
+    fn max_gather_frames_covers_the_highest_quality_tier() {
+        assert_eq!(MAX_GATHER_FRAMES, 2 * crate::denoise::DenoiseQuality::High.radius() + 1);
     }
 }
 

@@ -41,15 +41,21 @@ pub struct TextureHolder {
     pub wgpu_buffer: Option<wgpu::Buffer>
 }
 
-pub fn init_texture(device: &wgpu::Device, backend: wgpu::Backend, buf: &BufferDescription, format: wgpu::TextureFormat, is_in: bool) -> TextureHolder {
+pub fn init_texture(device: &wgpu::Device, backend: wgpu::Backend, buf: &BufferDescription, format: wgpu::TextureFormat, is_in: bool, array_layers: u32) -> TextureHolder {
     let usage = if is_in {
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
     } else {
         wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
     };
+    // `array_layers` is 1 (a plain 2D texture) except for the wgpu-allocated input
+    // textures used with temporal denoising, where layer 0 is the centre frame and
+    // layers 1.. are gathered references. Natively-imported textures below (Metal,
+    // Vulkan, D3D11/D3D12 zero-copy) alias external single-layer GPU memory and
+    // cannot be widened into an array; those paths only ever see `array_layers == 1`
+    // today because nothing upstream populates `Buffers::references` for them yet.
     let desc = wgpu::TextureDescriptor {
         label: None,
-        size: Extent3d { width: buf.size.0 as u32, height: buf.size.1 as u32, depth_or_array_layers: 1 },
+        size: Extent3d { width: buf.size.0 as u32, height: buf.size.1 as u32, depth_or_array_layers: array_layers },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,

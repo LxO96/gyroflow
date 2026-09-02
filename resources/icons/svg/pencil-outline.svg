@@ -1,0 +1,14 @@
+<!-- A pencil drawn as a thin outline rather than a solid glyph, and inset to 80% of the box, so
+     it sits next to the gyroflow mark in the video toolbar without out-weighing it. The filled
+     pencil.svg (an IcoMoon glyph on a 32x32 grid, edge to edge) reads much heavier at 24px than
+     anything else in that row.
+
+     Inset to 70% rather than 80%: the pencil runs corner to corner, so its diagonal is what the
+     eye measures against the upright icons either side of it, and matching the boxes leaves it
+     looking about a seventh too big. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="534" height="534" viewBox="0 0 1000 1000" shape-rendering="geometricPrecision" fill="none" stroke="#000" stroke-width="42" stroke-linecap="round" stroke-linejoin="round">
+<title>pencil-outline</title>
+<path d="M150 850 L191 704 L744 150 L850 256 L296 809 Z"/>
+<path d="M191 704 L296 809"/>
+<path d="M676 218 L782 324"/>
+</svg>

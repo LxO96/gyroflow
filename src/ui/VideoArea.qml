@@ -32,6 +32,11 @@ Item {
     property alias dropRect: dropRect;
     property bool isCalibrator: false;
 
+    // Armed state of the white balance eyedropper in Color adjustments. Lives here rather than in
+    // the panel because the click that matters lands on the video, and both sides need to see it:
+    // the panel to light its button, this file to put a crosshair on the picture.
+    property bool wbPickArmed: false;
+
     property var pendingGyroflowData: null;
     property int pendingQueueJobId: 0;
     property url loadedFileUrl;
@@ -144,6 +149,7 @@ Item {
                 window.sync.loadGyroflow(obj);
                 window.lensProfile.loadGyroflow(obj);
                 window.colorAdjustments.loadGyroflow(obj);
+                window.denoise.loadGyroflow(obj);
                 Qt.callLater(window.exportSettings.loadGyroflow, obj);
 
                 if (obj.hasOwnProperty("image_sequence_start") && +obj.image_sequence_start > 0) {
@@ -802,7 +808,93 @@ Item {
                 GridGuide {
                     id: gridGuide;
                     anchors.fill: vid;
-                    canShow: vid.loaded;
+                    canShow: vid.loaded && !root.wbPickArmed;
+                }
+
+                // White balance picker. Armed from the eyedropper in Color adjustments; the next
+                // click on the picture samples a patch and disarms.
+                //
+                // Sampling `vid` rather than the source frame is deliberate and is what makes the
+                // whole feature cheap: `grabToImage` already exists here, and the solver in
+                // core/color/picker.rs is built to work from the *graded* pixel - see its module
+                // docs for why that is enough. The cost is that anything drawn over the video
+                // (the grid guide, feature points) would be sampled too, so the guide is hidden
+                // while armed rather than leaving a trap the user cannot see.
+                MouseArea {
+                    id: wbPicker;
+                    anchors.fill: vid;
+                    enabled: root.wbPickArmed && vid.loaded;
+                    visible: enabled;
+                    cursorShape: Qt.CrossCursor;
+                    hoverEnabled: true;
+                    // Right-click cancels. Escape would be the conventional key, but a QML
+                    // Shortcut only ever fired here with `enabled` removed - and an
+                    // always-registered Escape is one the whole app pays for, because shortcuts
+                    // are matched before key events reach items and it would shadow the Escape
+                    // that closes a combo box or a tooltip. Cancelling on a button this MouseArea
+                    // already receives, and only while it is armed, steals nothing.
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton;
+
+                    // Where the press landed, and where the cursor is now. Both in item pixels;
+                    // they are only normalised at the moment of the pick, because the grab is
+                    // taken at the window's device pixel ratio and is not this item's size.
+                    property real startX: 0;
+                    property real startY: 0;
+                    property bool dragging: false;
+
+                    // Below this a drag is a click. Fingers and mice both wobble a pixel or two
+                    // on the way down, and a two-pixel rectangle is not what anyone meant.
+                    readonly property real dragThreshold: 4 * dpiScale;
+
+                    onPressed: mouse => {
+                        if (mouse.button !== Qt.LeftButton) return;
+                        startX = mouse.x; startY = mouse.y;
+                        marquee.x = mouse.x; marquee.y = mouse.y;
+                        marquee.width = 0; marquee.height = 0;
+                        dragging = false;
+                    }
+                    onPositionChanged: mouse => {
+                        if (!pressed) return;
+                        if (!dragging && (Math.abs(mouse.x - startX) > dragThreshold || Math.abs(mouse.y - startY) > dragThreshold))
+                            dragging = true;
+                        marquee.x = Math.min(startX, mouse.x);
+                        marquee.y = Math.min(startY, mouse.y);
+                        marquee.width  = Math.abs(mouse.x - startX);
+                        marquee.height = Math.abs(mouse.y - startY);
+                    }
+                    onReleased: mouse => {
+                        if (mouse.button === Qt.RightButton) { root.wbPickArmed = false; dragging = false; return; }
+
+                        // A click is sent as a rectangle with both corners at the same point;
+                        // `average_patch` widens it to a small block, so there is one code path
+                        // on the Rust side and clicking keeps behaving exactly as it did.
+                        const x1 = dragging? mouse.x : startX;
+                        const y1 = dragging? mouse.y : startY;
+                        const nx0 = startX / Math.max(1, width), ny0 = startY / Math.max(1, height);
+                        const nx1 = x1     / Math.max(1, width), ny1 = y1     / Math.max(1, height);
+
+                        dragging = false;
+                        root.wbPickArmed = false;
+                        vid.grabToImage(function(result) {
+                            const r = controller.pick_white_balance(result.image, nx0, ny0, nx1, ny1);
+                            if (r.error) {
+                                window.showNotification(Modal.Warning, r.error);
+                            } else {
+                                window.colorAdjustments.applyPickedWhiteBalance(r.kelvin, r.tint);
+                            }
+                        });
+                    }
+
+                    // Shows what is about to be sampled. Sits inside the MouseArea so it is torn
+                    // down with it, and is `enabled: false` by inheritance - a plain Rectangle
+                    // takes no input, so it cannot eat the release that ends the drag.
+                    Rectangle {
+                        id: marquee;
+                        visible: wbPicker.dragging;
+                        color: "#20ffffff";
+                        border.color: "#ffffff";
+                        border.width: 1 * dpiScale;
+                    }
                 }
             }
             Item {
@@ -1084,10 +1176,27 @@ Item {
                     tooltip: qsTr("Toggle stabilization");
                 }
 
+                // A/B the grade on its own. Deliberately beside the stabilization toggle and
+                // deliberately separate from it: turning stabilization off used to skip the whole
+                // render pass, taking the colour with it, so there was no way to see one without
+                // the other.
+                //
+                // Both are preview-only. `set_render_params` forces them back on for every job,
+                // so a toggle left off here can never silently ship a wrong-looking export.
+                SmallLinkButton {
+                    id: colorEnabledBtn;
+                    iconName: "pencil-outline";
+                    onCheckedChanged: { controller.preview_color_enabled = checked; vid.forceRedraw(); }
+                    tooltip: qsTr("Toggle color adjustments");
+                }
+
                 SmallLinkButton {
                     id: muteBtn;
                     iconName: checked? "sound" : "sound-mute";
-                    tooltip: checked? qsTr("Mute") : qsTr("Unmute");
+                    // Suppressed while the volume popup is open: the tooltip is anchored to this
+                    // button and lands on top of the slider, which is unreadable and, worse,
+                    // looks like part of it.
+                    tooltip: volumePopup.opened? "" : (checked? qsTr("Mute") : qsTr("Unmute"));
                     checked: !vid.muted;
 
                     ContextMenuMouseArea {
@@ -1096,27 +1205,100 @@ Item {
                         onContextMenu: (isHold, x, y) => { volumePopup.open(); if (isHold) vid.muted = !vid.muted; }
                     }
                     onClicked: () => { vid.muted = !vid.muted; }
+
+                    // Hovering the speaker reveals the volume slider; clicking still mutes.
+                    //
+                    // The popup and its slider are unchanged - they have been here all along, but
+                    // only reachable by right-clicking the icon (or long-pressing it on touch,
+                    // which is still the only route where there is no hover), so in practice
+                    // nobody found them.
+                    //
+                    // Two delays, and both earn their place. Opening waits, because this button
+                    // sits between the colour toggle and the playback-rate box: without a delay
+                    // the popup flashes every time the cursor crosses it on the way somewhere
+                    // else. Closing waits, because the cursor has to leave the button to reach
+                    // the slider - close on the first hover-out and the slider is unreachable.
+                    onHoveredChanged: {
+                        if (hovered) { volumeCloseTimer.stop(); volumeOpenTimer.restart(); }
+                        else         { volumeOpenTimer.stop();  volumeCloseTimer.restart(); }
+                    }
+                    Timer {
+                        id: volumeOpenTimer;
+                        interval: 250;
+                        onTriggered: if (muteBtn.hovered) volumePopup.open();
+                    }
+                    Timer {
+                        id: volumeCloseTimer;
+                        interval: 400;
+                        // `pressed` keeps it open through a drag that wanders outside the popup,
+                        // which is easy to do when the handle is already at one end of the track.
+                        onTriggered: if (!muteBtn.hovered && !volumeHover.hovered && !volumeSlider.pressed) volumePopup.close();
+                    }
+
+                    // Scroll over the speaker to set the level without aiming at anything. The
+                    // popup comes up with it so the change is visible rather than silent.
+                    WheelHandler {
+                        onWheel: event => {
+                            volumeSlider.value = Math.max(0, Math.min(100, volumeSlider.value + (event.angleDelta.y > 0? 5 : -5)));
+                            volumePopup.open();
+                            volumeCloseTimer.restart();
+                        }
+                    }
+
+                    // Declarative rather than assigning `vid.volume` from the slider's
+                    // `onValueChanged`: a stored level that happens to equal the Slider's own
+                    // initial value fires no change signal, so a saved volume of 0 was silently
+                    // never applied and audio came back at full level on the next launch.
+                    Binding { target: vid; property: "volume"; value: volumeSlider.value / 100.0; }
+
                     Popup {
                         id: volumePopup;
-                        width: volumeLabel.width + 25 * dpiScale;
+                        width: volumeRow.width + 20 * dpiScale;
                         height: 30 * dpiScale;
                         x: -width + muteBtn.width;
                         y: -height;
-                        Label {
-                            id: volumeLabel;
+
+                        Row {
+                            id: volumeRow;
                             anchors.centerIn: parent;
-                            text: qsTr("Volume");
-                            position: Label.LeftPosition;
-                            width: t.width + volumeSlider.width;
+                            spacing: 8 * dpiScale;
+
+                            // Keeps the popup alive while the cursor is inside it, which is the
+                            // other half of the close rule above. On the Row rather than on the
+                            // Popup because this component's `contentItem` is a ListView (it was
+                            // written for combo boxes), so a handler declared on the Popup lands
+                            // somewhere less predictable than the item actually under the cursor.
+                            HoverHandler {
+                                id: volumeHover;
+                                margin: 10 * dpiScale;   // cover the popup's padding too
+                                onHoveredChanged: {
+                                    if (hovered) volumeCloseTimer.stop();
+                                    else         volumeCloseTimer.restart();
+                                }
+                            }
+                            BasicText {
+                                text: qsTr("Volume");
+                                anchors.verticalCenter: parent.verticalCenter;
+                            }
                             Slider {
                                 id: volumeSlider;
-                                width: 200 * dpiScale;
+                                width: 150 * dpiScale;
+                                anchors.verticalCenter: parent.verticalCenter;
                                 unit: "%";
                                 from: 0;
                                 to: 100;
                                 value: settings.value("volume", 100);
                                 precision: 0;
-                                onValueChanged: { vid.volume = value / 100.0; settings.setValue("volume", value); }
+                                onValueChanged: settings.setValue("volume", value);
+                            }
+                            BasicText {
+                                // Fixed width, so the row does not shuffle sideways as the number
+                                // goes from "5 %" to "100 %" while you drag.
+                                width: 36 * dpiScale;
+                                horizontalAlignment: Text.AlignRight;
+                                anchors.verticalCenter: parent.verticalCenter;
+                                text: Math.round(volumeSlider.value) + " %";
+                                opacity: 0.7;
                             }
                         }
                     }
