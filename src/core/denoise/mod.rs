@@ -147,6 +147,9 @@ impl DenoiseSettings {
     }
 }
 
+/// End-to-end GPU tests for the temporal gather. `#[ignore]`d - they need a real device.
+#[cfg(test)] mod tests_gpu;
+
 #[cfg(test)]
 mod tests {
     use super::*;
