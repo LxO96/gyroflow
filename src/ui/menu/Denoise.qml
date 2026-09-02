@@ -20,6 +20,25 @@ MenuItem {
     // ColorAdjustments calls its flag `colorEnabled`.
     property bool denoiseEnabled: false;
 
+    // Restores the panel from a loaded project or an applied preset. Mirrors the core
+    // importer (core/lib.rs, the `obj.get("denoise")` arm): a file with no `denoise` section
+    // leaves the core's current settings alone, so the panel leaves its controls alone too.
+    //
+    // Without this the core and the panel drift apart on every project load - the render
+    // would denoise while the panel showed the previous clip's values.
+    function loadGyroflow(obj: var): void {
+        const d = obj.denoise;
+        if (!d || typeof d !== "object") return;
+
+        if (typeof d.luma_strength   !== "undefined") lumaSlider  .value = +d.luma_strength;
+        if (typeof d.chroma_strength !== "undefined") chromaSlider.value = +d.chroma_strength;
+        if (typeof d.enabled         !== "undefined") enableCb.checked = !!d.enabled;
+        // Read back from the core rather than from `d.quality`: the core rejects an
+        // unknown id and keeps its current value, and the dropdown must follow what was
+        // actually applied, not what the file asked for.
+        qualityCb.syncFromCore();
+    }
+
     CheckBox {
         id: enableCb;
         text: qsTr("Enable");
