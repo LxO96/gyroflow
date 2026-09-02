@@ -87,6 +87,18 @@ struct Opts {
     #[argh(option)]
     preset: Option<String>,
 
+    /// enable temporal denoising at the given quality: fast or high
+    #[argh(option)]
+    denoise: Option<String>,
+
+    /// denoise luma strength, 0.0 to 1.0
+    #[argh(option)]
+    denoise_luma: Option<f64>,
+
+    /// denoise chroma strength, 0.0 to 1.0
+    #[argh(option)]
+    denoise_chroma: Option<f64>,
+
     /// open file in the GUI (video or project)
     #[argh(option)]
     open: Option<String>,
@@ -157,6 +169,47 @@ pub fn run(open_file: &mut String, open_preset: &mut String) -> bool {
                     std::fs::read_to_string(std::fs::canonicalize(&preset).unwrap_or_else(|_| preset.clone().into()).to_string_lossy().to_string()).unwrap_or_default()
                 };
                 presets.push(preset);
+            }
+        }
+
+        // Expressed as a preset rather than by reaching for the stabilizer directly: presets
+        // already carry `denoise` (they are how the GUI and project files round-trip it), so
+        // this reuses that path instead of adding a second way to set the same fields.
+        // Pushed after `--preset` because presets are applied in order, which makes the
+        // explicit flags win over a `denoise` section inside a preset file.
+        {
+            let mut denoise = serde_json::Map::new();
+            if let Some(ref q) = opts.denoise {
+                match gyroflow_core::denoise::DenoiseQuality::from_id(q) {
+                    Some(quality) => {
+                        denoise.insert("enabled".into(), true.into());
+                        denoise.insert("quality".into(), quality.id().into());
+                    },
+                    None => {
+                        eprintln!("Unknown denoise quality: {q}. Expected 'fast' or 'high'.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            // Strengths are accepted on their own: they are meaningful when a preset or
+            // project file already enabled denoising, and harmless when nothing did.
+            if let Some(v) = opts.denoise_luma   { denoise.insert("luma_strength".into(),   v.into()); }
+            if let Some(v) = opts.denoise_chroma { denoise.insert("chroma_strength".into(), v.into()); }
+            if !denoise.is_empty() {
+                let mut root = serde_json::Map::new();
+                root.insert("denoise".into(), serde_json::Value::Object(denoise));
+                let value = serde_json::Value::Object(root);
+                // `--open` carries a single preset string into the GUI, so merge rather than
+                // overwrite: `--open x.mp4 --preset p.gyroflow --denoise high` must keep p.
+                if open_preset.trim().is_empty() {
+                    *open_preset = value.to_string();
+                } else if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(open_preset) {
+                    gyroflow_core::util::merge_json(&mut existing, &value);
+                    *open_preset = existing.to_string();
+                } else {
+                    *open_preset = value.to_string();
+                }
+                presets.push(value.to_string());
             }
         }
 
