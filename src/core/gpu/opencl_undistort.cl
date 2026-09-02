@@ -750,6 +750,23 @@ DATA_TYPEF sample_bilinear(__global const uchar *srcptr, float2 uv, int frame, _
     return sum;
 }
 
+// The source-rect remap `undistort_coord` performs inline for every background mode except
+// 3. Factored out so the temporal gather can apply the same mapping to its reference taps in
+// the one case where `undistort_coord` leaves it undone. Mirror of `map_uv_to_source_rect`
+// in wgpu_undistort.wgsl.
+float2 map_uv_to_source_rect(float2 uv, __global KernelParams *params) {
+    float2 frame_size = (float2)(params->width, params->height);
+    if (params->input_rotation != 0.0f) {
+        float rotation = params->input_rotation * (M_PI_F / 180.0f);
+        float2 size = frame_size;
+        frame_size = fabs(round(rotate_point(size, rotation, (float2)(0.0f, 0.0f), (float2)(0.0f, 0.0f))));
+    }
+    return (float2)(
+        map_coord(uv.x, 0.0f, frame_size.x, (float)params->source_rect.x, (float)(params->source_rect.x + params->source_rect.z)),
+        map_coord(uv.y, 0.0f, frame_size.y, (float)params->source_rect.y, (float)(params->source_rect.y + params->source_rect.w))
+    );
+}
+
 // Combine the centre sample with its temporal neighbours. Mirror of `gather_denoised` in
 // wgpu_undistort.wgsl and of `denoise::rejection_weight` in Rust - all three must agree:
 // the GPU tests compare this kernel's output against the wgpu kernel's.
@@ -776,6 +793,11 @@ DATA_TYPEF gather_denoised(float2 position, DATA_TYPEF centre, __global const uc
     for (int f = 1; f < count; f++) {
         float2 ruv = undistort_coord(position, f * block, params, matrices, mesh_data);
         if (ruv.x < -99998.0f) { continue; }
+        // `undistort_coord` skips the source-rect remap when background_mode == 3, leaving it
+        // to the caller. The references have no such caller - see the wgsl mirror of this.
+        if ((params->flags & 32) && params->background_mode == 3) {
+            ruv = map_uv_to_source_rect(ruv, params);
+        }
 
         DATA_TYPEF s = sample_bilinear(srcptr, ruv, f, params, drawing, bg, lut_coeffs);
 

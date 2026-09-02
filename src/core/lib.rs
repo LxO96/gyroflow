@@ -957,6 +957,12 @@ impl StabilizationManager {
 
         if let Some(undist) = self.stabilization.try_read_for(std::time::Duration::from_millis(30000)) {
             if reference_timestamps.is_empty() || buffers.references.is_empty() {
+                // Clear rather than merely branch: the backends derive `reference_count` from
+                // `buffers.references`, but the matrices come from the transform, and the
+                // plain path builds one with no `reference_matrices` at all. Leaving the
+                // buffers populated would have the kernel index matrix blocks that were never
+                // written.
+                buffers.references.clear();
                 undist.process_pixels::<T>(timestamp_us, frame, buffers, None)
             } else {
                 // The gather reads `reference_count` from `buffers.references.len()` but takes

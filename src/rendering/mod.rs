@@ -376,6 +376,12 @@ fn compute_fill_with_background(pad_with_black: bool, trim_ranges: &[(f64, f64)]
 ///   duration, so it must be computed before the `fps_scale` division.
 struct WindowFrame {
     out_ts: i64,
+    /// The frame-rate/speed-ramp duplication counts computed for *this* frame. Like
+    /// `out_ts`, they describe the frame they were computed for, so emitting frame `N - k`
+    /// while `rate_control` still holds frame `N`'s counts would duplicate the wrong frame
+    /// and collide with the next frame's timestamp slot.
+    repeat_times: i64,
+    repeat_interval: i64,
     fill_bg: bool,
     frame: Video,
 }
@@ -812,13 +818,12 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     // future neighbours; see `temporal_window`. At `denoise_k == 0` the window is bypassed
     // entirely (see `on_frame`), so denoising off costs neither a clone nor a delay.
     //
-    // One window spans the whole render, including multi-range (multi-trim) exports, so a
-    // frame within `denoise_k` of a trim seam gathers across the cut. The rejection weight
-    // discards those neighbours - they are a different scene, so the difference is large -
-    // which means the visible effect is denoising weakening for ~2k frames per seam rather
-    // than content bleeding across it. Left as is deliberately: a per-range window would
-    // reset the delay at every seam, and the failure it would prevent is already handled by
-    // the rejection.
+    // The window is drained at every trim-range boundary as well as at end of decode (see
+    // `ffmpeg_processor.rs`), so it never spans a cut. That matters for more than image
+    // quality: frames held across a seam would be emitted *after* the next range started,
+    // carrying their own `out_ts` into the middle of the new range's timeline, and the
+    // `add_video` the next range is offset by is derived from the last emitted frame - so a
+    // window left full at a seam makes PTS jump backwards there.
     let window: Rc<RefCell<temporal_window::TemporalWindow<WindowFrame>>> = Rc::new(RefCell::new(temporal_window::TemporalWindow::new(denoise_k)));
     let window_finish = window.clone();
     let planes_finish = planes.clone();
@@ -1151,10 +1156,18 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
         // neighbours (see `temporal_window`). `out_ts` and `fill_bg` are captured here and
         // restored on emission - see `WindowFrame` for why recomputing them from the centre
         // timestamp is wrong.
-        let item = WindowFrame { out_ts: rate_control.out_timestamp_us, fill_bg: fill_with_background, frame: input_frame.clone() };
+        let item = WindowFrame {
+            out_ts: rate_control.out_timestamp_us,
+            repeat_times: rate_control.repeat_times,
+            repeat_interval: rate_control.repeat_interval,
+            fill_bg: fill_with_background,
+            frame: input_frame.clone(),
+        };
         match window.borrow_mut().push(timestamp_us, item) {
             Some(emission) => {
-                rate_control.out_timestamp_us = emission.centre.out_ts;
+                rate_control.out_timestamp_us  = emission.centre.out_ts;
+                rate_control.repeat_times      = emission.centre.repeat_times;
+                rate_control.repeat_interval   = emission.centre.repeat_interval;
                 let references: Vec<&Video> = emission.references.iter().map(|r| &r.frame).collect();
                 process_and_undistort(
                     &mut planes.borrow_mut(),
@@ -1209,7 +1222,8 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 let output_frame = buf_cell.as_mut().unwrap();
 
                 rate_control.out_timestamp_us = emission.centre.out_ts;
-                rate_control.repeat_times = 1;
+                rate_control.repeat_times     = emission.centre.repeat_times.max(1);
+                rate_control.repeat_interval  = emission.centre.repeat_interval;
                 let references: Vec<&Video> = emission.references.iter().map(|r| &r.frame).collect();
                 process_and_undistort(
                     &mut planes_finish.borrow_mut(),

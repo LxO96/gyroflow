@@ -717,6 +717,22 @@ fn sample_bilinear_at(uv: vec2<f32>, frame: u32) -> vec4<f32> {
     return finish_sample(sum);
 }
 
+/// The source-rect remap `undistort_coord` performs inline for every background mode
+/// except 3. Factored out so the temporal gather can apply the same mapping to its
+/// reference taps in the one case where `undistort_coord` leaves it undone.
+fn map_uv_to_source_rect(uv: vec2<f32>) -> vec2<f32> {
+    var frame_size = vec2<f32>(f32(params.width), f32(params.height));
+    if (params.input_rotation != 0.0) {
+        let rotation = params.input_rotation * (3.14159265359 / 180.0);
+        let size = frame_size;
+        frame_size = abs(round(rotate_point(size, rotation, vec2<f32>(0.0, 0.0), vec2<f32>(0.0, 0.0))));
+    }
+    return vec2<f32>(
+        map_coord(uv.x, 0.0, f32(frame_size.x), f32(params.source_rect.x), f32(params.source_rect.x + params.source_rect.z)),
+        map_coord(uv.y, 0.0, f32(frame_size.y), f32(params.source_rect.y), f32(params.source_rect.y + params.source_rect.w))
+    );
+}
+
 // Combine the centre sample with its temporal neighbours.
 //
 // Each reference frame has its own matrix block, so running the same
@@ -741,8 +757,16 @@ fn gather_denoised(position: vec2<f32>, centre: vec4<f32>) -> vec4<f32> {
 
     let block = u32(params.matrix_count) * 14u;
     for (var f: u32 = 1u; f < count; f = f + 1u) {
-        let ruv = undistort_coord(position, f * block);
+        var ruv = undistort_coord(position, f * block);
         if (ruv.x < -99998.0) { continue; }
+        // `undistort_coord` skips the source-rect remap when background_mode == 3, leaving
+        // it to the caller (the "margin with feather" branch does it for `uv` and `pt2`).
+        // The references have no such caller, so without this they would sample raw frame
+        // coordinates while the centre samples remapped ones - every reference tap lands in
+        // the wrong place across the whole frame, not just the feather band.
+        if (bool(u32(params.flags) & 32u) && params.background_mode == 3) {
+            ruv = map_uv_to_source_rect(ruv);
+        }
 
         let s = sample_bilinear_at(ruv, f);
 

@@ -67,14 +67,17 @@ struct ReferenceFrame {
 /// preview resolution invalidates every cached frame's stride.
 #[derive(Default)]
 struct ReferenceCache {
-    key: Option<(i64, usize, (usize, usize, usize))>,
+    /// Includes the clip and its fps, not just the position: two clips of the same
+    /// resolution paused at the same timestamp would otherwise hit each other's cache and
+    /// denoise one clip against the other's neighbours.
+    key: Option<(String, i64, usize, (usize, usize, usize), u64)>,
     frames: Vec<ReferenceFrame>,
 }
 
 impl ReferenceCache {
     fn get(&mut self, url: &str, timestamp_us: i64, k: usize, fps: f64, size: (usize, usize, usize)) -> &mut [ReferenceFrame] {
-        let key = (timestamp_us, k, size);
-        if self.key != Some(key) {
+        let key = (url.to_string(), timestamp_us, k, size, fps.to_bits());
+        if self.key.as_ref() != Some(&key) {
             self.key = Some(key);
             self.frames = if k > 0 && fps > 0.0 && !url.is_empty() {
                 Self::fetch(url, timestamp_us, k, fps, size)
@@ -85,8 +88,12 @@ impl ReferenceCache {
         &mut self.frames
     }
 
-    /// Drop the window and its memory. Called on every played frame, so a paused window
-    /// (up to 7 full-size RGBA frames) is not held for the whole session.
+    /// Drop the window and its memory.
+    ///
+    /// Reached from the pixel callback whenever the radius is 0. Note that on the
+    /// GPU-texture preview pipeline a *playing* frame is accepted by `onProcessTexture` and
+    /// never reaches the pixel callback at all, so the window is released on the next paused
+    /// render rather than immediately when playback starts.
     fn clear(&mut self) {
         if self.key.is_some() {
             self.key = None;
@@ -151,7 +158,15 @@ impl ReferenceCache {
                     for y in 0..size.1 {
                         pixels[y * size.2..y * size.2 + row_bytes].copy_from_slice(&src_data[y * src_stride..y * src_stride + row_bytes]);
                     }
-                    collected2.borrow_mut().push(ReferenceFrame { timestamp_us: ts, pixels });
+                    // Never hand back more than the gather can hold. `max_frames` bounds the
+                    // decode, but the centre is only excluded when a decoded timestamp lands
+                    // within half a frame of it - and mdk's playhead and ffmpeg's PTS are
+                    // different domains, so at high frame rates that can miss. Without this
+                    // cap the extra reference makes the backends' size guard fail and (on
+                    // OpenCL) return Ok(()) with the previous frame still in the output.
+                    if collected2.borrow().len() < gyroflow_core::gpu::MAX_GATHER_FRAMES - 1 {
+                        collected2.borrow_mut().push(ReferenceFrame { timestamp_us: ts, pixels });
+                    }
                 });
                 if let Err(e) = r {
                     ::log::warn!("Denoise preview: decoding references around {timestamp_us} failed: {e:?}");

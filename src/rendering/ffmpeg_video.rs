@@ -78,6 +78,9 @@ pub struct VideoTranscoder<'a> {
     /// through `receive_and_process_video_frames`, needed here for the same reason: writing
     /// encoded packets out.
     pub on_finish_callback: Option<Box<dyn FnMut(&mut VideoTranscoder<'a>, &mut RateControl, &mut format::context::Output, &mut Vec<Rational>) -> Result<(), FFmpegError> + 'a>>,
+    /// Output timestamp of the last frame `encode_extra_frame` wrote, for the caller to fold
+    /// into `FrameTimestamps` - that path never sees `frame_ts` itself.
+    pub last_extra_video_ts: Option<i64>,
     pub on_encoder_initialized: Option<Box<dyn FnMut(&encoder::video::Video) -> Result<(), FFmpegError> + 'a>>,
 
     pub processing_order: ProcessingOrder,
@@ -531,11 +534,24 @@ impl<'a> VideoTranscoder<'a> {
         let mut final_frame: &mut frame::Video = final_frame_in;
         if in_format != target_format {
             if self.encoder_converter.is_none() {
-                let conv = software::scaling::Context::get(
+                let mut conv = software::scaling::Context::get(
                     final_frame.format(), final_frame.width(), final_frame.height(),
                     target_format, final_frame.width(), final_frame.height(),
                     software::scaling::flag::Flags::from_bits_truncate(self.ffmpeg_interpolation),
                 )?;
+                // Same coefficients the live path sets when it builds this converter. Without
+                // them a drained tail frame built through this fallback would be converted
+                // with swscale's BT.601/limited-range defaults while every other frame in the
+                // file got 709 - a visible shift on the last k frames.
+                unsafe {
+                    use std::os::raw::c_int;
+                    let mut src_range: c_int = 0;
+                    let mut dst_range: c_int = 0;
+                    let coefs = ffi::sws_getCoefficients(ffi::SWS_CS_ITU709);
+                    if final_frame.color_range() == util::color::Range::JPEG { src_range |= 1; }
+                    if self.buffers.converted_frame.color_range() == util::color::Range::JPEG { dst_range |= 1; }
+                    ffi::sws_setColorspaceDetails(conv.as_mut_ptr(), coefs, src_range, coefs, dst_range, 0, 1 << 16, 1 << 16);
+                }
                 self.encoder_converter = Some(conv);
             }
             if self.buffers.converted_frame.format() != target_format || self.buffers.converted_frame.width() != final_frame.width() || self.buffers.converted_frame.height() != final_frame.height() {
@@ -552,10 +568,33 @@ impl<'a> VideoTranscoder<'a> {
         let mut ts = rate_control.out_timestamp_us;
         let clone_frames = self.clone_frames;
         let output_index = self.output_index.unwrap_or_default();
+        let mut output_hw_frame = None;
         {
             let encoder = self.encoder.as_mut().ok_or(FFmpegError::EncoderNotFound)?;
             encoder.set_format(final_frame.format());
             encoder.set_color_range(final_frame.color_range());
+
+            // Some encoders only accept hardware frames, and that is a property of the
+            // ENCODER, not of how the input was decoded - Ruling 12 forces software decoding
+            // when denoising, which says nothing about what the encoder wants. Without this
+            // upload a drained tail frame reaches `send_frame` as a plain software frame and
+            // is rejected, failing the whole export after all the work is done. Mirrors the
+            // live path's upload; keyed off the encoder's own frames context rather than
+            // re-deriving the format, so it cannot disagree with what the encoder expects.
+            if !unsafe { (*encoder.as_mut_ptr()).hw_frames_ctx.is_null() } {
+                let mut hw = frame::Video::empty();
+                unsafe {
+                    let frame_ptr = hw.as_mut_ptr();
+                    let err = ffi::av_hwframe_get_buffer((*encoder.as_mut_ptr()).hw_frames_ctx, frame_ptr, 0);
+                    if err < 0 { return Err(FFmpegError::ToHWBufferError(err)); }
+                    if (*frame_ptr).hw_frames_ctx.is_null() { return Err(FFmpegError::NoFramesContext); }
+                    let err = ffi::av_hwframe_transfer_data(frame_ptr, final_frame.as_mut_ptr(), 0);
+                    if err < 0 { return Err(FFmpegError::ToHWTransferError(err)); }
+                    Self::copy_frame_props(frame_ptr, final_frame.as_ptr());
+                }
+                output_hw_frame = Some(hw);
+                final_frame = output_hw_frame.as_mut().ok_or(FFmpegError::FrameEmpty)?;
+            }
 
             for _ in 0..rate_control.repeat_times.max(1) {
                 let timestamp = Some(ts.rescale((1, 1000000), time_base));
@@ -569,6 +608,13 @@ impl<'a> VideoTranscoder<'a> {
                 ts += rate_control.repeat_interval;
             }
         }
+        // The live path updates `frame_ts.last_video` after every encode; this path cannot
+        // reach `frame_ts`, so it records the last timestamp it wrote and the caller folds it
+        // in. Without that, a trim seam computes `add_video` from the last *live* frame and
+        // the next range's timestamps collide with the frames the drain just emitted - the
+        // muxer silently drops one frame per collision.
+        self.last_extra_video_ts = Some(ts - rate_control.repeat_interval);
+
         let ost_time_base = ost_time_bases[output_index];
         self.receive_and_process_encoded_packets(octx, ost_time_base)?;
         Ok(true)

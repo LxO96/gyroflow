@@ -57,6 +57,12 @@ impl<T> TemporalWindow<T> {
     pub fn push(&mut self, ts: i64, item: T) -> Option<Emission<'_, T>> {
         self.ring.push_back((ts, item));
         self.total += 1;
+        // A new frame re-arms the drain. Without this the one-shot guard makes a window that
+        // was drained at a trim-range boundary refuse to drain again at end of decode, so the
+        // final range's held tail is silently dropped. The guard's real purpose - two
+        // consecutive drains with nothing pushed between them yielding nothing the second
+        // time - is unaffected.
+        self.drained = false;
 
         // Frame `next_emit` is ready once `k` frames after it have arrived.
         if self.total <= self.next_emit + self.k {
@@ -178,6 +184,32 @@ mod tests {
         let first = w.drain();
         assert!(!first.is_empty());
         assert!(w.drain().is_empty(), "a second drain must not re-emit");
+    }
+
+    /// A multi-range export drains at every trim seam and again at end of decode. The
+    /// one-shot guard must not let the seam drain disarm the final one, or the last range's
+    /// held tail disappears from the output - which is exactly what happened: a two-range
+    /// export came out 2k frames short with no error anywhere.
+    #[test]
+    fn draining_at_a_range_boundary_does_not_disarm_the_final_drain() {
+        let mut w = TemporalWindow::new(1);
+        let mut out = Vec::new();
+
+        // Range 1: three frames, one emitted live, then the seam drain takes the rest.
+        for i in 0..3 { if let Some(e) = w.push(i, i) { out.push(e.centre_ts); } }
+        w.drain_each(|e| out.push(e.centre_ts));
+        assert_eq!(out, vec![0, 1, 2], "range 1 must be complete at the seam");
+
+        // Range 2: the same again. Every frame must still come out.
+        for i in 10..13 { if let Some(e) = w.push(i, i) { out.push(e.centre_ts); } }
+        w.drain_each(|e| out.push(e.centre_ts));
+        assert_eq!(out, vec![0, 1, 2, 10, 11, 12], "range 2's tail was dropped");
+
+        // The guard itself still holds: draining twice with nothing pushed between emits
+        // nothing the second time.
+        let before = out.len();
+        w.drain_each(|e| out.push(e.centre_ts));
+        assert_eq!(out.len(), before, "a repeated drain must not re-emit");
     }
 
     #[test]
