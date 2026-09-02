@@ -429,9 +429,11 @@ fn denoise_gpu_preserves_a_subject_the_references_do_not_have() {
 /// both, and the two accumulate through different compilers. The bound is the same
 /// `1/1024` of full scale that `cross_backend_color_tests` holds the colour stage to.
 ///
-/// Requires *both* backends. Skipping when only one is present is correct — with one
-/// backend there is nothing to compare — but it means this test asserts nothing on a
-/// build without `--features use-opencl`.
+/// Requires *both* backends, so it is compiled out entirely without `use-opencl` rather
+/// than skipping at runtime. A test that printed `ok` while comparing nothing would let a
+/// wgpu-only run look like it had checked the kernels against each other; this way the
+/// absence shows up as a smaller test count, which is not mistakable for a pass.
+#[cfg(feature = "use-opencl")]
 #[test]
 #[ignore = "needs a GPU and OpenCL; run with: cd src/core && cargo test --features use-opencl -- --ignored denoise_gpu"]
 fn denoise_gpu_wgpu_and_opencl_agree_pixel_for_pixel() {
@@ -451,7 +453,7 @@ fn denoise_gpu_wgpu_and_opencl_agree_pixel_for_pixel() {
         resolve("OpenCL", run_opencl(&scene, SIGMA)),
     ) {
         (Some(a), Some(b)) => (a, b),
-        _ => { println!("SKIPPED: this comparison needs both backends present, so it asserted nothing"); return; }
+        (a, b) => panic!("this comparison needs both backends, but wgpu={} OpenCL={} - a build with use-opencl that cannot reach a device must fail, not quietly assert nothing", a.is_some(), b.is_some()),
     };
 
     let mut max_diff = 0.0f32;
