@@ -811,6 +811,14 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
     // Delays output by `denoise_k` frames so each denoised frame sees both its past and
     // future neighbours; see `temporal_window`. At `denoise_k == 0` the window is bypassed
     // entirely (see `on_frame`), so denoising off costs neither a clone nor a delay.
+    //
+    // One window spans the whole render, including multi-range (multi-trim) exports, so a
+    // frame within `denoise_k` of a trim seam gathers across the cut. The rejection weight
+    // discards those neighbours - they are a different scene, so the difference is large -
+    // which means the visible effect is denoising weakening for ~2k frames per seam rather
+    // than content bleeding across it. Left as is deliberately: a per-range window would
+    // reset the delay at every seam, and the failure it would prevent is already handled by
+    // the rejection.
     let window: Rc<RefCell<temporal_window::TemporalWindow<WindowFrame>>> = Rc::new(RefCell::new(temporal_window::TemporalWindow::new(denoise_k)));
     let window_finish = window.clone();
     let planes_finish = planes.clone();
@@ -1189,7 +1197,13 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                 if buf_cell.is_none() {
                     let template = vt.output_frame_template().ok_or(FFmpegError::FrameEmpty)?;
                     let mut nf = Video::new(template.format(), template.width(), template.height());
-                    nf.set_color_range(template.color_range());
+                    // The same prop copy the live path's output frames get (`ffmpeg_video.rs`),
+                    // not just the colour range: `copy_frame_props` also carries
+                    // colour primaries/trc/space and chroma location, and a drained tail frame
+                    // arriving tagged differently from every other frame is an asymmetry with no
+                    // upside. `pts` is copied too but is overwritten per frame by
+                    // `encode_extra_frame`'s `set_pts`.
+                    unsafe { ffmpeg_video::VideoTranscoder::copy_frame_props(nf.as_mut_ptr(), template.as_ptr()); }
                     *buf_cell = Some(nf);
                 }
                 let output_frame = buf_cell.as_mut().unwrap();
@@ -1212,9 +1226,10 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     output_frame,
                     emission.centre.fill_bg,
                 )?;
-                vt.encode_extra_frame(output_frame, rate_control, octx, ost_time_bases)?;
-                process_frame_finish.set(process_frame_finish.get() + 1);
-                progress_finish((process_frame_finish.get() as f64 / render_frame_count as f64, process_frame_finish.get(), render_frame_count, false, false));
+                if vt.encode_extra_frame(output_frame, rate_control, octx, ost_time_bases)? {
+                    process_frame_finish.set(process_frame_finish.get() + 1);
+                    progress_finish((process_frame_finish.get() as f64 / render_frame_count as f64, process_frame_finish.get(), render_frame_count, false, false));
+                }
                 Ok(())
             })();
             if let Err(e) = outcome {

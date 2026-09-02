@@ -505,6 +505,12 @@ impl WgpuWrapper {
 
         let _temp_texture = handle_input_texture(&self.device, &buffers.input, &self.queue, &mut encoder, &self.in_texture, self.pixel_format, self.padded_out_stride);
 
+        // How many references actually made it into the texture/buffer. The kernel walks
+        // frames 1..reference_count contiguously, so a reference that fails to upload
+        // truncates the window rather than merely being absent - everything after it would be
+        // sampled from a layer or offset that was never written.
+        let mut uploaded_references = 0usize;
+
         // Upload reference frames into the layers/offsets that follow the centre frame.
         if !buffers.references.is_empty() {
             if let Some(in_tex) = self.in_texture.wgpu_texture.as_ref() {
@@ -522,8 +528,13 @@ impl WgpuWrapper {
                                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(r.size.2 as u32), rows_per_image: None },
                                 wgpu::Extent3d { width: r.size.0 as u32, height: r.size.1 as u32, depth_or_array_layers: 1 },
                             );
+                            uploaded_references += 1;
                         }
-                        _ => log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will be missing this frame"),
+                        _ => {
+                            // Stop rather than skip - see `uploaded_references`.
+                            log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will use the {uploaded_references} reference(s) before it");
+                            break;
+                        }
                     }
                 }
             } else if let Some(in_buf) = self.in_texture.wgpu_buffer.as_ref() {
@@ -531,16 +542,19 @@ impl WgpuWrapper {
                 // `read_input_at`'s buffer branch steps between frames by
                 // `params.height * stride_px`, which is not the same as this plane's own
                 // frame size on a subsampled plane - see `super::reference_frame_pitch`.
-                let pitch = super::reference_frame_pitch(&itm.kernel_params, &buffers.input, in_size as usize) as u64;
+                let pitch = super::reference_frame_pitch(&itm.kernel_params, &buffers.input, in_size as usize).unwrap_or(0) as u64;
                 let required = pitch * (1 + buffers.references.len()) as u64;
-                if capacity < required {
+                if pitch == 0 || capacity < required {
                     log::error!("Reference frame buffer too small for {} references ({} < {})", buffers.references.len(), capacity, required);
                 } else {
                     for (i, r) in buffers.references.iter().enumerate() {
                         if let BufferSource::Cpu { buffer } = &r.data {
                             self.queue.write_buffer(in_buf, (i as u64 + 1) * pitch, bytemuck::cast_slice(buffer));
+                            uploaded_references += 1;
                         } else {
-                            log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will be missing this frame");
+                            // Stop rather than skip - see `uploaded_references`.
+                            log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will use the {uploaded_references} reference(s) before it");
+                            break;
                         }
                     }
                 }
@@ -551,7 +565,7 @@ impl WgpuWrapper {
 
         self.queue.write_buffer(self.buf_matrices.as_ref().unwrap(), 0, matrices);
         let mut kernel_params = itm.kernel_params;
-        kernel_params.reference_count = (1 + buffers.references.len()) as f32;
+        kernel_params.reference_count = (1 + uploaded_references) as f32;
         self.queue.write_buffer(self.buf_params.as_ref().unwrap(), 0, bytemuck::bytes_of(&kernel_params));
         if !drawing_buffer.is_empty() {
             if self.drawing_size < drawing_buffer.len() as u64 { log::error!("Buffer size mismatch! {} vs {}", self.drawing_size, drawing_buffer.len()); return false; }

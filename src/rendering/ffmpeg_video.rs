@@ -516,11 +516,14 @@ impl<'a> VideoTranscoder<'a> {
     /// match that target format and hand off to the encoder. It does not re-detect a codec,
     /// initialise the encoder, or handle hardware upload: denoising forces CPU decoding
     /// (Ruling 12), so a delayed frame is never a hardware frame.
-    pub fn encode_extra_frame(&mut self, final_frame_in: &mut frame::Video, rate_control: &mut RateControl, octx: &mut format::context::Output, ost_time_bases: &mut Vec<Rational>) -> Result<(), FFmpegError> {
+    /// Returns whether a frame was actually encoded. `false` is not an error - there is
+    /// simply no encoder to hand this to - but the caller must not count it as progress, or
+    /// a render that encoded nothing would still report 100%.
+    pub fn encode_extra_frame(&mut self, final_frame_in: &mut frame::Video, rate_control: &mut RateControl, octx: &mut format::context::Output, ost_time_bases: &mut Vec<Rational>) -> Result<bool, FFmpegError> {
         if self.decode_only || self.encoder.is_none() {
             // decode_only never encodes at all; encoder.is_none() means nothing was ever
             // encoded (e.g. a zero-frame input) and there is no pipeline to hand this to.
-            return Ok(());
+            return Ok(false);
         }
 
         let in_format = final_frame_in.format();
@@ -568,7 +571,7 @@ impl<'a> VideoTranscoder<'a> {
         }
         let ost_time_base = ost_time_bases[output_index];
         self.receive_and_process_encoded_packets(octx, ost_time_base)?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn receive_and_process_encoded_packets(&mut self, octx: &mut format::context::Output, ost_time_base: Rational) -> Result<(), FFmpegError> {
@@ -605,7 +608,7 @@ impl<'a> VideoTranscoder<'a> {
         }
     }*/
 
-    unsafe fn copy_frame_props(dst: *mut ffi::AVFrame, src: *const ffi::AVFrame) {
+    pub(crate) unsafe fn copy_frame_props(dst: *mut ffi::AVFrame, src: *const ffi::AVFrame) {
         unsafe {
             // (*dst).key_frame              = (*src).key_frame;
             (*dst).pict_type              = (*src).pict_type;

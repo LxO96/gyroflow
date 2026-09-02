@@ -32,10 +32,24 @@ pub const MAX_GATHER_FRAMES: usize = 7;
 /// makes host and kernel agree; the unwritten rows at the tail of each slot are never read
 /// back, because every sample the kernel takes is bounded by `source_rect`.
 ///
-/// The `max` guards the other direction: a CPU buffer carrying trailing padding beyond
-/// `height * stride` would otherwise have consecutive frames overlap.
-pub fn reference_frame_pitch(params: &crate::stabilization::KernelParams, input: &BufferDescription, centre_len: usize) -> usize {
-    (params.height as usize * params.stride as usize).max(centre_len).max(input.size.1 * input.size.2)
+/// The pitch is `params.height * params.stride` and nothing else: it is what the kernels
+/// step by, and the host has no freedom to choose differently. Pitching *larger* to make a
+/// frame fit would be worse than the overlap it avoids - every reference after the first
+/// would then be sampled from an offset the kernel does not use, silently and with no error.
+///
+/// The assertion below is therefore a real invariant, not a bound. It holds because
+/// `params.height` is the canvas height (>= any plane's own height) and `params.stride` is
+/// this plane's stride, so `height * stride >= plane_height * stride == centre_len`. If it
+/// ever fails, the decoded frame's geometry disagrees with `stab.params.size` and the right
+/// answer is to not gather at all, which is what the `None` return asks the caller to do.
+pub fn reference_frame_pitch(params: &crate::stabilization::KernelParams, input: &BufferDescription, centre_len: usize) -> Option<usize> {
+    let pitch = params.height as usize * params.stride as usize;
+    let needed = centre_len.max(input.size.1 * input.size.2);
+    if pitch < needed {
+        log::error!("Reference frame pitch {pitch} (height {} x stride {}) is smaller than one frame ({needed}); refusing to gather", params.height, params.stride);
+        return None;
+    }
+    Some(pitch)
 }
 
 /// The rust-gpu colour stage must be arithmetically identical to `crate::color::apply_color`.
@@ -429,8 +443,8 @@ mod reference_layout_tests {
         let chroma = desc(1920, 1080, 1920);
         let plane_frame_bytes = 1080 * 1920;
 
-        assert_eq!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), 2160 * 1920);
-        assert_ne!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), plane_frame_bytes,
+        assert_eq!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), Some(2160 * 1920));
+        assert_ne!(reference_frame_pitch(&params, &chroma, plane_frame_bytes), Some(plane_frame_bytes),
                    "pitching by the plane's own frame size is the bug this guards against");
     }
 
@@ -440,18 +454,19 @@ mod reference_layout_tests {
         let mut params = KernelParams::default();
         params.height = 2160;
         params.stride = 3840;
-        assert_eq!(reference_frame_pitch(&params, &desc(3840, 2160, 3840), 2160 * 3840), 2160 * 3840);
+        assert_eq!(reference_frame_pitch(&params, &desc(3840, 2160, 3840), 2160 * 3840), Some(2160 * 3840));
     }
 
-    /// A CPU buffer carrying padding beyond `height * stride` must still get frames that
-    /// do not overlap.
+    /// A frame that does not fit the kernel's fixed pitch must be REFUSED, not re-pitched.
+    /// Pitching larger would make every reference after the first be sampled from an offset
+    /// the kernel never reads - silent wrong output instead of no output.
     #[test]
-    fn pitch_never_lets_frames_overlap_a_padded_buffer() {
+    fn pitch_refuses_a_frame_that_does_not_fit_rather_than_growing() {
         let mut params = KernelParams::default();
         params.height = 1080;
         params.stride = 1920;
         let padded = 1080 * 1920 + 4096;
-        assert!(reference_frame_pitch(&params, &desc(1920, 1080, 1920), padded) >= padded);
+        assert_eq!(reference_frame_pitch(&params, &desc(1920, 1080, 1920), padded), None);
     }
 
     /// The largest window any quality tier asks for is `2k + 1` at k = 3. Both backends

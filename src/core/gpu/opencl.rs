@@ -238,9 +238,12 @@ impl OclWrapper {
                         // front - it is not resized per-frame. It is pitched by what the kernel
                         // steps by, and sized for the largest window rather than for this
                         // emission's reference count - see `reference_frame_pitch`.
-                        let len = if is_in && !buffers.references.is_empty() {
-                            super::reference_frame_pitch(params, &buffers.input, buffer.len()) * super::MAX_GATHER_FRAMES
-                        } else { buffer.len() };
+                        let len = match (is_in && !buffers.references.is_empty()).then(|| super::reference_frame_pitch(params, &buffers.input, buffer.len())) {
+                            Some(Some(pitch)) => pitch * super::MAX_GATHER_FRAMES,
+                            // Either not the input, or the geometry is inconsistent - allocate a
+                            // single frame, which makes `undistort_image` refuse to gather below.
+                            _ => buffer.len(),
+                        };
                         Ok((Buffer::builder().queue(ocl_queue.clone()).len(len).flags(flags).build()?, None))
                     },
                     BufferSource::OpenCL { queue, .. } => {
@@ -352,6 +355,12 @@ impl OclWrapper {
     }
 
     pub fn undistort_image(&self, buffers: &mut Buffers, itm: &crate::stabilization::FrameTransform, drawing_buffer: &[u8]) -> ocl::Result<()> {
+        // How many references actually made it into the input buffer. The kernel walks frames
+        // 1..reference_count contiguously, so a reference that fails to upload truncates the
+        // window rather than merely being absent - everything after it would be read from a
+        // slot that was never written. Counting successful uploads (and stopping at the first
+        // failure) is what keeps `reference_count` describing the buffer's real contents.
+        let mut uploaded_references = 0usize;
         // Block layout the kernel indexes into: frame f starts at f * matrix_count * 14
         // floats. Centre first, then references in temporal order - mirrors wgpu.rs.
         let mut all_matrices: Vec<[f32; 14]> = Vec::with_capacity(itm.matrices.len() * (1 + itm.reference_matrices.len()));
@@ -387,7 +396,7 @@ impl OclWrapper {
         match buffers.input.data {
             BufferSource::None => { },
             BufferSource::Cpu { ref buffer } => {
-                let pitch = super::reference_frame_pitch(&itm.kernel_params, &buffers.input, buffer.len());
+                let pitch = super::reference_frame_pitch(&itm.kernel_params, &buffers.input, buffer.len()).unwrap_or(buffer.len());
                 let required_len = if buffers.references.is_empty() { buffer.len() } else { pitch * (1 + buffers.references.len()) };
                 if self.src.len() < required_len { log::error!("Buffer size mismatch input! {} vs {}", self.src.len(), required_len);  return Ok(()); }
                 self.src.write(buffer as &[u8]).enq()?;
@@ -400,8 +409,14 @@ impl OclWrapper {
                     debug_assert_eq!(r.size.2, buffers.input.size.2, "reference frame {i} has a different stride ({}) than the centre frame ({}) - the kernel's frame*height*stride offset arithmetic would be wrong", r.size.2, buffers.input.size.2);
                     if let BufferSource::Cpu { buffer: ref rbuf } = r.data {
                         self.src.write(rbuf as &[u8]).offset((i + 1) * pitch).enq()?;
+                        uploaded_references += 1;
                     } else {
-                        log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will be missing this frame");
+                        // Stop rather than skip: the slots are contiguous, so continuing would
+                        // leave this one unwritten and every later reference read from the
+                        // wrong offset. Truncating the window costs some denoising strength;
+                        // gathering uninitialised device memory would corrupt the output.
+                        log::warn!("Reference frame {i} upload is not implemented for this backend yet; denoising will use the {uploaded_references} reference(s) before it");
+                        break;
                     }
                 }
             },
@@ -450,7 +465,7 @@ impl OclWrapper {
         }
 
         let mut kernel_params = itm.kernel_params;
-        kernel_params.reference_count = (1 + buffers.references.len()) as f32;
+        kernel_params.reference_count = (1 + uploaded_references) as f32;
         self.buf_params.write(bytemuck::bytes_of(&kernel_params)).enq()?;
         self.buf_matrices.write(matrices).enq()?;
 
