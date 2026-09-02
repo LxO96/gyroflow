@@ -892,7 +892,23 @@ impl StabilizationManager {
         }
     }
 
-    pub fn process_pixels<T: PixelType>(&self, mut timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers) -> Result<stabilization::ProcessedInfo, GyroflowCoreError> {
+    pub fn process_pixels<T: PixelType>(&self, timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers) -> Result<stabilization::ProcessedInfo, GyroflowCoreError> {
+        self.process_pixels_with_references::<T>(timestamp_us, frame, buffers, &[])
+    }
+
+    /// `process_pixels`, plus the per-reference matrix blocks the temporal-denoise gather needs.
+    ///
+    /// `buffers.references` alone is not enough to denoise: the kernel indexes one matrix block
+    /// per reference frame and reads its rejection sigma out of `KernelParams`, and the cached
+    /// `stab_data` transform carries neither - `ensure_stab_data_at_timestamp` builds it with
+    /// plain `get_frame_transform_at`. Handing it a transform built by
+    /// `get_frame_transform_with_references` instead is what the render path does at
+    /// `rendering/mod.rs`; this is the same thing for the live preview.
+    ///
+    /// `reference_timestamps` must be in the same order as `buffers.references` and in the raw
+    /// source-timestamp domain - the frame offset and fps scale are applied here, to the centre
+    /// and to every reference alike, so both sides stay in one domain (R9-4).
+    pub fn process_pixels_with_references<T: PixelType>(&self, mut timestamp_us: i64, frame: Option<usize>, buffers: &mut Buffers, reference_timestamps: &[i64]) -> Result<stabilization::ProcessedInfo, GyroflowCoreError> {
         if let gpu::BufferSource::Cpu { buffer } = &buffers.input.data  { if buffer.is_empty() { return Err(GyroflowCoreError::InputBufferEmpty); } }
         if let gpu::BufferSource::Cpu { buffer } = &buffers.output.data { if buffer.is_empty() { return Err(GyroflowCoreError::OutputBufferEmpty); } }
 
@@ -901,10 +917,15 @@ impl StabilizationManager {
             (params.frame_offset, params.fps)
         };
         let frame = frame.map(|x| (x as i32 + offset).max(0) as usize);
-        timestamp_us += (offset as f64 / fps * 1000000.0).round() as i64;
+        let offset_us = (offset as f64 / fps * 1000000.0).round() as i64;
+        timestamp_us += offset_us;
+        let mut reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
         if let Some(scale) = self.params.read().fps_scale {
             timestamp_us = (timestamp_us as f64 / scale).round() as i64;
+            for ts in reference_timestamps.iter_mut() {
+                *ts = (*ts as f64 / scale).round() as i64;
+            }
         }
 
         if self.smoothing_invalidated.load(SeqCst) {
@@ -935,7 +956,18 @@ impl StabilizationManager {
         }
 
         if let Some(undist) = self.stabilization.try_read_for(std::time::Duration::from_millis(30000)) {
-            undist.process_pixels::<T>(timestamp_us, frame, buffers, None)
+            if reference_timestamps.is_empty() || buffers.references.is_empty() {
+                undist.process_pixels::<T>(timestamp_us, frame, buffers, None)
+            } else {
+                // The gather reads `reference_count` from `buffers.references.len()` but takes
+                // its matrices from the transform, so the two must be built together or the
+                // kernel walks off the end of the matrix buffer.
+                let mut transform = undist.get_frame_transform_with_references::<T>(timestamp_us, &reference_timestamps, frame, buffers);
+                // Preview pixels are a single interleaved RGBA plane, so plane 0 - the luma
+                // strength - is the only sigma that applies.
+                transform.kernel_params.denoise_sigma = self.denoise.read().sigma_for_plane(0);
+                undist.process_pixels::<T>(timestamp_us, frame, buffers, Some(&transform))
+            }
         } else {
             Err(GyroflowCoreError::Unknown)
         }

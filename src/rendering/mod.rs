@@ -3,7 +3,7 @@
 
 mod ffmpeg_audio;
 mod ffmpeg_video;
-mod ffmpeg_video_converter;
+pub(crate) mod ffmpeg_video_converter; // `Converter::set_color_details` is also needed by the denoised preview's reference conversion in controller.rs
 mod audio_resampler;
 pub mod ffmpeg_processor;
 pub mod ffmpeg_hw;
