@@ -260,6 +260,12 @@ deploy:
     xcopy /Y "$CargoTarget\mdk-braw.dll"                                 "$TargetDir\"
     xcopy /Y "$CargoTarget\mdk-r3d.dll"                                  "$TargetDir\"
     echo F | xcopy /Y "$CargoTarget\gyroflow.exe"                        "$TargetDir\Gyroflow.exe"
+
+    # The Explorer thumbnail handler. Its own crate, so it needs its own build: it must not
+    # link ffmpeg/Qt/OpenCV, since Explorer loads it for every .gyroflow file it draws.
+    # Registration happens at install time (MSI/MSIX), or per-user from the portable build.
+    cargo build --release --target $Target --manifest-path "$ProjectDir\src\thumbnail_handler\Cargo.toml"
+    echo F | xcopy /Y "$ProjectDir\src\thumbnail_handler\target\$Target\release\gyroflow_thumbnail.dll" "$TargetDir\gyroflow_thumbnail.dll"
     xcopy /Y "$ProjectDir\_deployment\windows\Gyroflow_with_console.bat" "$TargetDir\"
     # xcopy /Y /E "$ProjectDir\resources\camera_presets\*"                 "$TargetDir\camera_presets\"
     mkdir "$TargetDir\camera_presets\" -Force

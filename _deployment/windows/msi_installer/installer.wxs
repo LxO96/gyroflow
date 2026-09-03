@@ -14,7 +14,57 @@
 
         <Feature Id="ProductFeature" Title="Application" Level="1">
             <ComponentGroupRef Id="HarvestedComponents"/>
+            <ComponentGroupRef Id="ThumbnailHandlerComponents"/>
         </Feature>
+
+        <!--
+            Explorer thumbnail handler for .gyroflow project files. The DLL itself arrives via
+            HarvestedComponents (_scripts/windows.just copies it into the deploy folder); only
+            its registration lives here.
+
+            The handler slot is registered on BOTH the ProgID and the extension. The ProgID
+            location is the documented one, but the shell resolves thumbnail handlers from the
+            extension key - with only the ProgID entry, GetImage fails without ever loading the
+            DLL. src/thumbnail_handler/src/register.rs carries the same pair and the evidence.
+
+            HKLM because this package is perMachine; the portable build registers the identical
+            shape under HKCU via DllRegisterServerUser.
+        -->
+        <ComponentGroup Id="ThumbnailHandlerComponents" Directory="ApplicationFolder">
+            <Component Id="GyroflowThumbnailHandler" Guid="9a4c1f30-7e58-4d2b-b6a1-0c53d8e94f77">
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{6F1D8A42-9C3B-4F27-AE15-2B7C0D4E8A31}">
+                    <RegistryValue Type="string" Value="Gyroflow project thumbnail handler"/>
+                    <RegistryValue Name="AppID" Type="string" Value="{6F1D8A42-9C3B-4F27-AE15-2B7C0D4E8A31}"/>
+                </RegistryKey>
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{6F1D8A42-9C3B-4F27-AE15-2B7C0D4E8A31}\InprocServer32">
+                    <RegistryValue Type="string" Value="[ApplicationFolder]gyroflow_thumbnail.dll"/>
+                    <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment"/>
+                </RegistryKey>
+
+                <!-- Empty DllSurrogate = run in dllhost.exe. Keeps a fault out of Explorer, and
+                     stops Explorer locking the DLL against the next update. -->
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\AppID\{6F1D8A42-9C3B-4F27-AE15-2B7C0D4E8A31}">
+                    <RegistryValue Name="DllSurrogate" Type="string" Value=""/>
+                </RegistryKey>
+
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\Gyroflow.Project">
+                    <RegistryValue Type="string" Value="Gyroflow project"/>
+                </RegistryKey>
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\Gyroflow.Project\DefaultIcon">
+                    <RegistryValue Type="string" Value="[ApplicationFolder]Gyroflow.exe,0"/>
+                </RegistryKey>
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\Gyroflow.Project\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+                    <RegistryValue Type="string" Value="{6F1D8A42-9C3B-4F27-AE15-2B7C0D4E8A31}"/>
+                </RegistryKey>
+
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\.gyroflow">
+                    <RegistryValue Type="string" Value="Gyroflow.Project"/>
+                </RegistryKey>
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\.gyroflow\ShellEx\{e357fccd-a995-4576-b01f-234630154e96}">
+                    <RegistryValue Type="string" Value="{6F1D8A42-9C3B-4F27-AE15-2B7C0D4E8A31}"/>
+                </RegistryKey>
+            </Component>
+        </ComponentGroup>
 
         <StandardDirectory Id="ProgramFiles64Folder">
 			<Directory Id="ApplicationFolder" Name="Gyroflow" />

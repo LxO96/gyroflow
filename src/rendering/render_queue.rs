@@ -1243,6 +1243,7 @@ impl RenderQueue {
                     let stab = Arc::new(stab);
 
                     let stab2 = stab.clone();
+                    let stab_thumb = stab.clone();
                     let loaded = util::qt_queued_callback_mut(QPointer::from(self as &Self), move |this, render_options: RenderOptions| {
                         this.add_internal(job_id, stab2.clone(), render_options, additional_data2.clone(), QString::default());
                     });
@@ -1256,6 +1257,16 @@ impl RenderQueue {
 
                     core::run_threaded(move || {
                         let fetch_thumb = |video_url: &str, ratio: f64| -> Result<(), rendering::FFmpegError> {
+                            // A project opened from a .gyroflow file already carries a picture
+                            // of its own first frame. Reuse it rather than decoding the video
+                            // again for the same image - and so the queue and Explorer show the
+                            // same thumbnail rather than two separately-produced ones.
+                            if let Some(t) = stab_thumb.thumbnail.read().as_ref() {
+                                if !t.jpeg_base64.is_empty() {
+                                    thumb_fetched(QString::from(format!("data:image/jpg;base64,{}", t.jpeg_base64)));
+                                    return Ok(());
+                                }
+                            }
                             let mut fetched = false;
                             if !crate::cli::will_run_in_console() { // Don't fetch thumbs in the CLI
                                 let mut proc = rendering::VideoProcessor::from_file(video_url, false, 0, None)?;
