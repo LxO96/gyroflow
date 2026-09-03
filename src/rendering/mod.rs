@@ -360,6 +360,92 @@ fn compute_fill_with_background(pad_with_black: bool, trim_ranges: &[(f64, f64)]
                                     timestamp_us <= (x.1 * duration_ms * 1000.0).round() as i64)
 }
 
+/// Decode one frame near the start of `video_url` and store it on `stab` as the project
+/// thumbnail, for Windows Explorer's handler and anything else reading `thumbnail`.
+///
+/// Entirely best-effort: every failure path leaves the existing thumbnail untouched and
+/// returns. A project must never fail to open, render or save because a preview could not be
+/// produced - a blank icon is a cosmetic loss, a failed save is not.
+pub fn generate_project_thumbnail(stab: &std::sync::Arc<StabilizationManager>, video_url: &str) {
+    let max_edge = gyroflow_core::THUMBNAIL_MAX_EDGE;
+    // Decoded frames are in sensor orientation; a phone or action-cam clip carries rotation
+    // metadata that the player applies at display time. Ignoring it here puts a sideways
+    // picture in Explorer, which is worse than no picture at all.
+    // Negated because `video_rotation` is counter-clockwise (a 270 clip needs a quarter turn
+    // clockwise to come out upright) while `rotate_rgba` works clockwise. Verified against a
+    // 270-metadata clip: applying 270 clockwise yields a correctly-shaped but upside-down
+    // picture, which is exactly the 180 error a sign mistake produces.
+    let stored = ((stab.params.read().video_rotation.round() as i64 % 360) + 360) % 360;
+    let rotation = (360 - stored) % 360;
+    let stab = stab.clone();
+    let result = (|| -> Result<(), FFmpegError> {
+        let mut proc = VideoProcessor::from_file(video_url, false, 0, None)?;
+        let mut done = false;
+        proc.on_frame(move |_ts, input_frame, _out, converter, _rc| {
+            if done { return Ok(()); }
+            done = true;
+            let (w, h) = (input_frame.width().max(1), input_frame.height().max(1));
+            // Fit the LONG edge, so a portrait clip is neither stretched nor oversized.
+            let scale = (max_edge as f64 / w.max(h) as f64).min(1.0);
+            let tw = ((w as f64 * scale).round() as u32).max(1);
+            let th = ((h as f64 * scale).round() as u32).max(1);
+            let sf = converter.scale(input_frame, ffmpeg_next::format::Pixel::RGBA, tw, th)?;
+
+            let (ow, oh, stride, owned);
+            let data: &[u8] = if rotation == 0 {
+                (ow, oh, stride) = (sf.plane_width(0), sf.plane_height(0), sf.stride(0) as u32);
+                sf.data(0)
+            } else {
+                let (rw, rh, buf) = rotate_rgba(sf.data(0), sf.plane_width(0), sf.plane_height(0), sf.stride(0) as u32, rotation);
+                (ow, oh, stride) = (rw, rh, rw * 4);
+                owned = buf;
+                &owned
+            };
+            let (tw, th) = (ow, oh);
+            let b64 = crate::util::image_data_to_base64(ow, oh, stride, data).to_string();
+            // That helper returns a display data-URL; a file should carry the payload only, so
+            // the prefix is stripped here rather than baked into the stored format.
+            let payload = b64.split_once(',').map(|x| x.1.to_string()).unwrap_or(b64);
+            if !payload.is_empty() {
+                *stab.thumbnail.write() = Some(gyroflow_core::Thumbnail { w: tw, h: th, jpeg_base64: payload });
+            }
+            Ok(())
+        });
+        // Half a second of range: enough to find a frame, never enough to walk a long clip.
+        proc.start_decoder_only(vec![(0.0, 500.0)], std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        ::log::debug!("No project thumbnail for {video_url}: {e:?}");
+    }
+}
+
+/// Rotate a tightly-indexed RGBA image by 90, 180 or 270 degrees clockwise, returning the new
+/// dimensions and a packed buffer. Any other angle is treated as no rotation: video rotation
+/// metadata is only ever a right angle in practice, and guessing at an arbitrary one would
+/// need resampling for no benefit here.
+fn rotate_rgba(src: &[u8], w: u32, h: u32, stride: u32, degrees: i64) -> (u32, u32, Vec<u8>) {
+    let (dw, dh) = if degrees == 180 { (w, h) } else { (h, w) };
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let si = (y * stride + x * 4) as usize;
+            if si + 4 > src.len() { continue; }
+            let (dx, dy) = match degrees {
+                90  => (h - 1 - y, x),
+                180 => (w - 1 - x, h - 1 - y),
+                270 => (y, w - 1 - x),
+                _   => (x, y),
+            };
+            let di = ((dy * dw + dx) * 4) as usize;
+            if di + 4 <= out.len() {
+                out[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+    }
+    (dw, dh, out)
+}
+
 /// A decoded frame plus the two per-frame values that must travel with it through the
 /// temporal window.
 ///
@@ -1858,5 +1944,61 @@ mod packed_color_format_tests {
         // And nothing is graded when the user did not ask for baking.
         assert!(!should_bake_color::<RGBA8>(false));
         assert!(!should_bake_color::<RGBA16>(false));
+    }
+}
+
+/// `rotate_rgba` is the only place a sign error silently produces a plausible-looking result:
+/// a wrong direction still yields the right shape, just upside down, which is easy to miss in
+/// a 64px icon. These pin the direction with an asymmetric pattern.
+#[cfg(test)]
+mod thumbnail_rotation_tests {
+    use super::rotate_rgba;
+
+    /// A 2x1 image: red at (0,0), green at (1,0). Packed, stride == width * 4.
+    fn src() -> Vec<u8> {
+        vec![255,0,0,255,  0,255,0,255]
+    }
+    fn px(buf: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [buf[i], buf[i+1], buf[i+2], buf[i+3]]
+    }
+    const RED:   [u8; 4] = [255, 0, 0, 255];
+    const GREEN: [u8; 4] = [0, 255, 0, 255];
+
+    #[test]
+    fn rotating_90_clockwise_moves_the_left_pixel_to_the_top() {
+        let (w, h, out) = rotate_rgba(&src(), 2, 1, 8, 90);
+        assert_eq!((w, h), (1, 2), "a 2x1 image becomes 1x2");
+        assert_eq!(px(&out, w, 0, 0), RED,   "the left pixel must end up on top");
+        assert_eq!(px(&out, w, 0, 1), GREEN);
+    }
+
+    #[test]
+    fn rotating_270_clockwise_moves_the_left_pixel_to_the_bottom() {
+        let (w, h, out) = rotate_rgba(&src(), 2, 1, 8, 270);
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(px(&out, w, 0, 0), GREEN, "270 must be the opposite of 90, not the same");
+        assert_eq!(px(&out, w, 0, 1), RED);
+    }
+
+    #[test]
+    fn rotating_180_keeps_the_shape_and_swaps_the_ends() {
+        let (w, h, out) = rotate_rgba(&src(), 2, 1, 8, 180);
+        assert_eq!((w, h), (2, 1), "180 must not transpose the dimensions");
+        assert_eq!(px(&out, w, 0, 0), GREEN);
+        assert_eq!(px(&out, w, 1, 0), RED);
+    }
+
+    /// Row padding is normal in decoded frames; reading it as image data would smear the
+    /// picture sideways by a pixel per row.
+    #[test]
+    fn a_padded_stride_is_not_read_as_pixels() {
+        // 1x2 image with 4 bytes of padding after each row.
+        let src = vec![255,0,0,255, 9,9,9,9,  0,255,0,255, 9,9,9,9];
+        let (w, h, out) = rotate_rgba(&src, 1, 2, 8, 180);
+        assert_eq!((w, h), (1, 2));
+        assert_eq!(px(&out, w, 0, 0), GREEN);
+        assert_eq!(px(&out, w, 0, 1), RED);
+        assert!(!out.windows(4).any(|c| c == [9,9,9,9]), "padding leaked into the image");
     }
 }

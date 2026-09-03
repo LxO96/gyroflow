@@ -1007,6 +1007,14 @@ impl RenderQueue {
                 }
 
                 if export_project > 0 {
+                    // The GUI fills this in when the video loads; a CLI export never goes
+                    // through that path, so a batch-exported project would otherwise be the one
+                    // case with no preview - exactly the case where you have many files to tell
+                    // apart. Synchronous here because the file is written on the next line.
+                    if stab.thumbnail.read().is_none() {
+                        let url = stab.input_file.read().url.clone();
+                        if !url.is_empty() { rendering::generate_project_thumbnail(&stab, &url); }
+                    }
                     if let Ok(serde_json::Value::Object(mut obj)) = serde_json::from_str(&additional_data) as serde_json::Result<serde_json::Value> {
                         if let Ok(output) = serde_json::to_value(&render_options) {
                             obj.insert("output".into(), output);

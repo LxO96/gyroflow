@@ -506,6 +506,17 @@ impl Controller {
         self.input_file_url_changed();
         self.project_file_url_changed();
 
+
+        // A still for the project file, so Explorer can show which project this is
+        // without opening it. Off the UI thread; best-effort by design.
+        {
+            let stab = self.stabilizer.clone();
+            let thumb_url = url.clone();
+            core::run_threaded(move || {
+                rendering::generate_project_thumbnail(&stab, &thumb_url);
+            });
+        }
+
         let mut custom_decoder = String::new(); // eg. BRAW:format=rgba64le
         if self.image_sequence_start > 0 {
             custom_decoder = format!("FFmpeg:avformat_options=start_number={}", self.image_sequence_start);

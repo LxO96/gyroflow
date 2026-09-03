@@ -87,6 +87,13 @@ pub struct StabilizationManager {
     pub smoothing: Arc<RwLock<Smoothing>>,
     pub color: Arc<RwLock<color::ColorAdjustments>>,
     pub denoise: Arc<RwLock<denoise::DenoiseSettings>>,
+    /// A small JPEG of the first frame, for Windows Explorer's thumbnail handler and for the
+    /// render queue. Base64, no `data:` prefix, together with the pixel size it was encoded at.
+    ///
+    /// Supplied by the host application rather than produced here: this crate has no decoder.
+    /// `None` whenever a frame could not be obtained - a missing thumbnail must never stop a
+    /// project from saving.
+    pub thumbnail: Arc<RwLock<Option<Thumbnail>>>,
 
     pub stabilization: Arc<RwLock<Stabilization>>,
 
@@ -122,6 +129,7 @@ impl Default for StabilizationManager {
             smoothing: Arc::new(RwLock::new(Smoothing::default())),
             color: Arc::new(RwLock::new(color::ColorAdjustments::default())),
             denoise: Arc::new(RwLock::new(denoise::DenoiseSettings::default())),
+            thumbnail: Arc::new(RwLock::new(None)),
 
             params: Arc::new(RwLock::new(StabilizationParams::default())),
 
@@ -1387,6 +1395,10 @@ impl StabilizationManager {
             "calibration_data": self.lens.read().get_json_value().unwrap_or_else(|_| serde_json::json!({})),
             "date": time::OffsetDateTime::now_local().map(|v| v.date().to_string()).unwrap_or_default(),
 
+            // Absent rather than null when there is no thumbnail: a project that never got one
+            // should look exactly like a project written before this feature existed.
+            "thumbnail": self.thumbnail.read().clone(),
+
             "image_sequence_start": input_file.image_sequence_start,
             "image_sequence_fps": input_file.image_sequence_fps,
             "background_color": params.background.as_slice(),
@@ -1516,6 +1528,12 @@ impl StabilizationManager {
             }
         }
 
+        // `json!` renders `None` as an explicit null; drop the key entirely instead, so a
+        // project without a thumbnail is byte-identical to one written before this existed.
+        if obj.get("thumbnail").map(|x| x.is_null()).unwrap_or(false) {
+            if let Some(o) = obj.as_object_mut() { o.remove("thumbnail"); }
+        }
+
         Ok(serde_json::to_string_pretty(&obj)?)
     }
 
@@ -1587,6 +1605,14 @@ impl StabilizationManager {
                 *videofile = serde_json::Value::String(video_url.clone());
             }
             *is_preset = org_video_url.is_empty();
+
+            // Restored so that opening a project and saving it again does not silently drop
+            // the thumbnail - the frame it came from may no longer be reachable.
+            if let Some(t) = obj.get("thumbnail") {
+                if let Ok(t) = serde_json::from_value::<Thumbnail>(t.clone()) {
+                    if !t.jpeg_base64.is_empty() { *self.thumbnail.write() = Some(t); }
+                }
+            }
 
             if let Some(vid_info) = obj.get("video_info") {
                 let mut params = self.params.write();
@@ -2284,6 +2310,20 @@ pub fn clear_gpu_cache_on_all_workers() {
 }
 
 use std::str::FromStr;
+/// A preview image embedded in a project file. See `StabilizationManager::thumbnail`.
+#[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+pub struct Thumbnail {
+    pub w: u32,
+    pub h: u32,
+    /// Base64-encoded JPEG bytes, without a `data:` URL prefix. The prefix is a display
+    /// concern; a file should carry the payload only.
+    pub jpeg_base64: String,
+}
+
+/// The longest edge a stored thumbnail may have. Explorer normally asks for 96-256 px and
+/// rarely more than 1024, so 512 covers real use at roughly 8-20 KB per project.
+pub const THUMBNAIL_MAX_EDGE: u32 = 512;
+
 #[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum GyroflowProjectType {
     Simple,
@@ -2564,6 +2604,47 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_scalars_match(&a, &b);
         assert_eq!(b.lut.as_ref().unwrap().data,     a.lut.as_ref().unwrap().data);
         assert_eq!(b.lut.as_ref().unwrap().checksum, a.lut.as_ref().unwrap().checksum);
+    }
+
+    /// A project with no thumbnail must serialise exactly as it did before the field
+    /// existed - an explicit `"thumbnail": null` would be a gratuitous format change and
+    /// would make every old-vs-new diff noisy.
+    #[test]
+    fn no_thumbnail_means_no_key_at_all() {
+        let mgr = StabilizationManager::default();
+        let json = mgr.export_gyroflow_data(GyroflowProjectType::Simple, "{}", None).unwrap();
+        assert!(!json.contains("thumbnail"), "absent thumbnail must not emit a key");
+    }
+
+    /// The thumbnail survives a save/open/save cycle. Without this, opening a project whose
+    /// source video has since moved and saving it again would silently discard the picture.
+    #[test]
+    fn thumbnail_round_trips_through_export_and_import() {
+        let mgr = StabilizationManager::default();
+        *mgr.thumbnail.write() = Some(Thumbnail { w: 512, h: 288, jpeg_base64: "/9j/AAQSkZJRgABAQ".into() });
+
+        let json = mgr.export_gyroflow_data(GyroflowProjectType::Simple, "{}", None).unwrap();
+        assert!(json.contains("jpeg_base64"));
+
+        let restored = StabilizationManager::default();
+        let mut is_preset = false;
+        restored.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false).unwrap();
+
+        assert_eq!(*restored.thumbnail.read(), *mgr.thumbnail.read());
+    }
+
+    /// A malformed or empty thumbnail must not fail the import - the rest of the project is
+    /// still perfectly usable, and a missing preview is a cosmetic loss.
+    #[test]
+    fn a_broken_thumbnail_does_not_break_the_project() {
+        for bad in [r#""thumbnail": 42,"#, r#""thumbnail": {"w": 1},"#, r#""thumbnail": {"w":1,"h":1,"jpeg_base64":""},"#] {
+            let json = format!(r#"{{"title":"Gyroflow data file","version":4,{bad}"videofile":"file:///x/y.mp4"}}"#);
+            let mgr = StabilizationManager::default();
+            let mut is_preset = false;
+            mgr.import_gyroflow_data(json.as_bytes(), true, None, |_| { }, Arc::new(AtomicBool::new(false)), &mut is_preset, false)
+                .unwrap_or_else(|e| panic!("import failed on {bad}: {e:?}"));
+            assert!(mgr.thumbnail.read().is_none(), "{bad} should have been rejected, not stored");
+        }
     }
 
     #[test]
