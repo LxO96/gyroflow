@@ -1,0 +1,42 @@
+[package]
+name = "gyroflow-thumbnail"
+version = "1.6.3"
+edition = "2021"
+description = "Windows Explorer thumbnail handler for .gyroflow project files"
+license = "GPL-3.0-or-later"
+
+[lib]
+# Explorer loads this by path through COM; it is not linked by the Gyroflow binary.
+crate-type = ["cdylib"]
+name = "gyroflow_thumbnail"
+
+[dependencies]
+# Deliberately minimal. Explorer loads this DLL for every .gyroflow it draws, so it must
+# not pull in ffmpeg, Qt, mdk or gyroflow-core. JPEG decoding goes through WIC, which is
+# part of Windows, rather than through an image crate.
+serde_json = "1.0"
+base64 = "0.22"
+# The `#[implement]` macro expands to `windows_core::` paths, so the crate must be nameable.
+windows-core = "0.62"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_Security", # SECURITY_ATTRIBUTES on RegCreateKeyExW
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
