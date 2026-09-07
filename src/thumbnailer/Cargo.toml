@@ -1,0 +1,22 @@
+[package]
+name = "gyroflow-thumbnailer"
+version = "1.6.3"
+edition = "2021"
+description = "Decodes one frame of a video file for the Windows Explorer thumbnail handler"
+license = "GPL-3.0-or-later"
+
+[[bin]]
+name = "gyroflow-thumbnailer"
+path = "src/main.rs"
+
+[dependencies]
+# ffmpeg only. Deliberately no Qt and no OpenCV: this is spawned per thumbnail, so its
+# startup cost is paid every time Explorer draws a file. Measured ~43 ms, against ~314 ms
+# for the Qt-linked gyroflow.exe.
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
