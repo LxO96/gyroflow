@@ -97,6 +97,28 @@ install-deps:
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ Development ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+# Builds the Explorer thumbnail handler and its decode helper, and puts them - with the
+# ffmpeg DLLs the helper imports - next to gyroflow.exe.
+#
+# The main app finds ffmpeg through PATH, which is why a dev build never needed those DLLs
+# copied. The helper cannot: Explorer spawns it, so it resolves imports from its own
+# directory only. Without this a dev build registers a handler whose helper cannot start.
+# `deploy` already produces this layout; this makes `build` match it.
+[no-cd]
+thumbnail-handler:
+    #!powershell
+    $ErrorActionPreference = 'Stop'
+    $ProjectDir = resolve-path "{{ProjectDir}}"
+    $Out = "$ProjectDir\target\release"
+    cargo build --release --manifest-path "$ProjectDir\src\thumbnail_handler\Cargo.toml"
+    cargo build --release --manifest-path "$ProjectDir\src\thumbnailer\Cargo.toml"
+    copy-item "$ProjectDir\src\thumbnail_handler\target\release\gyroflow_thumbnail.dll" "$Out" -Force
+    copy-item "$ProjectDir\src\thumbnailer\target\release\gyroflow-thumbnailer.exe" "$Out" -Force
+    $FFmpegDir = "{{FFMPEG_DIR}}\bin"
+    if (-not (Get-ChildItem "$FFmpegDir\*.dll" -ErrorAction SilentlyContinue)) { $FFmpegDir = "$FFmpegDir\x64" }
+    copy-item "$FFmpegDir\*.dll" "$Out" -Force
+    echo "Thumbnail handler built into $Out"
+
 [no-cd]
 build *param:
     cargo build --release -- {{param}}

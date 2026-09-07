@@ -11,6 +11,9 @@ test *param:
 build *param:
     just -f _scripts/{{BaseFile}}.just build {{param}}
 
+thumbnail-handler:
+    just -f _scripts/{{BaseFile}}.just thumbnail-handler
+
 build-debug *param:
     just -f _scripts/{{BaseFile}}.just build-debug {{param}}
 

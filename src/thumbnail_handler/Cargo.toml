@@ -32,6 +32,7 @@ features = [
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_Imaging",
+    "Win32_System_Diagnostics_Debug", # OutputDebugStringW
     "Win32_System_Threading", # TerminateProcess, for the decode watchdog
 ]
 
