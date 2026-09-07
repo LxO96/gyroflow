@@ -568,7 +568,11 @@ impl<'a> VideoTranscoder<'a> {
         let mut ts = rate_control.out_timestamp_us;
         let clone_frames = self.clone_frames;
         let output_index = self.output_index.unwrap_or_default();
-        let mut output_hw_frame = None;
+        // Owns the uploaded hardware frame, if one is needed, so `final_frame` can borrow it
+        // for the rest of this function. The initial `None` is never read - it exists purely
+        // to give the binding a lifetime that outlives the block below.
+        #[allow(unused_assignments)]
+        let mut output_hw_frame: Option<frame::Video> = None;
         {
             let encoder = self.encoder.as_mut().ok_or(FFmpegError::EncoderNotFound)?;
             encoder.set_format(final_frame.format());

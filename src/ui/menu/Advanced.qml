@@ -238,6 +238,34 @@ MenuItem {
         checked: true;
         onCheckedChanged: controller.set_gpu_decoding(checked);
     }
+    CheckBox {
+        id: videoThumbnails;
+        visible: Qt.platform.os == "windows";
+        text: qsTr("Thumbnails for video Windows can't preview");
+        tooltip: qsTr("Lets Windows Explorer show a preview frame for formats it cannot decode itself, such as 10-bit 4:2:2 video.
+
+While this is on, Gyroflow generates the thumbnails for every .mp4, .mov, .mxf, .360, .insv and .exr file - Windows offers no way to handle only the ones it fails at.
+
+Already-drawn thumbnails stay in Explorer's cache, so existing files may not change until that cache is cleared.");
+        checked: false;
+        property bool loading: true;
+        Component.onCompleted: {
+            checked = settings.value("videoThumbnailsEnabled", "false") == "true";
+            loading = false;
+        }
+        onCheckedChanged: {
+            // Skip the write while restoring the saved value, or opening this panel would
+            // re-register on every launch.
+            if (loading) return;
+            if (!controller.set_video_thumbnails_enabled(checked)) {
+                // The registry write failed, so the checkbox must not claim otherwise.
+                loading = true;
+                checked = !checked;
+                loading = false;
+                window.showNotification(Modal.Error, qsTr("Couldn't change the thumbnail setting."));
+            }
+        }
+    }
     Label {
         id: r3dConvertFormatLabel;
         position: Label.LeftPosition;

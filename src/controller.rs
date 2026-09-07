@@ -233,6 +233,8 @@ pub struct Controller {
     get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
     set_denoise_param: qt_method!(fn(&self, name: QString, val: f64)),
     set_denoise_enabled: qt_method!(fn(&self, enabled: bool)),
+    #[cfg(target_os = "windows")]
+    set_video_thumbnails_enabled: qt_method!(fn(&self, enabled: bool) -> bool),
     set_denoise_quality: qt_method!(fn(&self, id: QString)),
     get_denoise_quality: qt_method!(fn(&self) -> QString),
     set_horizon_lock: qt_method!(fn(&self, lock_percent: f64, roll: f64, lock_pitch: bool, pitch: f64, automatic_lock: bool, turn_threshold: f64, turn_smoothing_ms: f64, turn_multiplier: f64, tilt_accel_limit: f64)),
@@ -1482,6 +1484,62 @@ impl Controller {
             return;
         }
         self.request_recompute();
+    }
+
+    /// Register or unregister the Explorer thumbnail handler for video files.
+    ///
+    /// Opt-in and off by default, because Windows has no thumbnail-handler fallback chaining:
+    /// claiming `.mp4` means owning EVERY mp4 thumbnail on the machine, including the 8-bit
+    /// ones Windows already handles. That is the user's call, not ours.
+    ///
+    /// Writes only `HKCU`, so there is no elevation prompt - which is what makes an in-app
+    /// checkbox viable at all. Returns whether the registry change succeeded, so the UI can
+    /// put the checkbox back if it did not.
+    #[cfg(target_os = "windows")]
+    fn set_video_thumbnails_enabled(&mut self, enabled: bool) -> bool {
+        let ok = Self::call_thumbnail_dll(if enabled { "DllRegisterVideoTypesUser" } else { "DllUnregisterVideoTypesUser" });
+        if ok {
+            gyroflow_core::settings::set("videoThumbnailsEnabled", enabled.into());
+        } else {
+            ::log::warn!("Failed to {} the video thumbnail handler", if enabled { "register" } else { "unregister" });
+        }
+        ok
+    }
+
+    /// Call one of `gyroflow_thumbnail.dll`'s registration entry points.
+    ///
+    /// The DLL is loaded on demand rather than linked: it is a shell extension that normally
+    /// lives only in Explorer's processes, and Gyroflow has no other reason to hold it open.
+    /// A missing DLL (a build that did not ship it) is a plain `false`, not a crash.
+    #[cfg(target_os = "windows")]
+    fn call_thumbnail_dll(entry: &str) -> bool {
+        use windows::core::{ PCSTR, PCWSTR };
+        use windows::Win32::System::LibraryLoader::{ LoadLibraryW, GetProcAddress };
+        use windows::Win32::Foundation::FreeLibrary;
+
+        let Ok(exe) = std::env::current_exe() else { return false; };
+        let Some(dir) = exe.parent() else { return false; };
+        let dll = dir.join("gyroflow_thumbnail.dll");
+        if !dll.is_file() {
+            ::log::warn!("gyroflow_thumbnail.dll not found next to the executable; thumbnails cannot be registered");
+            return false;
+        }
+
+        let wide: Vec<u16> = dll.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let Ok(module) = LoadLibraryW(PCWSTR(wide.as_ptr())) else { return false; };
+            let name = format!("{entry}\0");
+            let proc = GetProcAddress(module, PCSTR(name.as_ptr()));
+            let ok = match proc {
+                Some(f) => {
+                    let f: extern "system" fn() -> i32 = std::mem::transmute(f);
+                    f() >= 0
+                },
+                None => false,
+            };
+            let _ = FreeLibrary(module);
+            ok
+        }
     }
 
     fn set_denoise_enabled(&mut self, enabled: bool) {

@@ -266,6 +266,12 @@ deploy:
     # Registration happens at install time (MSI/MSIX), or per-user from the portable build.
     cargo build --release --target $Target --manifest-path "$ProjectDir\src\thumbnail_handler\Cargo.toml"
     echo F | xcopy /Y "$ProjectDir\src\thumbnail_handler\target\$Target\release\gyroflow_thumbnail.dll" "$TargetDir\gyroflow_thumbnail.dll"
+
+    # The decode helper for video thumbnails. ffmpeg only, no Qt or OpenCV - Explorer
+    # spawns it per file, so its startup cost is paid every time. It resolves the ffmpeg
+    # DLLs from this same directory, which is why it must land beside them.
+    cargo build --release --target $Target --manifest-path "$ProjectDir\src\thumbnailer\Cargo.toml"
+    echo F | xcopy /Y "$ProjectDir\src\thumbnailer\target\$Target\release\gyroflow-thumbnailer.exe" "$TargetDir\gyroflow-thumbnailer.exe"
     xcopy /Y "$ProjectDir\_deployment\windows\Gyroflow_with_console.bat" "$TargetDir\"
     # xcopy /Y /E "$ProjectDir\resources\camera_presets\*"                 "$TargetDir\camera_presets\"
     mkdir "$TargetDir\camera_presets\" -Force

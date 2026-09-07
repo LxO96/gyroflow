@@ -64,6 +64,30 @@
                     <RegistryValue Type="string" Value="{6F1D8A42-9C3B-4F27-AE15-2B7C0D4E8A31}"/>
                 </RegistryKey>
             </Component>
+
+            <!--
+                The video thumbnail handler is a SECOND COM server, and it is registered here
+                but NOT associated with any file extension. That association is opt-in and
+                lives behind a Gyroflow setting (see Controller::set_video_thumbnails_enabled),
+                because Windows has no thumbnail-handler fallback chaining: claiming .mp4 means
+                owning every mp4 thumbnail on the machine, including the ones Windows already
+                handles. The installer therefore makes the handler *available*; the user
+                decides whether it is used.
+
+                DisableProcessIsolation is required, not optional: this handler initialises
+                from a file rather than a stream, and the shell's sandboxed thumbnail host
+                silently declines such handlers.
+            -->
+            <Component Id="GyroflowVideoThumbnailHandler" Guid="4b8e2c17-3f96-4a51-8d7e-6c09a2f5be38">
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{7C2E9B51-4D6A-4E83-9F27-1A58C3B7D094}">
+                    <RegistryValue Type="string" Value="Gyroflow video thumbnail handler"/>
+                    <RegistryValue Name="DisableProcessIsolation" Type="integer" Value="1"/>
+                </RegistryKey>
+                <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{7C2E9B51-4D6A-4E83-9F27-1A58C3B7D094}\InprocServer32">
+                    <RegistryValue Type="string" Value="[ApplicationFolder]gyroflow_thumbnail.dll"/>
+                    <RegistryValue Name="ThreadingModel" Type="string" Value="Apartment"/>
+                </RegistryKey>
+            </Component>
         </ComponentGroup>
 
         <StandardDirectory Id="ProgramFiles64Folder">
