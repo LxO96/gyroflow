@@ -26,6 +26,10 @@ pub const HEADER_LEN: usize = 12;
 pub const MAX_EDGE: u32 = 4096;
 
 /// Serialise a header. Pixel data follows immediately, `w * h * 4` bytes of BGRA.
+///
+/// Only the helper writes headers; the handler compiles this same file for `decode_header`
+/// and never needs this half.
+#[allow(dead_code)]
 pub fn encode_header(w: u32, h: u32) -> [u8; HEADER_LEN] {
     let mut out = [0u8; HEADER_LEN];
     out[0..4].copy_from_slice(&MAGIC);

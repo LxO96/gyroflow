@@ -27,8 +27,11 @@ pub enum ThumbError {
 /// A decoded thumbnail: JPEG bytes plus the dimensions the project claims for them.
 pub struct RawThumbnail {
     pub jpeg: Vec<u8>,
-    pub declared_w: u32,
-    pub declared_h: u32,
+    /// What the project claims the image is. Parsed and asserted by the tests, but NOT used
+    /// for decoding: WIC reports the true dimensions from the JPEG itself, and trusting a
+    /// number in the file over the image it describes is how you get a buffer mismatch.
+    #[allow(dead_code)] pub declared_w: u32,
+    #[allow(dead_code)] pub declared_h: u32,
 }
 
 /// Pull the JPEG payload out of a `.gyroflow` file's bytes.

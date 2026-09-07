@@ -16,6 +16,12 @@
 
 mod thumbnail;
 mod register;
+mod helper;
+
+// The wire format is compiled from the helper crate's own source rather than copied, so the
+// two can never disagree about layout or bounds.
+#[path = "../../thumbnailer/src/protocol.rs"]
+mod protocol;
 
 use std::cell::RefCell;
 use windows::core::*;
@@ -30,10 +36,31 @@ use windows::Win32::UI::Shell::PropertiesSystem::*;
 /// and into installer manifests, so changing it orphans every existing registration.
 pub const CLSID_GYROFLOW_THUMBNAIL: GUID = GUID::from_u128(0x6f1d8a42_9c3b_4f27_ae15_2b7c0d4e8a31);
 
+/// A SECOND handler, for video files, registered under its own CLSID.
+///
+/// Two CLSIDs rather than one because the shell's two initialisation interfaces cannot be
+/// mixed in a single object usefully: the shell prefers `IInitializeWithStream` whenever a
+/// handler offers it, and a stream yields only a bare filename via `Stat` - no directory, so
+/// nothing the decode helper can open. Declining the stream does not make the shell retry
+/// through `IInitializeWithFile`; it abandons the handler entirely and falls back to whatever
+/// Windows itself can do (measured: the request never reached this DLL at all).
+///
+/// So the video handler is a separate class that offers ONLY `IInitializeWithFile`, and its
+/// registration sets `DisableProcessIsolation` so the shell will load a handler that cannot
+/// work from a stream.
+pub const CLSID_GYROFLOW_VIDEO_THUMBNAIL: GUID = GUID::from_u128(0x7c2e9b51_4d6a_4e83_9f27_1a58c3b7d094);
+
 #[implement(IInitializeWithStream, IThumbnailProvider)]
+/// Serves two quite different jobs behind one CLSID, and the two initialisation interfaces
+/// exist to route between them.
+///
+/// The shell prefers `IInitializeWithStream` and will not load a handler that lacks it, so a
+/// project file is read straight from the stream - no path needed, no subprocess. A video
+/// cannot work that way: the helper must open the file itself, and `IStream::Stat` yields
+/// only a bare filename. So the stream initialiser *declines* video files, which makes the
+/// shell fall back to `IInitializeWithFile` and hand over the full path.
 struct GyroflowThumbnailProvider {
-    /// The project file's bytes, captured in `Initialize`. Explorer always calls that before
-    /// `GetThumbnail`; if it somehow does not, `GetThumbnail` fails rather than guessing.
+    /// Project bytes, read from the stream in `Initialize`.
     data: RefCell<Option<Vec<u8>>>,
 }
 
@@ -41,15 +68,14 @@ impl Default for GyroflowThumbnailProvider {
     fn default() -> Self { Self { data: RefCell::new(None) } }
 }
 
+
 impl IInitializeWithStream_Impl for GyroflowThumbnailProvider_Impl {
     fn Initialize(&self, stream: Ref<'_, IStream>, _grfmode: u32) -> Result<()> {
         let stream = stream.ok()?;
 
-        // Read the whole file. Project files are tens of kilobytes; streaming a JSON document
-        // to find one key would be more code and no faster. The cap exists so that a file
-        // which is not really a project cannot make the host allocate without bound.
+        // A project file: read it. Bounded, because Explorer hands this DLL whatever is on
+        // disk under a `.gyroflow` name.
         const MAX_PROJECT_BYTES: usize = 8 * 1024 * 1024;
-
         let mut buf = Vec::new();
         let mut chunk = [0u8; 64 * 1024];
         loop {
@@ -57,11 +83,8 @@ impl IInitializeWithStream_Impl for GyroflowThumbnailProvider_Impl {
             unsafe { stream.Read(chunk.as_mut_ptr() as *mut _, chunk.len() as u32, Some(&mut read)) }.ok()?;
             if read == 0 { break; }
             buf.extend_from_slice(&chunk[..read as usize]);
-            if buf.len() > MAX_PROJECT_BYTES {
-                return Err(Error::from(E_FAIL));
-            }
+            if buf.len() > MAX_PROJECT_BYTES { return Err(Error::from(E_FAIL)); }
         }
-
         *self.data.borrow_mut() = Some(buf);
         Ok(())
     }
@@ -150,18 +173,91 @@ unsafe fn decode_to_hbitmap(jpeg: &[u8], max_edge: u32) -> Result<HBITMAP> {
     }
 }
 
+/// Wrap tightly packed BGRA in a top-down 32-bit DIB.
+///
+/// The helper already scaled and rotated, so this is a straight copy. Kept separate from the
+/// WIC path because the two share nothing but the DIB shape.
+unsafe fn bgra_to_hbitmap(bgra: &[u8], w: u32, h: u32) -> Result<HBITMAP> {
+    unsafe {
+        let expected = (w as usize) * (h as usize) * 4;
+        // The helper's header is already bounds-checked, but this is the last point before a
+        // raw pointer write - a mismatch here would read past the buffer.
+        if w == 0 || h == 0 || bgra.len() != expected { return Err(Error::from(E_FAIL)); }
+
+        let mut info = BITMAPINFO::default();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w as i32;
+        // Negative height = top-down, matching the helper's row order. Positive would show
+        // the picture vertically mirrored.
+        info.bmiHeader.biHeight = -(h as i32);
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB.0;
+
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
+        if bits.is_null() {
+            let _ = DeleteObject(bitmap.into());
+            return Err(Error::from(E_FAIL));
+        }
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, expected);
+        Ok(bitmap)
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // COM plumbing
 // ---------------------------------------------------------------------------------------
 
+/// The video half: initialised with a real path, decodes through the helper subprocess.
+#[implement(IInitializeWithFile, IThumbnailProvider)]
+struct GyroflowVideoThumbnailProvider {
+    path: RefCell<Option<String>>,
+}
+
+impl Default for GyroflowVideoThumbnailProvider {
+    fn default() -> Self { Self { path: RefCell::new(None) } }
+}
+
+impl IInitializeWithFile_Impl for GyroflowVideoThumbnailProvider_Impl {
+    fn Initialize(&self, path: &PCWSTR, _grfmode: u32) -> Result<()> {
+        *self.path.borrow_mut() = Some(unsafe { path.to_string() }.map_err(|_| Error::from(E_INVALIDARG))?);
+        Ok(())
+    }
+}
+
+impl IThumbnailProvider_Impl for GyroflowVideoThumbnailProvider_Impl {
+    fn GetThumbnail(&self, cx: u32, phbmp: *mut HBITMAP, pdwalpha: *mut WTS_ALPHATYPE) -> Result<()> {
+        let path = self.path.borrow();
+        let path = path.as_ref().ok_or_else(|| Error::from(E_UNEXPECTED))?;
+
+        // Only decode what we actually claim. Registration is machine state that can be edited
+        // or left behind by an older build, and spawning a decoder for a file type we never
+        // advertised (a .braw, say, which needs a vendor SDK) would waste a process to fail.
+        if !helper::is_video_extension(path) { return Err(Error::from(E_FAIL)); }
+
+        // Bounded by a timeout inside `decode_frame`, so a corrupt or pathological file cannot
+        // wedge the shell. Every failure becomes "no thumbnail" and Explorer draws its icon.
+        let frame = helper::decode_frame(path, cx).ok_or_else(|| Error::from(E_FAIL))?;
+        let bitmap = unsafe { bgra_to_hbitmap(&frame.bgra, frame.w, frame.h) }?;
+        unsafe { *phbmp = bitmap; *pdwalpha = WTSAT_RGB; }
+        Ok(())
+    }
+}
+
 #[implement(IClassFactory)]
-struct ClassFactory;
+struct ClassFactory(bool); // true = video handler
 
 impl IClassFactory_Impl for ClassFactory_Impl {
     fn CreateInstance(&self, outer: Ref<'_, IUnknown>, iid: *const GUID, object: *mut *mut std::ffi::c_void) -> Result<()> {
         if !outer.is_null() { return Err(Error::from(CLASS_E_NOAGGREGATION)); }
-        let provider: IInitializeWithStream = GyroflowThumbnailProvider::default().into();
-        unsafe { provider.query(iid, object).ok() }
+        if self.0 {
+            let provider: IInitializeWithFile = GyroflowVideoThumbnailProvider::default().into();
+            unsafe { provider.query(iid, object).ok() }
+        } else {
+            let provider: IInitializeWithStream = GyroflowThumbnailProvider::default().into();
+            unsafe { provider.query(iid, object).ok() }
+        }
     }
     fn LockServer(&self, _lock: BOOL) -> Result<()> { Ok(()) }
 }
@@ -170,8 +266,9 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 pub extern "system" fn DllGetClassObject(rclsid: *const GUID, riid: *const GUID, ppv: *mut *mut std::ffi::c_void) -> HRESULT {
     unsafe {
         if rclsid.is_null() || riid.is_null() || ppv.is_null() { return E_INVALIDARG; }
-        if *rclsid != CLSID_GYROFLOW_THUMBNAIL { return CLASS_E_CLASSNOTAVAILABLE; }
-        let factory: IClassFactory = ClassFactory.into();
+        let is_video = *rclsid == CLSID_GYROFLOW_VIDEO_THUMBNAIL;
+        if *rclsid != CLSID_GYROFLOW_THUMBNAIL && !is_video { return CLASS_E_CLASSNOTAVAILABLE; }
+        let factory: IClassFactory = ClassFactory(is_video).into();
         factory.query(riid, ppv)
     }
 }
@@ -194,3 +291,18 @@ pub extern "system" fn DllRegisterServerUser() -> HRESULT { register::register(f
 
 #[no_mangle]
 pub extern "system" fn DllUnregisterServerUser() -> HRESULT { register::unregister(false) }
+
+/// Opt-in registration for video extensions, driven by the Gyroflow setting. Separate from
+/// the `.gyroflow` registration because claiming `.mp4` means owning every mp4 thumbnail on
+/// the machine - see `register::register_video_types`.
+#[no_mangle]
+pub extern "system" fn DllRegisterVideoTypesUser() -> HRESULT { register::register_video_types(false) }
+
+#[no_mangle]
+pub extern "system" fn DllUnregisterVideoTypesUser() -> HRESULT { register::unregister_video_types(false) }
+
+#[no_mangle]
+pub extern "system" fn DllRegisterVideoTypes() -> HRESULT { register::register_video_types(true) }
+
+#[no_mangle]
+pub extern "system" fn DllUnregisterVideoTypes() -> HRESULT { register::unregister_video_types(true) }

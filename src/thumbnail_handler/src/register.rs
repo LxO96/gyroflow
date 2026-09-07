@@ -12,7 +12,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Registry::*;
 
-use crate::CLSID_GYROFLOW_THUMBNAIL;
+use crate::{ CLSID_GYROFLOW_THUMBNAIL, CLSID_GYROFLOW_VIDEO_THUMBNAIL };
 
 /// Shell's `IThumbnailProvider` handler slot. Not ours — this GUID is Windows'.
 const THUMBNAIL_HANDLER_SLOT: &str = "{e357fccd-a995-4576-b01f-234630154e96}";
@@ -24,18 +24,22 @@ fn clsid_string() -> String {
     format!("{{{:?}}}", CLSID_GYROFLOW_THUMBNAIL)
 }
 
+fn video_clsid_string() -> String {
+    format!("{{{:?}}}", CLSID_GYROFLOW_VIDEO_THUMBNAIL)
+}
+
 fn root(machine_wide: bool) -> HKEY {
     if machine_wide { HKEY_LOCAL_MACHINE } else { HKEY_CURRENT_USER }
 }
 
 /// Full path of this DLL. Registration stores an absolute path, so moving or renaming the
 /// install directory leaves a dangling handler — which is why uninstall must unregister.
-fn dll_path() -> Result<String> {
+pub fn this_dll_path() -> Result<String> {
     unsafe {
         let mut module = Default::default();
         GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            PCSTR(dll_path as *const () as *const u8),
+            PCSTR(this_dll_path as *const () as *const u8),
             &mut module,
         )?;
         let mut buf = [0u16; 32768];
@@ -62,6 +66,18 @@ fn set_value(root: HKEY, subkey: &str, name: Option<&str>, value: &str) -> Resul
     }
 }
 
+fn set_dword(root: HKEY, subkey: &str, name: &str, value: u32) -> Result<()> {
+    unsafe {
+        let mut key = HKEY::default();
+        let sub: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+        RegCreateKeyExW(root, PCWSTR(sub.as_ptr()), None, PWSTR::null(), REG_OPTION_NON_VOLATILE, KEY_WRITE, None, &mut key, None).ok()?;
+        let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let r = RegSetValueExW(key, PCWSTR(name_w.as_ptr()), None, REG_DWORD, Some(&value.to_ne_bytes()));
+        let _ = RegCloseKey(key);
+        r.ok()
+    }
+}
+
 fn delete_tree(root: HKEY, subkey: &str) {
     unsafe {
         let sub: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
@@ -81,7 +97,7 @@ pub fn register(machine_wide: bool) -> HRESULT {
 fn try_register(machine_wide: bool) -> Result<()> {
     let hk = root(machine_wide);
     let clsid = clsid_string();
-    let dll = dll_path()?;
+    let dll = this_dll_path()?;
     let classes = "Software\\Classes";
 
     // The COM server itself.
@@ -114,6 +130,58 @@ fn try_register(machine_wide: bool) -> Result<()> {
     Ok(())
 }
 
+/// Register the handler for the video extensions listed in `helper::VIDEO_EXTENSIONS`.
+///
+/// Separate from `register()` because this is opt-in and `.gyroflow` is not. Windows has no
+/// thumbnail-handler fallback chaining: claiming `.mp4` means owning EVERY mp4 thumbnail on
+/// the machine, including the 8-bit ones Windows already handles well. That is the user's
+/// call to make, not ours, which is why it sits behind a setting and ships off.
+pub fn register_video_types(machine_wide: bool) -> HRESULT {
+    match try_register_video(machine_wide) {
+        Ok(()) => S_OK,
+        Err(e) => e.code(),
+    }
+}
+
+fn try_register_video(machine_wide: bool) -> Result<()> {
+    let hk = root(machine_wide);
+    let clsid = video_clsid_string();
+    let dll = this_dll_path()?;
+    let classes = "Software\\Classes";
+
+    // The video handler is its own COM server under its own CLSID.
+    let key = format!("{classes}\\CLSID\\{clsid}");
+    set_value(hk, &key, None, "Gyroflow video thumbnail handler")?;
+    set_value(hk, &format!("{key}\\InprocServer32"), None, &dll)?;
+    set_value(hk, &format!("{key}\\InprocServer32"), Some("ThreadingModel"), "Apartment")?;
+
+    // This handler initialises from a FILE rather than a stream, because the decode
+    // helper must open the file itself and `IStream::Stat` yields only a bare filename.
+    // The shell's sandboxed thumbnail host accepts only stream-based handlers and
+    // silently declines one that cannot work that way - measured: the request never
+    // reached this DLL at all. Disabling process isolation is what makes it load.
+    set_dword(hk, &key, "DisableProcessIsolation", 1)?;
+
+    for ext in crate::helper::VIDEO_EXTENSIONS {
+        // Only the handler slot. No ProgID and no default value: the file type belongs to
+        // whatever the user has associated it with, and we are adding a thumbnail, not
+        // taking over the association.
+        set_value(hk, &format!("{classes}\\{ext}\\ShellEx\\{THUMBNAIL_HANDLER_SLOT}"), None, &clsid)?;
+    }
+    Ok(())
+}
+
+/// Remove the video registrations, leaving `.gyroflow` alone.
+pub fn unregister_video_types(machine_wide: bool) -> HRESULT {
+    let hk = root(machine_wide);
+    let classes = "Software\\Classes";
+    for ext in crate::helper::VIDEO_EXTENSIONS {
+        delete_tree(hk, &format!("{classes}\\{ext}\\ShellEx\\{THUMBNAIL_HANDLER_SLOT}"));
+    }
+    delete_tree(hk, &format!("{classes}\\CLSID\\{}", video_clsid_string()));
+    S_OK
+}
+
 pub fn unregister(machine_wide: bool) -> HRESULT {
     let hk = root(machine_wide);
     let clsid = clsid_string();
@@ -125,6 +193,10 @@ pub fn unregister(machine_wide: bool) -> HRESULT {
     delete_tree(hk, &format!("{classes}\\CLSID\\{clsid}"));
     delete_tree(hk, &format!("{classes}\\AppID\\{clsid}"));
     delete_tree(hk, &format!("{classes}\\{PROGID}"));
+
+    // Opt-in video registrations go too: an uninstall must not leave a handler pointing
+    // at a DLL that is about to disappear.
+    let _ = unregister_video_types(machine_wide);
 
     // Our handler slot under the extension goes too, but the extension key itself stays:
     // another application may have taken over `.gyroflow` since, and removing that would
