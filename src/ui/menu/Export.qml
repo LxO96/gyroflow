@@ -91,6 +91,7 @@ MenuItem {
         property alias interpolationMethod: interpolationMethod.currentIndex;
         property alias preserveOutputSettings: preserveOutputSettings.checked;
         property alias preserveOutputPath: preserveOutputPath.checked;
+        property alias autoPixelFormat: autoPixelFormat.checked;
 
         Component.onCompleted: settings.init(sett);
         function propChanged() { settings.propChanged(sett); }
@@ -129,15 +130,31 @@ MenuItem {
     // Re-asked whenever any of its three inputs moves. Cheap - the encoder's format list is a
     // static property read straight out of ffmpeg, with no render and no file access - so it is
     // fine to call this from a binding-ish context rather than caching it.
-    function updatePixelFormatCheck(): void {
+    //
+    // `codecName` defaults to the live selection, but MUST be passed by anything running inside
+    // `codec.onCurrentIndexChanged`: `ComboBox.currentText` - and so `root.outCodec` - still
+    // holds the PREVIOUS codec while that handler runs. Reading it there checks the codec being
+    // switched away from, which showed as a banner naming the new codec while reporting the old
+    // one's verdict, and would now pick a replacement format for an encoder that isn't the one
+    // about to be used.
+    function updatePixelFormatCheck(codecName): void {
+        const forCodec = codecName || root.outCodec;
         const source = window.vidInfo? window.vidInfo.pixelFormatRaw : "";
         if (!source) { root.pixelFormatCheck = { ok: true }; return; }
-        root.pixelFormatCheck = render_queue.check_export_pixel_format(root.outCodec, root.outGpu, source);
+        const c = render_queue.check_export_pixel_format(forCodec, root.outGpu, source);
+        root.pixelFormatCheck = c;
 
-        // An override chosen for a different codec is worse than none: it would be passed
-        // through to an encoder that may not take it either. Drop it whenever the question
-        // changes, and let the user re-accept.
-        root.pixelFormatOverride = "";
+        // The OVERRIDE never survives this call; only the DECISION to convert does.
+        //
+        // Carrying the format string across a codec change would be worse than dropping it: it
+        // was chosen for a different encoder, which may refuse it just as flatly as the source
+        // format. So the string is always recomputed from the check that just ran, and what
+        // `autoPixelFormat` remembers is merely "yes, convert" - an answer that stays true
+        // whichever encoder asks the question.
+        //
+        // `c.suggestion` is empty when no compatible format exists (`cpu_only`), which lands on
+        // "" here and leaves the warning standing, as it must - there is nothing to accept.
+        root.pixelFormatOverride = (autoPixelFormat.checked && !c.ok) ? (c.suggestion || "") : "";
     }
 
     function getExportOptions(): var {
@@ -304,7 +321,12 @@ MenuItem {
 
             // Runs on codec change and on video load, which is two of the three inputs; the
             // third is the GPU checkbox, which calls it itself.
-            root.updatePixelFormatCheck();
+            //
+            // The name comes from the model rather than `currentText`, which has not caught up
+            // yet when this runs from `onCurrentIndexChanged`. This call is last for the same
+            // reason it is explicit: the `gpu.checked` assignment above triggers the checkbox's
+            // own (argument-less, so stale-named) call, and this one overwrites its result.
+            root.updatePixelFormatCheck(format.name);
         }
         onCurrentIndexChanged: {
             const format = exportFormats[currentIndex];
@@ -547,7 +569,15 @@ MenuItem {
         show: !root.pixelFormatCheck.ok;
         type: root.pixelFormatOverride? InfoMessage.Info : InfoMessage.Warning;
         t.textFormat: Text.StyledText;
-        t.onLinkActivated: (link) => root.pixelFormatOverride = (link == "undo"? "" : link);
+        // Accepting or undoing a conversion here also sets the standing preference, so the
+        // answer carries to the next file without a second control to find. Clicking the link
+        // IS the "remember this" - the checkbox below exists to make that visible and to take
+        // it back, not to arm it.
+        t.onLinkActivated: (link) => {
+            const accepted = link != "undo";
+            autoPixelFormat.checked = accepted;
+            root.pixelFormatOverride = accepted? link : "";
+        };
         text: {
             const c = root.pixelFormatCheck;
             if (c.ok) return "";
@@ -732,6 +762,21 @@ MenuItem {
                 }
             }
         }
+        // Standing answer to the pixel format warning above.
+        //
+        // Ticked by accepting the conversion in the warning itself, so nobody has to find this
+        // to get the behaviour - it is here to be seen and switched off. What it stores is the
+        // decision, not the format: `updatePixelFormatCheck` recomputes the right format for
+        // whatever encoder is currently selected.
+        CheckBox {
+            id: autoPixelFormat;
+            text: qsTr("Automatically convert unsupported pixel formats");
+            checked: false;
+            width: parent.width;
+            Component.onCompleted: contentItem.wrapMode = Text.WordWrap;
+            tooltip: qsTr("When the selected encoder can't write the source pixel format, convert to the closest one it accepts instead of asking every time.");
+            onCheckedChanged: root.updatePixelFormatCheck();
+        }
         CheckBox {
             id: preserveOutputSettings;
             text: qsTr("Preserve export settings");
@@ -745,15 +790,54 @@ MenuItem {
                 }
             }
         }
-        CheckBox {
+        // The export folder, shown rather than merely remembered.
+        //
+        // This setting has always pinned every export to one folder; what it lacked was any way
+        // to SEE or SET which folder that was. It was whichever one you last happened to pick in
+        // the output path field, stored out of sight in `preservedOutputPath`. The field below
+        // is that same setting, made visible and directly editable - the storage key is
+        // unchanged, so an existing preference carries over untouched.
+        CheckBoxWithContent {
             id: preserveOutputPath;
-            text: qsTr("Preserve export path");
+            text: qsTr("Always export to this folder");
             checked: false;
-            tooltip: qsTr("Save output path in settings and use it for all files.");
+            tooltip: qsTr("Export every file to one fixed folder instead of next to the source video.");
             onCheckedChanged: {
                 if (checked) {
-                    const outputFolder = window.outputFile.folderUrl.toString();
-                    if (outputFolder) settings.setValue("preservedOutputPath", outputFolder);
+                    // Seed from wherever the current export is going, so ticking the box on its
+                    // own is meaningful: it pins the folder you can already see in the output
+                    // path field, rather than leaving the setting blank until you browse.
+                    if (!exportFolder.folderUrl.toString() && window.outputFile) {
+                        const outputFolder = window.outputFile.folderUrl.toString();
+                        if (outputFolder) exportFolder.setFolder(outputFolder);
+                    }
+                    const folder = exportFolder.folderUrl.toString();
+                    if (folder) settings.setValue("preservedOutputPath", folder);
+                }
+            }
+
+            OutputPathField {
+                id: exportFolder;
+                folderOnly: true;
+
+                // Restored here rather than through the `sett` alias block: that mechanism binds
+                // to a plain property, and this one has to travel through `setFolder` to keep
+                // `folderUrl`, `filename` and the displayed text consistent.
+                Component.onCompleted: {
+                    const saved = settings.value("preservedOutputPath", "");
+                    if (saved) setFolder(saved);
+                }
+                onFolderUrlChanged: {
+                    const folder = folderUrl.toString();
+                    if (folder && preserveOutputPath.checked) {
+                        settings.setValue("preservedOutputPath", folder);
+                        // Retarget the export already on screen. Without this the new folder
+                        // would only take effect on the NEXT video loaded, which reads as the
+                        // setting having been ignored. Guarded because this component is
+                        // restored from settings during startup, before the window's own output
+                        // path field necessarily exists.
+                        if (window.outputFile) window.outputFile.setFolder(folder);
+                    }
                 }
             }
         }

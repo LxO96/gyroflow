@@ -29,6 +29,11 @@ TextField {
         if (!preventChange) {
             if (isSandboxed) {
                 setFilename(text.replace(/^.+\//, ""));
+            } else if (folderOnly) {
+                // `setUrl` would read the last path segment as a filename, so typing
+                // "D:/Renders" would leave folderUrl at "D:/" and the field pointing one level
+                // above what was typed. In folder mode the whole text IS the folder.
+                setFolder(filesystem.path_to_url(text));
             } else {
                 setUrl(filesystem.path_to_url(text));
             }
