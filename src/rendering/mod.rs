@@ -1584,13 +1584,27 @@ pub fn check_export_pixel_format(codec: &str, gpu: bool, source_format: &str) ->
     // list is free, the probe is not.
     if supported.contains(&source) && ffmpeg_hw::encoder_accepts_format(&encoder_name, source) { return ok; }
 
-    // Rank, probe the winner, and on refusal drop it and rank again. Ranking the whole list
-    // through the probe instead would mean opening an encoder session per candidate - twenty-one
-    // of them for NVENC, at ~100 ms each, on the UI thread. In practice this settles in one or
-    // two rounds; the cap is there so a thoroughly broken encoder cannot spin.
+    // Rank, probe the winner, and on refusal drop it and rank again, until the ranking runs out
+    // of candidates.
+    //
+    // The bound is the candidate list itself rather than a fixed number of rounds. Each round
+    // removes exactly one format - the ranking only ever returns something it was handed - so
+    // `remaining` strictly shrinks and this terminates on its own; no encoder, however broken,
+    // can spin here.
+    //
+    // It used to stop after four rounds, which was not a conservative limit but a bug: for a
+    // 10-bit 4:2:2 source, h264_nvenc rejects P210LE, P010LE, YUV444P10MSBLE and NV16 in a row,
+    // so the loop ran out and the UI announced "no compatible format is available" about an
+    // encoder that takes NV12 perfectly well.
+    //
+    // Cost is bounded and very nearly one-off. `encoder_accepts_format` memoises every
+    // (encoder, format) answer for the life of the process, so a run of rejections is paid once
+    // and every later check of that encoder is free; and only plain software YUV layouts are
+    // ranked at all, so the realistic worst case is a dozen probes rather than the whole
+    // advertised list (NVENC advertises twenty-one, six of which are hardware or RGB).
     let mut remaining = supported.clone();
     let mut suggestion = None;
-    for _ in 0..4 {
+    for _ in 0..remaining.len() {
         let Some(candidate) = ffmpeg_hw::find_best_matching_codec(source, &remaining) else { break };
         if ffmpeg_hw::encoder_accepts_format(&encoder_name, candidate) {
             suggestion = Some(candidate);
@@ -1798,6 +1812,66 @@ mod pixel_format_check_tests {
     #[test]
     fn an_encoder_that_advertises_nothing_yields_nothing() {
         assert_eq!(find_best_matching_codec(Pixel::YUV422P10LE, &[]), None);
+    }
+
+    /// What `h264_nvenc` advertises, verbatim from `SW formats:` in gyroflow.log. It advertises
+    /// the 10-bit 4:2:2 source format itself; the hardware then refuses it, which is the whole
+    /// reason the probe exists alongside the advertised list.
+    const NVENC_H264: &[Pixel] = &[
+        Pixel::NV12, Pixel::NV16, Pixel::YUV420P, Pixel::YUV444P, Pixel::P010LE, Pixel::P016LE,
+        Pixel::P210LE, Pixel::P216LE, Pixel::YUV422P, Pixel::YUV420P10LE, Pixel::YUV422P10LE,
+        Pixel::YUV444P10LE, Pixel::YUV444P16LE, Pixel::BGRA, Pixel::RGBA,
+    ];
+
+    /// The loop in `check_export_pixel_format` drops the rejected candidate and ranks again, and
+    /// bounds itself by the length of the candidate list. That is only safe because the ranking
+    /// never invents a format: every answer comes out of the list handed in, so each round
+    /// strictly shrinks it and the walk terminates on its own.
+    ///
+    /// This is the invariant, exercised to exhaustion rather than asserted in a comment.
+    #[test]
+    fn ranking_only_ever_returns_a_candidate_it_was_given() {
+        let mut remaining = NVENC_H264.to_vec();
+        let mut rounds = 0;
+        while let Some(picked) = find_best_matching_codec(Pixel::YUV422P10LE, &remaining) {
+            assert!(remaining.contains(&picked), "{picked:?} was not in the list it came from");
+            remaining.retain(|&f| f != picked);
+            rounds += 1;
+            assert!(rounds <= NVENC_H264.len(), "walk did not shrink the list");
+        }
+        // It stops because the YUV layouts run out, not because the list emptied: the hardware
+        // surfaces and RGB entries are never offered for a YUV source and are still sitting there.
+        assert!(!remaining.is_empty());
+        assert!(remaining.iter().all(|f| matches!(f, Pixel::BGRA | Pixel::RGBA)), "{remaining:?}");
+    }
+
+    /// The regression that motivated removing the round cap.
+    ///
+    /// For a 10-bit 4:2:2 source, `h264_nvenc` rejects its four best-ranked candidates in a row.
+    /// A loop capped at four rounds gave up there and reported "no compatible format is
+    /// available" - about an encoder that takes NV12 perfectly well. Walking the ranking out
+    /// past those four finds a real answer.
+    #[test]
+    fn a_run_of_rejections_still_finds_a_workable_format() {
+        // Observed from `Encoder probe: h264_nvenc + <fmt> -> rejected` in gyroflow.log, plus
+        // the source format itself, which it advertises but will not open.
+        let rejected = [
+            Pixel::YUV422P10LE, Pixel::P210LE, Pixel::P010LE, Pixel::NV16, Pixel::P216LE,
+            Pixel::YUV420P10LE, Pixel::YUV444P10LE, Pixel::YUV444P16LE, Pixel::P016LE,
+            Pixel::YUV444P,
+        ];
+
+        let mut remaining = NVENC_H264.to_vec();
+        let mut rounds = 0;
+        let suggestion = loop {
+            let Some(candidate) = find_best_matching_codec(Pixel::YUV422P10LE, &remaining) else { break None };
+            rounds += 1;
+            if !rejected.contains(&candidate) { break Some(candidate); }
+            remaining.retain(|&f| f != candidate);
+        };
+
+        assert_eq!(suggestion, Some(Pixel::YUV422P), "an 8-bit 4:2:2 layout is the honest fallback");
+        assert!(rounds > 4, "took {rounds} rounds - the old cap of 4 is what made this report nothing");
     }
 
     /// `same_visual_quality` is what decides whether the message promises the swap is free, so it
