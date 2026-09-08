@@ -223,12 +223,13 @@ Rectangle {
                     width: parent.width - (isMobileLayout? 0 : renderBtnRow.width + 10 * dpiScale) - 2*x;
                     OutputPathField {
                         id: outputFile;
-                        onFolderUrlChanged: {
-                            if (exportSettings.item.preserveOutputPath.checked) {
-                                const outputFolder = folderUrl.toString();
-                                if (outputFolder) settings.setValue("preservedOutputPath", outputFolder);
-                            }
-                        }
+                        // Deliberately does NOT write back to `preservedOutputPath`.
+                        //
+                        // It used to: browsing here while "preserve export path" was on silently
+                        // redefined the pinned folder, because that was the only way to set it.
+                        // The setting now has its own field in export settings, so this one is
+                        // free to be what it looks like - the destination for THIS export - and
+                        // sending one file elsewhere no longer moves everything after it.
                     }
                 }
 
