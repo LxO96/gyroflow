@@ -6,6 +6,7 @@ import QtQuick
 import "../components/"
 
 MenuItem {
+    id: root;
     text: qsTr("Advanced");
     iconName: "settings";
     opened: false;
@@ -22,6 +23,10 @@ MenuItem {
         property alias marginPixels: marginPixels.value;
         property alias featherPixels: featherPixels.value;
         property alias defaultSuffix: defaultSuffix.text;
+        // `exportFolderMode` and `exportSubfolder` are deliberately NOT here: the control below
+        // reads and writes them itself, because both have to be persisted synchronously for the
+        // Rust-side resolver to see them, and this block saves through a queued connection.
+        property alias autoPixelFormat: autoPixelFormat.checked;
         property alias playSounds: playSounds.checked;
         property alias r3dConvertFormat: r3dConvertFormat.currentIndex;
         property alias r3dColorMode: r3dColorMode.currentIndex;
@@ -40,7 +45,20 @@ MenuItem {
         function propChanged() { settings.propChanged(sett); }
     }
     property alias defaultSuffix: defaultSuffix;
+    property alias autoPixelFormat: autoPixelFormat;
     property alias previewResolution: previewResolution.currentIndex;
+
+    /// Point the loaded clip's output path at wherever the "Export to" setting now says.
+    ///
+    /// Without this a change only takes effect on the NEXT video opened, which reads as the
+    /// setting having been ignored. Everything is guarded because this menu is restored from
+    /// settings during startup, before there is a video or an output path field to speak of.
+    function refreshOutputFolder(): void {
+        if (!window.videoArea || !window.outputFile) return;
+        const url = window.videoArea.loadedFileUrl.toString();
+        if (!url) return;
+        window.outputFile.setFolder(render_queue.get_default_output_folder(url));
+    }
     property alias r3dConvertFormat: r3dConvertFormat;
     property alias gpudecode: gpudecode;
 
@@ -421,6 +439,146 @@ Already-drawn thumbnails stay in Explorer's cache, so existing files may not cha
             onTextChanged: render_queue.default_suffix = text;
         }
     }
+
+    // Where exports go. Sits next to the file suffix because the two answer the same question
+    // between them - what the output is called, and where it lands.
+    //
+    // Three mutually exclusive answers, so radio buttons rather than a checkbox each: "next to
+    // the source" and "a fixed folder" cannot both be true, and two independent checkboxes would
+    // let a user express that and then wonder which won.
+    //
+    // The RULE lives in Rust (`render_queue::resolve_output_folder`), not here. This is only the
+    // control that writes the settings it reads, so the render queue and the output path field
+    // cannot disagree about what "subfolder of the source" means.
+    Label {
+        position: Label.TopPosition;
+        text: qsTr("Export to");
+
+        Column {
+            id: exportFolderMode;
+            width: parent.width;
+            spacing: 2 * dpiScale;
+
+            // 0: next to the source, 1: subfolder of the source, 2: a fixed folder. Stored as a
+            // number rather than the button's identity so the setting survives reordering.
+            property int mode: 0;
+
+            // False until the stored value has been read. Nothing here may WRITE settings before
+            // then: creating the buttons assigns `checked`, which sets `mode`, which would
+            // persist the default and overwrite the user's stored choice before it was ever read.
+            // That is not hypothetical - it is what this flag was added to fix.
+            property bool restored: false;
+
+            function syncButtons(): void {
+                nextToSource.checked = mode == 0;
+                intoSubfolder.checked = mode == 1;
+                intoFixedFolder.checked = mode == 2;
+            }
+            onModeChanged: {
+                syncButtons();
+                if (!restored) return;
+                // Written explicitly rather than left to the `sett` alias block, which persists
+                // through a QUEUED connection and so lands after this call stack. The resolver
+                // reads the STORED value, and would otherwise answer with the mode just left.
+                settings.setValue("exportFolderMode", mode);
+                root.refreshOutputFolder();
+            }
+            Component.onCompleted: {
+                // Read directly rather than relying on `settings.init` having run: these are
+                // separate objects with no guaranteed completion order between them, and this
+                // way the outcome does not depend on which went first.
+                if (!settings.contains("exportFolderMode") && +settings.value("preserveOutputPath", 0)) {
+                    // Carry over the checkbox this replaces, so anyone already exporting to a
+                    // fixed folder keeps doing that rather than silently reverting.
+                    mode = 2;
+                } else {
+                    mode = +settings.value("exportFolderMode", 0);
+                }
+                syncButtons();
+                exportSubfolder.text = settings.value("exportSubfolder", "Stabilized") || "Stabilized";
+                restored = true;
+                // Persist the default the field is showing, rather than leaving the setting
+                // absent while the UI implies a value. The resolver reads the stored name, so an
+                // unwritten default meant picking "subfolder" did nothing at all: the mode was
+                // saved, the name was not, and every export went beside the source anyway.
+                if (!settings.contains("exportSubfolder")) settings.setValue("exportSubfolder", exportSubfolder.text);
+            }
+
+            RadioButton {
+                id: nextToSource;
+                text: qsTr("Next to the source file");
+                checked: true;
+                onCheckedChanged: if (checked) exportFolderMode.mode = 0;
+            }
+            RadioButton {
+                id: intoSubfolder;
+                // Hidden where it cannot work: under sandboxing an export folder is something
+                // the user grants access to, not something the app invents a path inside.
+                visible: !isSandboxed;
+                text: qsTr("Subfolder of the source file");
+                onCheckedChanged: if (checked) exportFolderMode.mode = 1;
+            }
+            TextField {
+                id: exportSubfolder;
+                visible: intoSubfolder.visible;
+                enabled: intoSubfolder.checked;
+                opacity: enabled? 1 : 0.5;
+                x: 20 * dpiScale;
+                width: parent.width - x;
+                text: "Stabilized";
+                onTextChanged: {
+                    if (!exportFolderMode.restored) return; // don't overwrite the stored name with the default
+                    settings.setValue("exportSubfolder", text); // ahead of the queued save, as above
+                    if (intoSubfolder.checked) root.refreshOutputFolder();
+                }
+                tooltip: qsTr("Created on export if it doesn't exist. A path like \"Renders/2026\" nests.");
+            }
+            RadioButton {
+                id: intoFixedFolder;
+                text: qsTr("A fixed folder");
+                onCheckedChanged: if (checked) exportFolderMode.mode = 2;
+            }
+            OutputPathField {
+                id: exportFolder;
+                folderOnly: true;
+                enabled: intoFixedFolder.checked;
+                opacity: enabled? 1 : 0.5;
+                x: 20 * dpiScale;
+                width: parent.width - x;
+
+                // Restored by hand rather than through the `sett` alias block: that binds to a
+                // plain property, and this one has to travel through `setFolder` to keep
+                // `folderUrl`, `filename` and the displayed text consistent.
+                Component.onCompleted: {
+                    const saved = settings.value("preservedOutputPath", "");
+                    if (saved) setFolder(saved);
+                }
+                onFolderUrlChanged: {
+                    const folder = folderUrl.toString();
+                    if (folder) settings.setValue("preservedOutputPath", folder);
+                    if (intoFixedFolder.checked) root.refreshOutputFolder();
+                }
+            }
+        }
+    }
+
+    // Standing answer to the pixel format warning in export settings.
+    //
+    // Ticked by accepting the conversion in that warning, so nobody has to find this to get the
+    // behaviour - it is here to be seen and switched off. What it stores is the decision, not the
+    // format: the check recomputes the right format for whatever encoder is selected.
+    CheckBox {
+        id: autoPixelFormat;
+        text: qsTr("Automatically convert unsupported pixel formats");
+        checked: false;
+        width: parent.width;
+        Component.onCompleted: contentItem.wrapMode = Text.WordWrap;
+        tooltip: qsTr("When the selected encoder can't write the source pixel format, convert to the closest one it accepts instead of asking every time.");
+        // Guarded: this menu and the export menu are separate lazily-created items, and the one
+        // that holds the check may not exist yet while settings are being restored.
+        onCheckedChanged: if (window.exportSettings) window.exportSettings.updatePixelFormatCheck();
+    }
+
     CheckBox {
         id: playSounds;
         text: qsTr("Notification sounds");

@@ -1341,12 +1341,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
 
     let mut filename = render_options.output_filename.clone();
     let folder = &render_options.output_folder;
-    if cfg!(not(any(target_os = "android", target_os = "ios"))) && !gyroflow_core::filesystem::exists(folder) {
-        let path = gyroflow_core::filesystem::url_to_path(folder);
-        if !path.is_empty() {
-            let _ = std::fs::create_dir_all(path);
-        }
-    }
+    ensure_output_folder_exists(folder);
     if org_trim_ranges.len() > 1 {
         if let Some(ind) = trim_range_ind {
             if let Some(pos) = filename.rfind('.') {
@@ -1558,6 +1553,26 @@ pub struct PixelFormatCheck {
     pub suggestion: String,
     pub same_quality: bool,
     pub cpu_only: bool,
+}
+
+/// Create the output folder if it isn't there yet.
+///
+/// Every writer of an export has to call this, not just the renderer. Output folders used to be
+/// the source's own folder, which by definition exists; since "Export to" can name a subfolder or
+/// a folder that has simply been moved, any of them can be missing. A project export skipped this
+/// and silently wrote nothing at all - the failure this exists to prevent.
+///
+/// Not on the sandboxed platforms, where a folder is something the user grants access to rather
+/// than something the app conjures.
+pub fn ensure_output_folder_exists(folder: &str) {
+    if cfg!(any(target_os = "android", target_os = "ios")) { return; }
+    if folder.is_empty() || gyroflow_core::filesystem::exists(folder) { return; }
+    let path = gyroflow_core::filesystem::url_to_path(folder);
+    if !path.is_empty() {
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            ::log::warn!("Failed to create output folder {path}: {e:?}");
+        }
+    }
 }
 
 pub fn check_export_pixel_format(codec: &str, gpu: bool, source_format: &str) -> PixelFormatCheck {

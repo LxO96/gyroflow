@@ -13,6 +13,55 @@ use std::collections::{ HashMap, HashSet };
 use parking_lot::RwLock;
 use regex::Regex;
 
+/// How the "Export to" setting answers "where does this file's export go?".
+///
+/// Kept as one function used by both callers - the output path field when a video is loaded, and
+/// the render queue's per-file default - because the alternative is the same rule written twice
+/// and drifting. In particular a queue of files from different folders has to resolve the rule
+/// per file, not once for the batch, or "subfolder of the source" quietly pools everything into
+/// whichever folder happened to be current.
+pub fn resolve_output_folder(input_url: &str) -> String {
+    let source = filesystem::get_folder(input_url);
+    apply_export_folder_mode(
+        &source,
+        core::settings::get_u64("exportFolderMode", 0),
+        // Defaults to the same name the UI field shows. If it defaulted to empty, a user who
+        // picked "subfolder of the source" without ever editing the name would have the mode
+        // stored but no name to go with it, and every export would quietly land beside the
+        // source instead - the setting apparently ignored. An explicitly EMPTIED name is a
+        // different thing and still falls back, because the key exists and holds "".
+        &core::settings::get_str("exportSubfolder", "Stabilized"),
+        &core::settings::get_str("preservedOutputPath", ""),
+    )
+}
+
+/// The rule itself, with the settings passed in so it can be tested without a settings store.
+///
+/// Every branch falls back to `source_folder`, which is what Gyroflow did before any of this
+/// existed: a setting that cannot be honoured must not lose the export, it must put the file
+/// where the user would have found it anyway.
+///
+/// Mode 1 splits the subfolder on both separators so "Renders/2026" nests rather than becoming
+/// one folder with an encoded slash in its name. `.` and `..` segments are dropped: a name is a
+/// place to put exports, not a way to walk out of the source folder.
+pub fn apply_export_folder_mode(source_folder: &str, mode: u64, subfolder: &str, fixed_folder: &str) -> String {
+    match mode {
+        1 => {
+            let mut url = source_folder.to_owned();
+            let mut nested = false;
+            for segment in subfolder.split(['/', '\\']).map(str::trim).filter(|s| !s.is_empty() && *s != "." && *s != "..") {
+                url = filesystem::get_file_url(&url, segment, false);
+                if url.is_empty() { return source_folder.to_owned(); }
+                nested = true;
+            }
+            // A blank or `../..`-only name means the setting says nothing usable.
+            if nested { format!("{url}/") } else { source_folder.to_owned() }
+        }
+        2 if !fixed_folder.is_empty() => fixed_folder.to_owned(),
+        _ => source_folder.to_owned(),
+    }
+}
+
 #[derive(Default, Clone, SimpleListItem, Debug)]
 pub struct RenderQueueItem {
     pub job_id: u32,
@@ -208,6 +257,7 @@ pub struct RenderQueue {
 
     get_job_output_filename: qt_method!(fn(&self, job_id: u32) -> QString),
     get_job_output_folder: qt_method!(fn(&self, job_id: u32) -> QUrl),
+    get_default_output_folder: qt_method!(fn(&self, input_url: QUrl) -> QUrl),
     set_job_output_filename: qt_method!(fn(&mut self, job_id: u32, new_filename: QString, start: bool)),
 
     set_pixel_format: qt_method!(fn(&mut self, job_id: u32, format: String)),
@@ -493,6 +543,13 @@ impl RenderQueue {
             }
         }
         QUrl::default()
+    }
+    /// Where a newly loaded video's export should go, per the "Export to" setting.
+    ///
+    /// The same call the queue makes for each of its files, exposed so the output path field
+    /// answers the question identically instead of reimplementing it in QML.
+    pub fn get_default_output_folder(&self, input_url: QUrl) -> QUrl {
+        QUrl::from(QString::from(resolve_output_folder(&util::qurl_to_encoded(input_url))))
     }
     pub fn get_job_output_filename(&self, job_id: u32) -> QString {
         let q = self.queue.borrow();
@@ -1022,6 +1079,10 @@ impl RenderQueue {
                         additional_data = serde_json::to_string(&obj).unwrap_or_default();
                     }
                     let gf_folder = render_options.output_folder.to_owned();
+                    // "Export to" can name a folder nothing has written to yet - a subfolder of
+                    // the source, typically. The render path creates it; this one has to as well,
+                    // or exporting a project there writes nothing and reports nothing.
+                    rendering::ensure_output_folder_exists(&gf_folder);
                     let gf_file = filesystem::filename_with_extension(&render_options.output_filename.replace(&default_suffix, ""), "gyroflow");
                     let gf_url = filesystem::get_file_url(&gf_folder, &gf_file, true);
                     let result = match export_project {
@@ -1128,7 +1189,9 @@ impl RenderQueue {
         if !ui_output_folder.is_empty() {
             return ui_output_folder.to_owned();
         }
-        filesystem::get_folder(input_url)
+        // Resolved per file, not per batch: a queue can hold clips from several folders, and
+        // "subfolder of the source" has to mean each clip's own source.
+        resolve_output_folder(input_url)
     }
     fn get_output_filename(input_url: &str, suffix: &str, render_options: &RenderOptions, override_ext: Option<&str>) -> String {
         if !render_options.output_filename.is_empty() {
@@ -1795,5 +1858,79 @@ impl RenderQueue {
         if sync_settings.is_object() && !sync_settings.as_object().unwrap().is_empty() {
             stab.lens.write().sync_settings = Some(sync_settings);
         }
+    }
+}
+
+#[cfg(test)]
+mod export_folder_tests {
+    use super::apply_export_folder_mode;
+
+    const SRC: &str = "file:///C:/Shoot/";
+    const FIXED: &str = "file:///D:/Renders/";
+
+    /// Mode 0 is what every export did before the setting existed, and stays the default.
+    #[test]
+    fn next_to_the_source_is_the_source_folder() {
+        assert_eq!(apply_export_folder_mode(SRC, 0, "Stabilized", FIXED), SRC);
+    }
+
+    #[test]
+    fn a_subfolder_hangs_off_the_source() {
+        assert_eq!(apply_export_folder_mode(SRC, 1, "Stabilized", ""), "file:///C:/Shoot/Stabilized/");
+    }
+
+    #[test]
+    fn a_fixed_folder_ignores_where_the_source_is() {
+        assert_eq!(apply_export_folder_mode(SRC, 2, "Stabilized", FIXED), FIXED);
+    }
+
+    /// A name is a place to put exports, not a way to walk out of the source folder. Segments
+    /// that would climb are dropped rather than honoured or rejected outright.
+    #[test]
+    fn a_subfolder_cannot_escape_upwards() {
+        assert_eq!(apply_export_folder_mode(SRC, 1, "../../Elsewhere", ""), "file:///C:/Shoot/Elsewhere/");
+        assert_eq!(apply_export_folder_mode(SRC, 1, "./Here", ""),          "file:///C:/Shoot/Here/");
+    }
+
+    /// Typing a path rather than a name should nest, not produce one folder with an encoded
+    /// slash in its name.
+    #[test]
+    fn a_subfolder_path_nests() {
+        assert_eq!(apply_export_folder_mode(SRC, 1, "Renders/2026", ""),  "file:///C:/Shoot/Renders/2026/");
+        assert_eq!(apply_export_folder_mode(SRC, 1, r"Renders\2026", ""), "file:///C:/Shoot/Renders/2026/");
+    }
+
+    #[test]
+    fn a_subfolder_name_is_url_encoded() {
+        assert_eq!(apply_export_folder_mode(SRC, 1, "Final cut", ""), "file:///C:/Shoot/Final%20cut/");
+    }
+
+    /// A setting that cannot be honoured must not lose the export. Every one of these falls back
+    /// to the folder the user would have found the file in anyway.
+    #[test]
+    fn an_unusable_setting_falls_back_to_the_source() {
+        assert_eq!(apply_export_folder_mode(SRC, 1, "",       FIXED), SRC, "blank subfolder name");
+        assert_eq!(apply_export_folder_mode(SRC, 1, "   ",    FIXED), SRC, "whitespace-only name");
+        assert_eq!(apply_export_folder_mode(SRC, 1, "../..",  FIXED), SRC, "nothing left after dropping climbs");
+        assert_eq!(apply_export_folder_mode(SRC, 2, "Stabilized", ""), SRC, "fixed mode with no folder set");
+        assert_eq!(apply_export_folder_mode(SRC, 99, "Stabilized", FIXED), SRC, "unknown mode");
+    }
+
+    /// The reported bug: picking "subfolder of the source" saved the mode but nothing had ever
+    /// written the name, so the resolver saw "" and every export went beside the source anyway -
+    /// the setting stuck, the path ignored it. The wrapper now defaults the name to what the UI
+    /// field shows, so the two cannot disagree. This pins the two halves of that.
+    #[test]
+    fn a_subfolder_mode_with_the_default_name_still_nests() {
+        // What `resolve_output_folder` now passes when the key was never written.
+        assert_eq!(apply_export_folder_mode(SRC, 1, "Stabilized", ""), "file:///C:/Shoot/Stabilized/");
+        // ...while a name the user deliberately cleared is still a fallback, not a default.
+        assert_eq!(apply_export_folder_mode(SRC, 1, "", ""), SRC);
+    }
+
+    /// Surrounding whitespace is a typo, not part of the folder name.
+    #[test]
+    fn a_subfolder_name_is_trimmed() {
+        assert_eq!(apply_export_folder_mode(SRC, 1, "  Stabilized  ", ""), "file:///C:/Shoot/Stabilized/");
     }
 }

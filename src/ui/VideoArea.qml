@@ -453,12 +453,10 @@ Item {
             const suffix = window.advanced.defaultSuffix.text;
             window.outputFile.setFilename(filesystem.filename_with_suffix(filename, suffix).replace(/%0[0-9]+d/, ""));
 
-            const preservedPath = settings.value("preservedOutputPath", "");
-            if (window.exportSettings.preserveOutputPath.checked && preservedPath) {
-                window.outputFile.setFolder(preservedPath);
-            } else {
-                window.outputFile.setFolder(folder);
-            }
+            // The "Export to" rule is answered in Rust, by the same call the render queue makes
+            // for each of its files, so a clip opened here and the same clip queued cannot end
+            // up in different places.
+            window.outputFile.setFolder(render_queue.get_default_output_folder(url));
             window.exportSettings.updateCodecParams();
         }
         if (!root.pendingGyroflowData) {

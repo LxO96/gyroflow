@@ -90,8 +90,6 @@ MenuItem {
         property alias audioCodec: audioCodec.currentIndex;
         property alias interpolationMethod: interpolationMethod.currentIndex;
         property alias preserveOutputSettings: preserveOutputSettings.checked;
-        property alias preserveOutputPath: preserveOutputPath.checked;
-        property alias autoPixelFormat: autoPixelFormat.checked;
 
         Component.onCompleted: settings.init(sett);
         function propChanged() { settings.propChanged(sett); }
@@ -109,7 +107,6 @@ MenuItem {
     property alias outGpu: gpu.checked;
     property alias outAudio: audio.checked;
     property alias preserveOutputSettings: preserveOutputSettings;
-    property alias preserveOutputPath: preserveOutputPath;
     property alias exportTrimsSeparately: exportTrimsSeparately;
     property string outCodecOptions: "";
     property real originalWidth: outWidth;
@@ -154,7 +151,14 @@ MenuItem {
         //
         // `c.suggestion` is empty when no compatible format exists (`cpu_only`), which lands on
         // "" here and leaves the warning standing, as it must - there is nothing to accept.
-        root.pixelFormatOverride = (autoPixelFormat.checked && !c.ok) ? (c.suggestion || "") : "";
+        root.pixelFormatOverride = (root.autoConvertEnabled() && !c.ok) ? (c.suggestion || "") : "";
+    }
+
+    // The preference lives in the Advanced menu, next to the other output settings. That is a
+    // separate lazily-created item, and this one is built first, so every read has to tolerate
+    // it not existing yet - during startup the check runs before the checkbox does.
+    function autoConvertEnabled(): bool {
+        return !!(window.advanced && window.advanced.autoPixelFormat && window.advanced.autoPixelFormat.checked);
     }
 
     function getExportOptions(): var {
@@ -575,7 +579,7 @@ MenuItem {
         // it back, not to arm it.
         t.onLinkActivated: (link) => {
             const accepted = link != "undo";
-            autoPixelFormat.checked = accepted;
+            if (window.advanced && window.advanced.autoPixelFormat) window.advanced.autoPixelFormat.checked = accepted;
             root.pixelFormatOverride = accepted? link : "";
         };
         text: {
@@ -762,21 +766,6 @@ MenuItem {
                 }
             }
         }
-        // Standing answer to the pixel format warning above.
-        //
-        // Ticked by accepting the conversion in the warning itself, so nobody has to find this
-        // to get the behaviour - it is here to be seen and switched off. What it stores is the
-        // decision, not the format: `updatePixelFormatCheck` recomputes the right format for
-        // whatever encoder is currently selected.
-        CheckBox {
-            id: autoPixelFormat;
-            text: qsTr("Automatically convert unsupported pixel formats");
-            checked: false;
-            width: parent.width;
-            Component.onCompleted: contentItem.wrapMode = Text.WordWrap;
-            tooltip: qsTr("When the selected encoder can't write the source pixel format, convert to the closest one it accepts instead of asking every time.");
-            onCheckedChanged: root.updatePixelFormatCheck();
-        }
         CheckBox {
             id: preserveOutputSettings;
             text: qsTr("Preserve export settings");
@@ -787,57 +776,6 @@ MenuItem {
                     if (outputWidth.value  > 0) settings.setValue("preservedWidth",  outputWidth.value);
                     if (outputHeight.value > 0) settings.setValue("preservedHeight", outputHeight.value);
                     if (bitrate.value > 0) settings.setValue("preservedBitrate", bitrate.value);
-                }
-            }
-        }
-        // The export folder, shown rather than merely remembered.
-        //
-        // This setting has always pinned every export to one folder; what it lacked was any way
-        // to SEE or SET which folder that was. It was whichever one you last happened to pick in
-        // the output path field, stored out of sight in `preservedOutputPath`. The field below
-        // is that same setting, made visible and directly editable - the storage key is
-        // unchanged, so an existing preference carries over untouched.
-        CheckBoxWithContent {
-            id: preserveOutputPath;
-            text: qsTr("Always export to this folder");
-            checked: false;
-            tooltip: qsTr("Export every file to one fixed folder instead of next to the source video.");
-            onCheckedChanged: {
-                if (checked) {
-                    // Seed from wherever the current export is going, so ticking the box on its
-                    // own is meaningful: it pins the folder you can already see in the output
-                    // path field, rather than leaving the setting blank until you browse.
-                    if (!exportFolder.folderUrl.toString() && window.outputFile) {
-                        const outputFolder = window.outputFile.folderUrl.toString();
-                        if (outputFolder) exportFolder.setFolder(outputFolder);
-                    }
-                    const folder = exportFolder.folderUrl.toString();
-                    if (folder) settings.setValue("preservedOutputPath", folder);
-                }
-            }
-
-            OutputPathField {
-                id: exportFolder;
-                folderOnly: true;
-
-                // Restored here rather than through the `sett` alias block: that mechanism binds
-                // to a plain property, and this one has to travel through `setFolder` to keep
-                // `folderUrl`, `filename` and the displayed text consistent.
-                Component.onCompleted: {
-                    const saved = settings.value("preservedOutputPath", "");
-                    if (saved) setFolder(saved);
-                }
-                onFolderUrlChanged: {
-                    const folder = folderUrl.toString();
-                    if (folder && preserveOutputPath.checked) {
-                        settings.setValue("preservedOutputPath", folder);
-                        // Retarget the export already on screen. Without this the new folder
-                        // would only take effect on the NEXT video loaded, which reads as the
-                        // setting having been ignored. Guarded because this component is
-                        // restored from settings during startup, before the window's own output
-                        // path field necessarily exists.
-                        if (window.outputFile) window.outputFile.setFolder(folder);
-                    }
                 }
             }
         }
