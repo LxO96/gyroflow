@@ -25,6 +25,18 @@ pub struct OclWrapper {
     buf_matrices: Buffer<f32>,
     #[allow(dead_code)] // Written once at creation, then only read by the kernel
     buf_coeffs: Buffer<f32>,
+
+    /// The chroma smoothing pass (`opencl_chroma_filter.cl`), when this output and format
+    /// support it: CPU outputs only, not half-float.
+    chroma: Option<OclChroma>,
+    chroma_warned: std::sync::atomic::AtomicBool,
+}
+
+struct OclChroma {
+    kernel: Kernel,
+    dst: Buffer<u8>,
+    guide: Option<Buffer<u8>>,
+    params: Buffer<u8>,
 }
 
 pub struct CtxWrapper {
@@ -231,7 +243,8 @@ impl OclWrapper {
                 match &buf.data {
                     BufferSource::Cpu { buffer } => {
                         let flags = if is_in { MemFlags::new().read_only().host_write_only() }
-                                    else     { MemFlags::new().write_only().host_read_only().alloc_host_ptr() };
+                                    // read_write: the chroma pass reads the main kernel's output.
+                                    else     { MemFlags::new().read_write().host_read_only().alloc_host_ptr() };
                         // The centre frame occupies offset 0 of the input buffer; any temporal
                         // reference frames are uploaded right after it at i * pitch (see
                         // undistort_image below), so the buffer must be sized for all of them up
@@ -333,6 +346,36 @@ impl OclWrapper {
 
             let kernel = builder.build()?;
 
+            let chroma = if matches!(buffers.output.data, BufferSource::Cpu { .. }) && ocl_names.1 != "convert_half4" {
+                let guide_type = ocl_names.0.trim_end_matches(|c: char| c.is_ascii_digit());
+                let src = include_str!("opencl_chroma_filter.cl")
+                    .replace("DATA_CONVERTF", ocl_names.3)
+                    .replace("DATA_TYPEF", ocl_names.2)
+                    .replace("DATA_CONVERT", ocl_names.1)
+                    .replace("DATA_TYPE", ocl_names.0)
+                    .replace("GUIDE_TYPE", guide_type)
+                    .replace("PIXEL_BYTES", &format!("{}", params.bytes_per_pixel))
+                    .replace("ROUND_OFFSET", if ocl_names.0.starts_with('u') { "0.5f" } else { "0.0f" });
+                let program = Program::builder().src(&src).devices(ctx.device).build(&ctx.context)?;
+                let cdst = Buffer::<u8>::builder().queue(ocl_queue.clone()).len(dest_buffer.len()).flags(MemFlags::new().write_only().host_read_only().alloc_host_ptr()).build()?;
+                let cguide = match &buffers.guide {
+                    Some(g) => Some(Buffer::<u8>::builder().queue(ocl_queue.clone()).len((g.size.1 * g.size.2).max(4)).flags(MemFlags::new().read_only().host_write_only()).build()?),
+                    None => None,
+                };
+                let cparams = Buffer::<u8>::builder().queue(ocl_queue.clone()).len(std::mem::size_of::<crate::denoise::chroma_filter::ChromaFilterParams>()).flags(MemFlags::new().read_only().host_write_only()).build()?;
+                let mut b = Kernel::builder();
+                unsafe {
+                    b.program(&program).name("chroma_filter").queue(ocl_queue.clone())
+                        .global_work_size((buffers.output.size.0, buffers.output.size.1))
+                        .disable_arg_type_check()
+                        .arg(&dest_buffer)                            // 0: the main kernel's output
+                        .arg(&cdst)                                   // 1
+                        .arg(cguide.as_ref().unwrap_or(&dest_buffer)) // 2: unused in RGB mode
+                        .arg(&cparams);                               // 3
+                }
+                Some(OclChroma { kernel: b.build()?, dst: cdst, guide: cguide, params: cparams })
+            } else { None };
+
             // Clear the drawing buffer
             buf_drawing.write(&vec![0u8; buf_drawing.len()]).enq()?;
 
@@ -348,6 +391,8 @@ impl OclWrapper {
                 buf_matrices,
                 buf_mesh_data,
                 buf_coeffs,
+                chroma,
+                chroma_warned: Default::default(),
             })
         } else {
             Err(ocl::BufferCmdError::AlreadyMapped.into())
@@ -471,10 +516,15 @@ impl OclWrapper {
 
         unsafe { self.kernel.enq()?; }
 
+        let chroma_ran = self.run_chroma(buffers, &itm.chroma_filter)?;
+
         match &mut buffers.output.data {
             BufferSource::None => { },
             BufferSource::Cpu { buffer, .. } => {
-                self.dst.read(&mut **buffer).enq()?;
+                match (&self.chroma, chroma_ran) {
+                    (Some(c), true) => c.dst.read(&mut **buffer).enq()?,
+                    _ => self.dst.read(&mut **buffer).enq()?,
+                }
             },
             BufferSource::OpenGL { texture, .. } => {
                 if let Some(ref tex) = self.image_dst {
@@ -509,6 +559,35 @@ impl OclWrapper {
         // self.queue.finish();
 
         Ok(())
+    }
+
+    /// Runs the chroma pass if it applies. Returns whether it ran. Skipping is the pass's only
+    /// failure mode (see the spec), so a reason to skip warns once and leaves the frame alone.
+    fn run_chroma(&self, buffers: &Buffers, p: &crate::denoise::chroma_filter::ChromaFilterParams) -> ocl::Result<bool> {
+        use crate::denoise::chroma_filter::MODE_PLANAR;
+        if !p.is_active() { return Ok(false); }
+        let skip = |why: &str| {
+            if !self.chroma_warned.swap(true, std::sync::atomic::Ordering::Relaxed) { log::warn!("Chroma smoothing skipped: {why}"); }
+            Ok(false)
+        };
+        let Some(c) = &self.chroma else { return skip("this output or pixel format is not supported"); };
+        let mut kp = *p;
+        kp.width = buffers.output.size.0 as i32;
+        kp.height = buffers.output.size.1 as i32;
+        kp.stride = buffers.output.size.2 as i32;
+        if p.mode == MODE_PLANAR {
+            let (Some(g), Some(gbuf)) = (&buffers.guide, &c.guide) else { return skip("no luma guide for a chroma plane"); };
+            let BufferSource::Cpu { buffer } = &g.data else { return skip("the luma guide is not a CPU buffer"); };
+            let len = g.size.1 * g.size.2;
+            if buffer.len() < len || gbuf.len() < len { return skip("the luma guide is smaller than its size says"); }
+            gbuf.write(&buffer[..len]).enq()?;
+            kp.guide_width = g.size.0 as i32;
+            kp.guide_height = g.size.1 as i32;
+            kp.guide_stride = g.size.2 as i32;
+        }
+        c.params.write(bytemuck::bytes_of(&kp)).enq()?;
+        unsafe { c.kernel.enq()?; }
+        Ok(true)
     }
 }
 
