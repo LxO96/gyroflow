@@ -65,8 +65,9 @@ A **second GPU pass**, run by the same backend instance right after the existing
 - **Packed RGB** (RGBA8/16, RGB8/16: the paused preview and colour-baked exports): the guide is
   each pixel's own Rec.709 luma. Only the chroma component `c = rgb − Y·(1,1,1)` is filtered,
   and the pixel keeps its own `Y`, so luma is never blurred. Alpha is untouched.
-- **Everything else** (single-channel RGB planes such as GBRP, packed YUV such as AYUV,
-  float formats): skipped.
+- **Everything else** (planar RGB planes such as GBRP float, packed YUV such as AYUV, alpha
+  planes, half-float on OpenCL): skipped. Packed float RGB (RGBAf) is supported like any
+  other packed RGB.
 
 Plane classification reuses what the export dispatch already knows: the plane index and the
 YUV index list `$yuvi` (empty = packed RGB), as the `denoise_rgb` work does.
