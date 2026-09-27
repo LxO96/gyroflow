@@ -142,3 +142,21 @@ logs one warning (once per backend instance, not per frame).
 
 Spatial luma denoising, motion-compensated temporal denoising, a CPU implementation of the
 pass, and exposing radius or sigma as user controls.
+
+## Results
+
+Measured 2026-09-27 on `testfiles/C2520.MP4`, High temporal denoising, HEVC P010 export,
+frame 8, moving-trousers patch (10-bit codes, std):
+
+| Colour smoothing | Luma grain | U | V | Export time (118 frames, 4K) |
+|---|---|---|---|---|
+| no denoising | 9.21 | 2.63 | 3.51 | — |
+| 0% | 6.25 | 2.31 | 3.23 | 12.2 s |
+| 50% (default) | 6.25 | 1.51 | 2.26 | 13.3 s |
+| 100% | 6.25 | 1.08 | 1.84 | 13.3 s |
+
+0% is identical to temporal-only; luma is untouched at every setting; 100% matches the
+prototype (U 1.06, V 1.84) and meets the V ≤ 2.0 target. The pass costs about 9% of export
+time. Visual check at the shoe's colour edge: blotches gone, colour stays inside the luma
+edge, no fringe. GPU tests: both backends match the Rust reference to 6e-8 (RGB) and 8e-6
+(16-bit planar), and agree with each other to 1.5e-5.
