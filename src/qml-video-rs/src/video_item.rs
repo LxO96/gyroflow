@@ -7,7 +7,22 @@ use qmetaobject::*;
 use crate::video_player::*;
 
 type ProcessPixelsCb = Box<dyn Fn(u32, f64, u32, u32, u32, &mut [u8]) -> (u32, u32, u32, *mut u8)>;
-type ProcessTextureCb = Box<dyn Fn(u32, f64, u32, u32, u32, u64, u64, u64, u64, u64) -> bool>;
+type ProcessTextureCb = Box<dyn Fn(u32, f64, u32, u32, u32, u64, u64, u64, u64, u64) -> TextureResult>;
+
+/// What a texture callback did with the frame. The values are the `Texture*` constants in
+/// MDKPlayer.h, which reads them back as a `uint32_t`.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextureResult {
+    /// It failed. After more than 10 in a row the pixel callback takes over, so a
+    /// transient failure does not cost a readback every frame.
+    NotProcessed = 0,
+    /// The texture holds the result.
+    Processed = 1,
+    /// It deliberately declined this frame, and the pixel callback runs for it straight
+    /// away instead of after the failure threshold.
+    UsePixels = 2,
+}
 type ReadyForProcessingCb = Box<dyn Fn() -> bool>;
 type ResizeCb = Box<dyn Fn(u32, u32)>;
 
@@ -220,11 +235,11 @@ impl MDKVideoItem {
             (width, height, stride, pixels.as_mut_ptr())
         }
     }
-    fn process_texture(&mut self, frame: u32, timestamp: f64, width: u32, height: u32, backend_id: u32, ptr1: u64, ptr2: u64, ptr3: u64, ptr4: u64, ptr5: u64) -> bool {
+    fn process_texture(&mut self, frame: u32, timestamp: f64, width: u32, height: u32, backend_id: u32, ptr1: u64, ptr2: u64, ptr3: u64, ptr4: u64, ptr5: u64) -> u32 {
         if let Some(ref mut proc) = self.m_processTextureCb {
-            proc(frame, timestamp, width, height, backend_id, ptr1, ptr2, ptr3, ptr4, ptr5)
+            proc(frame, timestamp, width, height, backend_id, ptr1, ptr2, ptr3, ptr4, ptr5) as u32
         } else {
-            false
+            TextureResult::NotProcessed as u32
         }
     }
     fn ready_for_processing(&mut self) -> bool {
@@ -290,8 +305,8 @@ cpp! {{
             qimage_from_parts(vid_item.process_pixels(frame, timestamp, width, height, stride, slice))
         });
     };
-    bool processTextureCb(QQuickItem *item, uint32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t backend_id, uint64_t ptr1, uint64_t ptr2, uint64_t ptr3, uint64_t ptr4, uint64_t ptr5) {
-        return rust!(Rust_MDKPlayerItem_processTexture [item: *mut std::os::raw::c_void as "QQuickItem *", frame: u32 as "uint32_t", timestamp: f64 as "double", width: u32 as "uint32_t", height: u32 as "uint32_t", backend_id: u32 as "uint32_t", ptr1: u64 as "uint64_t", ptr2: u64 as "uint64_t", ptr3: u64 as "uint64_t", ptr4: u64 as "uint64_t", ptr5: u64 as "uint64_t"] -> bool as "bool" {
+    uint32_t processTextureCb(QQuickItem *item, uint32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t backend_id, uint64_t ptr1, uint64_t ptr2, uint64_t ptr3, uint64_t ptr4, uint64_t ptr5) {
+        return rust!(Rust_MDKPlayerItem_processTexture [item: *mut std::os::raw::c_void as "QQuickItem *", frame: u32 as "uint32_t", timestamp: f64 as "double", width: u32 as "uint32_t", height: u32 as "uint32_t", backend_id: u32 as "uint32_t", ptr1: u64 as "uint64_t", ptr2: u64 as "uint64_t", ptr3: u64 as "uint64_t", ptr4: u64 as "uint64_t", ptr5: u64 as "uint64_t"] -> u32 as "uint32_t" {
             let mut vid_item = MDKVideoItem::get_from_cpp(item);
             let mut vid_item = unsafe { &mut *vid_item.as_ptr() }; // vid_item.borrow_mut()
 

@@ -54,8 +54,10 @@ filetime_creation = "0.2"
 
 qmetaobject = { version = "0.2.10", default-features = false, features = ["log"] }
 qttypes     = { version = "0.2.12", default-features = false, features = ["required", "qtquick", "qtquickcontrols2"]}
-qml-video-rs = { git = "https://github.com/AdrianEddy/qml-video-rs.git", rev = "855130d" }
-#qml-video-rs = { path = "../qml-video-rs" }
+# Vendored from https://github.com/AdrianEddy/qml-video-rs (rev 855130d) and patched: the
+# texture callback returns `TextureResult`, so a deliberately declined frame (paused denoise
+# preview, CPU pipeline) falls back to pixels at once instead of after 10 failures.
+qml-video-rs = { path = "src/qml-video-rs" }
 
 ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "filter", "format", "software-resampling", "software-scaling"] }
 lazy_static = "1.5.0"

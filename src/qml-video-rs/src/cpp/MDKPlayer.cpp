@@ -405,6 +405,7 @@ void MDKPlayer::windowBeforeRendering() {
     int frame = std::ceil(std::round(timestamp * fps * 100.0) / 100.0);
 
     bool processed = false;
+    bool usePixels = false;
     if (m_firstFrameLoaded.load()) {
         if (!m_videoLoaded.load() || m_shuttingDown.load()) return;
         if (m_processTexture && m_texture) {
@@ -471,7 +472,9 @@ void MDKPlayer::windowBeforeRendering() {
         }
     }
 #endif
-            processed = m_processTexture(m_item, frame, timestamp * 1000.0, m_size.width(), m_size.height(), backend_id, ptr1, ptr2, ptr3, ptr4, ptr5);
+            const uint32_t result = m_processTexture(m_item, frame, timestamp * 1000.0, m_size.width(), m_size.height(), backend_id, ptr1, ptr2, ptr3, ptr4, ptr5);
+            processed = result == TextureProcessed;
+            usePixels = result == TextureUsePixels;
 
             // -------------- Readback workaround --------------
             // if (processed && rif->graphicsApi() == QSGRendererInterface::Direct3D11Rhi) {
@@ -482,12 +485,13 @@ void MDKPlayer::windowBeforeRendering() {
             // }
             // -------------- Readback workaround --------------
 
-            if (processed) m_renderFailCounter = 0;
-            else           m_renderFailCounter++;
+            // A deliberate decline is not a failure, so it leaves the counter alone.
+            if (processed)       m_renderFailCounter = 0;
+            else if (!usePixels) m_renderFailCounter++;
         }
 
         if (!processed && m_processPixels) {
-            if (!m_processTexture || m_renderFailCounter > 10) {
+            if (!m_processTexture || usePixels || m_renderFailCounter > 10) {
                 auto img = toImage();
                 if (!m_videoLoaded.load() || m_shuttingDown.load()) return;
 

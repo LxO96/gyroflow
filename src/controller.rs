@@ -10,7 +10,7 @@ use std::sync::atomic::{ AtomicBool, AtomicUsize, Ordering::SeqCst };
 use std::collections::{ BTreeMap, BTreeSet, HashSet };
 use std::str::FromStr;
 
-use qml_video_rs::video_item::MDKVideoItem;
+use qml_video_rs::video_item::{ MDKVideoItem, TextureResult };
 
 use crate::core;
 use crate::core::StabilizationManager;
@@ -1194,8 +1194,8 @@ impl Controller {
         if let Some(vid) = player.to_qobject::<MDKVideoItem>() {
             let vid = unsafe { &mut *vid.as_ptr() }; // vid.borrow_mut()
             vid.onResize(Box::new(|_, _| { }));
-            vid.onProcessTexture(Box::new(|_, _, _, _, _, _, _, _, _, _| -> bool {
-                false
+            vid.onProcessTexture(Box::new(|_, _, _, _, _, _, _, _, _, _| -> TextureResult {
+                TextureResult::NotProcessed
             }));
             vid.onProcessPixels(Box::new(|_, _, _, _, _, _| -> (u32, u32, u32, *mut u8) {
                 (0, 0, 0, std::ptr::null_mut())
@@ -1265,8 +1265,8 @@ impl Controller {
             let update_info2 = update_info.clone();
 
             #[allow(unused_variables)]
-            vid.onProcessTexture(Box::new(move |frame, timestamp_ms, width, height, backend_id, ptr1, ptr2, ptr3, ptr4, ptr5| -> bool {
-                if width < 4 || height < 4 || backend_id == 0 { return false; }
+            vid.onProcessTexture(Box::new(move |frame, timestamp_ms, width, height, backend_id, ptr1, ptr2, ptr3, ptr4, ptr5| -> TextureResult {
+                if width < 4 || height < 4 || backend_id == 0 { return TextureResult::NotProcessed; }
 
                 // Denoising gathers its reference frames from CPU buffers: `BufferSource::Cpu`
                 // is the only source either back-end uploads references from, and a natively
@@ -1278,7 +1278,12 @@ impl Controller {
                 // `process_pixels::<RGBA8>`. This is a change of hand-over, not of renderer:
                 // OpenCL/wgpu still do the work. It costs one readback per pause, and nothing
                 // at all during playback.
-                if preview_denoise_radius(&stab, vid2.playing) > 0 { return false; }
+                //
+                // `UsePixels`, not `NotProcessed`: the player only falls back to pixels by
+                // itself after more than 10 failed frames in a row, and a paused frame is
+                // redrawn once or twice - so a plain failure left the raw, unstabilized frame
+                // on screen, and toggling denoise looked like the framing jumping.
+                if preview_denoise_radius(&stab, vid2.playing) > 0 { return TextureResult::UsePixels; }
 
                 let _time = std::time::Instant::now();
 
@@ -1301,10 +1306,12 @@ impl Controller {
                     } else {
                         update_info2((1.0, 1.0, None, QString::from("---")));
                     }
-                    return true;
+                    return TextureResult::Processed;
                 }
 
-                if preview_pipeline.load(SeqCst) > 1 { return false; }
+                // The CPU pipeline declines every frame on purpose, so it too goes to pixels
+                // at once - otherwise switching to it while paused showed the raw frame.
+                if preview_pipeline.load(SeqCst) > 1 { return TextureResult::UsePixels; }
 
                 let size = (width as usize, height as usize, width as usize * 4);
 
@@ -1397,7 +1404,7 @@ impl Controller {
                     match stab.process_pixels::<RGBA8>((timestamp_ms * 1000.0).round() as i64, Some(frame as usize), buffers) {
                         Ok(ret) =>  {
                             update_info2((ret.fov, ret.minimal_fov, ret.focal_length, QString::from(format!("Processing {}x{} using {backend}->{} took {:.2}ms", width, height, ret.backend, _time.elapsed().as_micros() as f64 / 1000.0))));
-                            return true;
+                            return TextureResult::Processed;
                         },
                         Err(e) => {
                             ::log::error!("Failed to process pixels: {e:?}");
@@ -1406,7 +1413,7 @@ impl Controller {
                 }
 
                 update_info2((1.0, 1.0, None, QString::from("---")));
-                false
+                TextureResult::NotProcessed
             }));
 
             let stab = self.stabilizer.clone();

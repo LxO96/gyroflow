@@ -14,7 +14,14 @@
 
 #include "VideoTextureNode.h"
 
-typedef std::function<bool(QQuickItem *item, uint32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t backend_id, uint64_t ptr1, uint64_t ptr2, uint64_t ptr3, uint64_t ptr4, uint64_t ptr5)> ProcessTextureCb;
+// What a texture callback did with the frame. Mirrors `TextureResult` in video_item.rs.
+//   NotProcessed - it failed; after more than 10 in a row the pixel callback takes over.
+//   Processed    - the texture holds the result.
+//   UsePixels    - it deliberately declined this frame; the pixel callback runs *now*.
+//                  Without this, a declined paused frame (which is redrawn only once or
+//                  twice) never reaches the counter's threshold and shows the raw frame.
+enum : uint32_t { TextureNotProcessed = 0, TextureProcessed = 1, TextureUsePixels = 2 };
+typedef std::function<uint32_t(QQuickItem *item, uint32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t backend_id, uint64_t ptr1, uint64_t ptr2, uint64_t ptr3, uint64_t ptr4, uint64_t ptr5)> ProcessTextureCb;
 typedef std::function<QImage(QQuickItem *item, uint32_t frame, double timestamp, const QImage &img)> ProcessPixelsCb;
 typedef std::function<bool(QQuickItem *item)> ReadyForProcessingCb;
 typedef std::function<bool(int32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t org_width, uint32_t org_height, double fps, double duration_ms, uint32_t frame_count, const uint8_t *bits, uint64_t bitsSize)> VideoProcessCb;
