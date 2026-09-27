@@ -185,13 +185,16 @@ fn desc(buf: &mut [u8]) -> BufferDescription<'_> {
 /// handed `@builtin(position)`, the pixel centre, while the CPU path is handed the integer
 /// index. Without it both the centre sampler and `sample_bilinear_at` land between texels
 /// and every number here would be measuring a resampling.
-fn run_wgpu(scene: &Scene, sigma: f32) -> Result<Vec<[f32; 4]>, String> {
+fn run_wgpu(scene: &Scene, sigma: f32) -> Result<Vec<[f32; 4]>, String> { run_wgpu_rgb(scene, sigma, 0.0) }
+/// `chroma_sigma` > 0 marks the plane as packed RGB (`KernelParams::denoise_rgb`).
+fn run_wgpu_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f32; 4]>, String> {
     if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() {
         return Err("UNAVAILABLE: no usable wgpu adapter".into());
     }
 
     let mut itm = identity_transform(scene.references.len(), sigma);
     itm.kernel_params.translation2d = [-0.5, -0.5];
+    itm.kernel_params.denoise_rgb = [chroma_sigma, 0.0, 0.0, 0.0];
 
     let mut input = to_bytes(&scene.centre);
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();
@@ -226,13 +229,15 @@ fn run_wgpu(scene: &Scene, sigma: f32) -> Result<Vec<[f32; 4]>, String> {
 /// No half-pixel correction here, deliberately: the OpenCL kernel takes its coordinates
 /// from `get_global_id` (`opencl_undistort.cl:806`), i.e. the integer pixel index, exactly
 /// like the CPU path. Adding wgpu's offset would shift *this* backend off the sampling grid.
+fn run_opencl(scene: &Scene, sigma: f32) -> Result<Vec<[f32; 4]>, String> { run_opencl_rgb(scene, sigma, 0.0) }
 #[cfg(feature = "use-opencl")]
-fn run_opencl(scene: &Scene, sigma: f32) -> Result<Vec<[f32; 4]>, String> {
+fn run_opencl_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f32; 4]>, String> {
     if crate::gpu::opencl::OclWrapper::list_devices().is_empty() {
         return Err("UNAVAILABLE: no OpenCL device".into());
     }
 
-    let itm = identity_transform(scene.references.len(), sigma);
+    let mut itm = identity_transform(scene.references.len(), sigma);
+    itm.kernel_params.denoise_rgb = [chroma_sigma, 0.0, 0.0, 0.0];
 
     let mut input = to_bytes(&scene.centre);
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();
@@ -260,7 +265,7 @@ fn run_opencl(scene: &Scene, sigma: f32) -> Result<Vec<[f32; 4]>, String> {
 }
 
 #[cfg(not(feature = "use-opencl"))]
-fn run_opencl(_scene: &Scene, _sigma: f32) -> Result<Vec<[f32; 4]>, String> {
+fn run_opencl_rgb(_scene: &Scene, _sigma: f32, _chroma_sigma: f32) -> Result<Vec<[f32; 4]>, String> {
     Err("UNAVAILABLE: built without the use-opencl feature (cargo test --features use-opencl)".into())
 }
 
@@ -474,3 +479,101 @@ fn denoise_gpu_wgpu_and_opencl_agree_pixel_for_pixel() {
          {TOLERANCE} tolerance. Report this - do not patch either kernel to make it pass.",
         a[worst], b[worst]);
 }
+
+/// Packed RGB is judged as luma and chroma separately, each against its own sigma - the same
+/// split the planar YUV path gets from running once per plane. Before this, one distance over
+/// R, G and B used the luma sigma alone, so the preview (RGBA) ignored chroma strength.
+///
+/// Every reference differs from the centre by one fixed offset, with no noise, so each case
+/// has an exact expected outcome: rejected (output == centre) or accepted (output moves
+/// 6/7 of the way to the references, since the centre keeps weight 1 among 7 frames).
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test -- --ignored denoise_gpu"]
+fn denoise_gpu_rgb_judges_luma_and_chroma_separately() {
+    const A: f32 = 0.05;
+    const LOOSE: f32 = 0.5;
+    const TIGHT: f32 = 0.002;
+    // Pure chroma: raises red, lowers blue by exactly as much luma as red added (dY = 0).
+    let chroma_offset = [A, 0.0, -A * 0.2126 / 0.0722, 0.0];
+    // Pure luma: equal R, G, B, so Cb and Cr do not move.
+    let luma_offset = [A, A, A, 0.0];
+
+    let scene_with = |offset: [f32; 4]| -> Scene {
+        let centre: Vec<[f32; 4]> = (0..N).map(base_pixel).collect();
+        let shifted: Vec<[f32; 4]> = centre.iter().map(|p| [p[0] + offset[0], p[1] + offset[1], p[2] + offset[2], p[3]]).collect();
+        Scene { centre, references: vec![shifted; GATHER_FRAMES - 1] }
+    };
+    // Fraction of the way from the centre to the references, on the channel that moved most.
+    let moved = |out: &[[f32; 4]], offset: [f32; 4]| -> f32 {
+        let c = (0..3).max_by(|&a, &b| offset[a].abs().total_cmp(&offset[b].abs())).unwrap();
+        (0..N).map(|i| (out[i][c] - base_pixel(i)[c]) / offset[c]).sum::<f32>() / N as f32
+    };
+
+    let cases = [
+        ("chroma change, tight chroma sigma", chroma_offset, LOOSE, TIGHT, false),
+        ("chroma change, loose chroma sigma", chroma_offset, TIGHT, LOOSE, true),
+        ("luma change, tight luma sigma",     luma_offset,   TIGHT, LOOSE, false),
+        ("luma change, loose luma sigma",     luma_offset,   LOOSE, TIGHT, true),
+    ];
+    let mut ran_any = false;
+    for (case, offset, luma_sigma, chroma_sigma, accepted) in cases {
+        let scene = scene_with(offset);
+        for (name, result) in [("wgpu", run_wgpu_rgb(&scene, luma_sigma, chroma_sigma)), ("OpenCL", run_opencl_rgb(&scene, luma_sigma, chroma_sigma))] {
+            if let Some(out) = resolve(name, result) {
+                ran_any = true;
+                let m = moved(&out, offset);
+                println!("{name}: {case}: moved {m:.3} of the way to the references");
+                if accepted {
+                    assert!(m > 0.8, "{name}: {case}: the references should be accepted (expected ~0.857), moved {m:.3}");
+                } else {
+                    assert!(m < 0.05, "{name}: {case}: the references should be rejected (expected ~0), moved {m:.3}");
+                }
+            }
+        }
+    }
+    assert!(ran_any, "no backend was available, so this test asserted nothing");
+}
+
+/// A tight chroma sigma must not stop *luma* from being denoised. With one weight per sample,
+/// rejecting a sample for its chroma threw its luma away too, so on RGB (the preview) turning
+/// chroma strength down also switched luma denoising off. Planar YUV never had this: each
+/// plane is weighted on its own. RGB now accumulates luma and chroma separately to match.
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test -- --ignored denoise_gpu"]
+fn denoise_gpu_rgb_tight_chroma_still_denoises_luma() {
+    const AMPLITUDE: f32 = 0.02;
+    // Every reference: independent grey (luma-only) noise, plus a fixed chroma offset that the
+    // tight chroma sigma must reject.
+    let chroma_offset = [0.05, 0.0, -0.05 * 0.2126 / 0.0722];
+    let frame = |f: usize, offset: bool| -> Vec<[f32; 4]> {
+        (0..N).map(|i| {
+            let mut p = base_pixel(i);
+            let n = noise(f, i, AMPLITUDE);
+            for c in 0..3 { p[c] += n + if offset { chroma_offset[c] } else { 0.0 }; }
+            p
+        }).collect()
+    };
+    let scene = Scene { centre: frame(K, false), references: (0..GATHER_FRAMES).filter(|&f| f != K).map(|f| frame(f, true)).collect() };
+    // Luma residual: the green channel carries luma noise one-to-one here and no chroma offset.
+    let green_var = |px: &[[f32; 4]]| -> f32 {
+        let r: Vec<f32> = (0..N).map(|i| px[i][1] - base_pixel(i)[1]).collect();
+        let m = r.iter().sum::<f32>() / N as f32;
+        r.iter().map(|x| (x - m) * (x - m)).sum::<f32>() / N as f32
+    };
+    let before = green_var(&scene.centre);
+
+    let mut ran_any = false;
+    for (name, result) in [("wgpu", run_wgpu_rgb(&scene, 0.5, 0.002)), ("OpenCL", run_opencl_rgb(&scene, 0.5, 0.002))] {
+        if let Some(out) = resolve(name, result) {
+            ran_any = true;
+            let ratio = before / green_var(&out);
+            // Blue carries the chroma offset: it must not have moved towards the references.
+            let blue_moved = (0..N).map(|i| (out[i][2] - scene.centre[i][2]) / chroma_offset[2]).sum::<f32>() / N as f32;
+            println!("{name}: luma variance reduced {ratio:.2}x; chroma moved {blue_moved:.3} towards the rejected offset");
+            assert!(ratio > GATHER_FRAMES as f32 * 0.5, "{name}: luma was not denoised ({ratio:.2}x) - a chroma rejection threw the luma away");
+            assert!(blue_moved.abs() < 0.05, "{name}: the chroma offset should be rejected, moved {blue_moved:.3}");
+        }
+    }
+    assert!(ran_any, "no backend was available, so this test asserted nothing");
+}
+

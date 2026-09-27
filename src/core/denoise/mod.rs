@@ -17,6 +17,15 @@ const SIGMA_MIN: f64 = 0.002;
 /// Sigma at `strength == 1`. Above roughly this, genuine detail starts averaging
 /// away along with the noise.
 const SIGMA_MAX: f64 = 0.050;
+/// Chroma's own range, mapped geometrically. Chroma noise is far smaller than luma noise
+/// (measured on Sony S-Log3 4K: ~0.9 vs ~15 ten-bit codes frame to frame), so sharing luma's
+/// linear range left most of the chroma slider doing nothing: every sigma above ~0.008 gave an
+/// identical render. The response is also steep near zero (sigma 0.0002 / 0.002 / 0.004 left
+/// 100% / 46% / 32% of the chroma noise), which a linear slider bunches into its first few
+/// percent. Geometric spreads it out: 0.5 -> 0.0022, 0.7 -> 0.006 (that clip's saturation),
+/// 1.0 -> 0.025 as headroom for footage with coarser chroma noise.
+const SIGMA_CHROMA_MIN: f64 = 0.0002;
+const SIGMA_CHROMA_MAX: f64 = 0.025;
 
 /// How much memory the reference-frame ring is allowed to occupy, across both
 /// host and GPU. `radius_for_size` shrinks `k` rather than exceed it.
@@ -36,6 +45,19 @@ const WORST_BYTES_PER_PIXEL: usize = 8;
 pub fn rejection_weight(distance: f32, sigma: f32) -> f32 {
     let s = sigma.max(f32::MIN_POSITIVE); // never divide by zero
     (-(distance * distance) / (2.0 * s * s)).exp()
+}
+
+/// The (luma, chroma) weights for one packed RGB reference sample whose difference from the
+/// centre is `d`. The kernels split every RGB sample as `Y*(1,1,1) + c` (the Rec.709 weights
+/// sum to 1, so `c` has zero luma) and gather the two parts separately, luma with the first
+/// weight and chroma with the second - exactly what planar YUV gets by running once per plane.
+/// One shared weight would let a chroma rejection throw the luma away too, which is what made
+/// a low chroma strength switch luma denoising off in the preview. Both kernels mirror this.
+pub fn rgb_gather_weights(d: [f32; 3], sigma_luma: f32, sigma_chroma: f32) -> (f32, f32) {
+    let dy = 0.2126 * d[0] + 0.7152 * d[1] + 0.0722 * d[2];
+    let dcb = (d[2] - dy) / 1.8556;
+    let dcr = (d[0] - dy) / 1.5748;
+    (rejection_weight(dy, sigma_luma), rejection_weight((dcb * dcb + dcr * dcr).sqrt(), sigma_chroma))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +127,16 @@ impl DenoiseSettings {
     /// — `KernelParams::plane_index` runs the kernel once per plane, so a single
     /// invocation only ever needs one of the two.
     pub fn sigma_for_plane(&self, plane_index: i32) -> f32 {
-        let strength = if plane_index == 0 { self.luma_strength } else { self.chroma_strength };
-        (SIGMA_MIN + strength.clamp(MIN_STRENGTH, MAX_STRENGTH) * (SIGMA_MAX - SIGMA_MIN)) as f32
+        if plane_index == 0 { self.luma_sigma() } else { self.chroma_sigma() }
+    }
+    pub fn luma_sigma(&self) -> f32 {
+        (SIGMA_MIN + self.luma_strength.clamp(MIN_STRENGTH, MAX_STRENGTH) * (SIGMA_MAX - SIGMA_MIN)) as f32
+    }
+    /// Also what packed RGB planes (the preview, RGB exports) use for the chroma part of each
+    /// difference - see `KernelParams::denoise_rgb`.
+    pub fn chroma_sigma(&self) -> f32 {
+        let t = self.chroma_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
+        (SIGMA_CHROMA_MIN * (SIGMA_CHROMA_MAX / SIGMA_CHROMA_MIN).powf(t)) as f32
     }
 
     /// The single definition of every scalar's valid range. Both entry points
@@ -254,6 +284,42 @@ mod tests {
             assert!(w < prev, "weight must fall monotonically with distance");
             prev = w;
         }
+    }
+
+    #[test]
+    fn rgb_weight_judges_luma_and_chroma_by_their_own_sigma() {
+        let (loose, tight) = (0.5, 0.002);
+        let chroma_only = [0.05, 0.0, -0.05 * 0.2126 / 0.0722]; // dY = 0
+        let luma_only = [0.05, 0.05, 0.05];                     // dCb = dCr = 0
+        // A chroma-only change is judged on chroma alone, and never costs the luma its weight.
+        let (wl, wc) = rgb_gather_weights(chroma_only, loose, tight);
+        assert!(wc < 1e-6 && wl > 0.999, "chroma change: luma {wl}, chroma {wc}");
+        let (wl, wc) = rgb_gather_weights(chroma_only, tight, loose);
+        assert!(wl > 0.999 && wc > 0.9, "chroma change, loose chroma: luma {wl}, chroma {wc}");
+        // And the reverse.
+        let (wl, wc) = rgb_gather_weights(luma_only, tight, loose);
+        assert!(wl < 1e-6 && wc > 0.999, "luma change: luma {wl}, chroma {wc}");
+        assert_eq!(rgb_gather_weights([0.0; 3], tight, tight), (1.0, 1.0));
+    }
+
+    #[test]
+    fn chroma_range_ends_well_below_luma() {
+        // Measured on Sony S-Log3 4K: every chroma sigma above ~0.008 gave an identical result,
+        // so a slider sharing luma's range (up to 0.05) did nothing over most of its travel.
+        let mut d = DenoiseSettings::default();
+        d.chroma_strength = 1.0;
+        assert!(d.chroma_sigma() <= 0.03, "chroma max {}", d.chroma_sigma());
+        d.chroma_strength = 0.7;
+        assert!((d.chroma_sigma() - 0.006).abs() < 0.001, "the measured saturation point sits at 0.7: {}", d.chroma_sigma());
+        d.chroma_strength = 0.0;
+        assert!(d.chroma_sigma() > 0.0 && d.chroma_sigma() < 0.001, "chroma min {}", d.chroma_sigma());
+        // Geometric: each step multiplies sigma by the same factor, and it never decreases.
+        let at = |s: f64| { let mut d = DenoiseSettings::default(); d.chroma_strength = s; d.chroma_sigma() as f64 };
+        assert!(((at(0.5) / at(0.25)) - (at(0.75) / at(0.5))).abs() < 1e-3);
+        assert!((0..10).all(|i| at(i as f64 / 10.0) < at((i + 1) as f64 / 10.0)));
+        // Planes 1+ use exactly this.
+        assert_eq!(d.sigma_for_plane(1), d.chroma_sigma());
+        assert_eq!(d.sigma_for_plane(2), d.chroma_sigma());
     }
 
     #[test]

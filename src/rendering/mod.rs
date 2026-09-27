@@ -1017,6 +1017,11 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     plane.set_compute_params(compute_params);
                     let render_globals = render_globals.clone();
                     let denoise = stab.denoise.clone();
+                    // Packed RGB planes are the ones dispatched with no YUV channel indices
+                    // (RGBA8/16, RGB8/16). They hold luma and chroma in one sample, so the
+                    // kernel splits them itself (`denoise_rgb`); every other plane is one
+                    // component class and takes its sigma by plane index.
+                    let packed_rgb = { let yuvi: &[usize] = &$yuvi; yuvi.is_empty() && $t::COUNT >= 3 };
                     $planes.borrow_mut().push(Box::new(move |timestamp_us: i64, in_frame_data: &Video, references: &[&Video], reference_timestamps: &[i64], out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
                         let mut g = render_globals.borrow_mut();
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
@@ -1050,7 +1055,15 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                             transform.kernel_params.max_pixel_value = 1.0;
                         }
                         transform.kernel_params.plane_index = plane_index as i32;
-                        transform.kernel_params.denoise_sigma = denoise.read().sigma_for_plane(plane_index as i32);
+                        {
+                            let denoise = denoise.read();
+                            if packed_rgb {
+                                transform.kernel_params.denoise_sigma = denoise.luma_sigma();
+                                transform.kernel_params.denoise_rgb = [denoise.chroma_sigma(), 0.0, 0.0, 0.0];
+                            } else {
+                                transform.kernel_params.denoise_sigma = denoise.sigma_for_plane(plane_index as i32);
+                            }
+                        }
                         if fill_with_background {
                             transform.kernel_params.flags |= KernelParamsFlags::FILL_WITH_BACKGROUND.bits();
                         }

@@ -85,6 +85,7 @@ pub struct KernelParams {
     pub color_params_1:           Vec4, // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     pub color_params_2:           Vec4, // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
     pub color_params_3:           Vec4, // 16 - lut_domain_min, lut_domain_max, unused, unused
+    pub denoise_rgb:              Vec4, // 16 - chroma_sigma (0: plane is not RGB), unused, unused, unused
 }
 
 // #[inline] pub fn fast_floor(x: f32) -> i32 { x as i32 }

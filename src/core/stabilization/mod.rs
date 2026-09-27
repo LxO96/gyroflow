@@ -208,6 +208,10 @@ pub struct KernelParams {
     pub color_params_1:           [f32; 4], // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     pub color_params_2:           [f32; 4], // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
     pub color_params_3:           [f32; 4], // 16 - lut_domain_min, lut_domain_max, shadows, highlights
+    /// `x`: when the plane is packed RGB, the sigma for the *chroma* part of each difference,
+    /// in the same normalised units as `denoise_sigma` (which then covers the luma part).
+    /// `0`: the plane is not RGB, and `denoise_sigma` applies to every channel. `yzw` unused.
+    pub denoise_rgb:              [f32; 4], // 16 - chroma_sigma, unused, unused, unused
 }
 unsafe impl bytemuck::Zeroable for KernelParams {}
 unsafe impl bytemuck::Pod for KernelParams {}
@@ -224,7 +228,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<KernelParams>() % 16, 0, "struct must stay 16-byte aligned");
         assert_eq!(std::mem::align_of::<KernelParams>(), 4);
         // Pinned so a new field cannot be added to one copy and not the other four.
-        assert_eq!(std::mem::size_of::<KernelParams>(), 464);
+        assert_eq!(std::mem::size_of::<KernelParams>(), 480);
     }
 }
 

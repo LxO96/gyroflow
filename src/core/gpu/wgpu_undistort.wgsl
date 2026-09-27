@@ -52,6 +52,7 @@ struct KernelParams {
     color_params_1:           vec4<f32>, // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     color_params_2:           vec4<f32>, // 16 - wb_gains.r, wb_gains.g, wb_gains.b, lut_size
     color_params_3:           vec4<f32>, // 16 - domain_min, domain_max, unused, unused
+    denoise_rgb:              vec4<f32>, // 16 - chroma_sigma (0: plane is not RGB), unused, unused, unused
 }
 
 @group(0) @binding(0) @fragment var<uniform> params: KernelParams;
@@ -765,9 +766,25 @@ fn gather_denoised(position: vec2<f32>, centre: vec4<f32>) -> vec4<f32> {
 
     let sigma = params.denoise_sigma * params.max_pixel_value;
     let inv_2sigma_sq = 1.0 / (2.0 * sigma * sigma);
+    // Packed RGB carries luma and chroma in one sample. It is split as rgb = Y*(1,1,1) + c,
+    // where c has zero luma (the Rec.709 weights sum to 1), and the two parts are gathered
+    // separately with their own weights: luma judged on its difference against `denoise_sigma`,
+    // chroma on its Cb/Cr difference against `denoise_rgb.x`. That is exactly what the planar
+    // YUV path gets by running once per plane - one shared weight would let a chroma rejection
+    // throw the luma away too. Mirrors `denoise::rgb_gather_weights`.
+    let sigma_c = params.denoise_rgb.x * params.max_pixel_value;
+    let rgb = sigma_c > 0.0 && pix_element_count >= 3;
+    var inv_2sigma_c_sq = 0.0;
+    if (rgb) { inv_2sigma_c_sq = 1.0 / (2.0 * sigma_c * sigma_c); }
 
     var acc: vec4<f32> = centre;
     var weight_sum: f32 = 1.0;
+
+    let y_centre = 0.2126 * centre.x + 0.7152 * centre.y + 0.0722 * centre.z;
+    var acc_luma = y_centre;
+    var wsum_luma = 1.0;
+    var acc_chroma = vec3<f32>(centre.x - y_centre, centre.y - y_centre, centre.z - y_centre);
+    var wsum_chroma = 1.0;
 
     let block = u32(params.matrix_count) * 14u;
     for (var f: u32 = 1u; f < count; f = f + 1u) {
@@ -791,17 +808,34 @@ fn gather_denoised(position: vec2<f32>, centre: vec4<f32>) -> vec4<f32> {
         // its NEIGHBOUR differs. The output write at the end of this file gates its
         // stores the same way, for the same reason. `pix_element_count` is a pipeline
         // constant, so these branches fold away at compile time.
-        var dist_sq = 0.0;
-        if (pix_element_count >= 1) { dist_sq += d.x * d.x; }
-        if (pix_element_count >= 2) { dist_sq += d.y * d.y; }
-        if (pix_element_count >= 3) { dist_sq += d.z * d.z; }
-        if (pix_element_count >= 4) { dist_sq += d.w * d.w; }
-        let w = exp(-dist_sq * inv_2sigma_sq);
-
-        acc = acc + s * w;
-        weight_sum = weight_sum + w;
+        if (rgb) {
+            let y_s = 0.2126 * s.x + 0.7152 * s.y + 0.0722 * s.z;
+            let dy  = y_s - y_centre;
+            let dcb = (d.z - dy) / 1.8556;
+            let dcr = (d.x - dy) / 1.5748;
+            let w_luma   = exp(-dy * dy * inv_2sigma_sq);
+            let w_chroma = exp(-(dcb * dcb + dcr * dcr) * inv_2sigma_c_sq);
+            acc_luma = acc_luma + y_s * w_luma;
+            wsum_luma = wsum_luma + w_luma;
+            acc_chroma = acc_chroma + vec3<f32>(s.x - y_s, s.y - y_s, s.z - y_s) * w_chroma;
+            wsum_chroma = wsum_chroma + w_chroma;
+        } else {
+            var dist_sq = 0.0;
+            if (pix_element_count >= 1) { dist_sq += d.x * d.x; }
+            if (pix_element_count >= 2) { dist_sq += d.y * d.y; }
+            if (pix_element_count >= 3) { dist_sq += d.z * d.z; }
+            if (pix_element_count >= 4) { dist_sq += d.w * d.w; }
+            let w = exp(-dist_sq * inv_2sigma_sq);
+            acc = acc + s * w;
+            weight_sum = weight_sum + w;
+        }
     }
 
+    if (rgb) {
+        let y = acc_luma / wsum_luma;
+        let c = acc_chroma / wsum_chroma;
+        return vec4<f32>(c.x + y, c.y + y, c.z + y, centre.w); // alpha is not noise; keep the centre's
+    }
     return acc / weight_sum;
 }
 

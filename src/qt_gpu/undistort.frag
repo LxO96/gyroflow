@@ -57,6 +57,7 @@ layout(std140, binding = 2) uniform KernelParams {
     vec4 color_params_1;            // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     vec4 color_params_2;            // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
     vec4 color_params_3;            // 16 - lut_domain_min, lut_domain_max, unused, unused
+    vec4 denoise_rgb;               // 16 - chroma_sigma (0: plane is not RGB), unused, unused, unused
 } params;
 
 LENS_MODEL_FUNCTIONS;

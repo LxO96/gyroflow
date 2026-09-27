@@ -54,6 +54,7 @@ typedef struct {
     float4 color_params_1;           // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     float4 color_params_2;           // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
     float4 color_params_3;           // 16 - lut_domain_min, lut_domain_max, unused, unused
+    float4 denoise_rgb;              // 16 - chroma_sigma (0: plane is not RGB), unused, unused, unused
 } KernelParams;
 
 #if INTERPOLATION == 2 // Bilinear
@@ -799,9 +800,25 @@ DATA_TYPEF gather_denoised(float2 position, DATA_TYPEF centre, __global const uc
 
     float sigma = params->denoise_sigma * params->max_pixel_value;
     float inv_2sigma_sq = 1.0f / (2.0f * sigma * sigma);
+    // Packed RGB carries luma and chroma in one sample. It is split as rgb = Y*(1,1,1) + c,
+    // where c has zero luma (the Rec.709 weights sum to 1), and the two parts are gathered
+    // separately with their own weights: luma judged on its difference against `denoise_sigma`,
+    // chroma on its Cb/Cr difference against `denoise_rgb.x`. That is exactly what the planar
+    // YUV path gets by running once per plane - one shared weight would let a chroma rejection
+    // throw the luma away too. Mirrors `denoise::rgb_gather_weights`.
+    float sigma_c = params->denoise_rgb.x * params->max_pixel_value;
+    bool rgb = sigma_c > 0.0f;
+    float inv_2sigma_c_sq = rgb? 1.0f / (2.0f * sigma_c * sigma_c) : 0.0f;
 
     DATA_TYPEF acc = centre;
     float weight_sum = 1.0f;
+
+    float4 centre4 = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+    *(DATA_TYPEF *)&centre4 = centre;
+    float y_centre = 0.2126f * centre4.x + 0.7152f * centre4.y + 0.0722f * centre4.z;
+    float acc_luma = y_centre, wsum_luma = 1.0f;
+    float4 acc_chroma = centre4 - (float4)(y_centre, y_centre, y_centre, 0.0f);
+    float wsum_chroma = 1.0f;
 
     int block = params->matrix_count * 14;
     for (int f = 1; f < count; f++) {
@@ -822,13 +839,32 @@ DATA_TYPEF gather_denoised(float2 position, DATA_TYPEF centre, __global const uc
         DATA_TYPEF d = s - centre;
         float4 d4 = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
         *(DATA_TYPEF *)&d4 = d;
-        float dist_sq = dot(d4, d4);
-        float w = exp(-dist_sq * inv_2sigma_sq);
-
-        acc += s * w;
-        weight_sum += w;
+        if (rgb) {
+            float4 s4 = centre4 + d4;
+            float y_s = 0.2126f * s4.x + 0.7152f * s4.y + 0.0722f * s4.z;
+            float dy  = y_s - y_centre;
+            float dcb = (d4.z - dy) / 1.8556f;
+            float dcr = (d4.x - dy) / 1.5748f;
+            float w_luma   = exp(-dy * dy * inv_2sigma_sq);
+            float w_chroma = exp(-(dcb * dcb + dcr * dcr) * inv_2sigma_c_sq);
+            acc_luma   += y_s * w_luma;
+            wsum_luma  += w_luma;
+            acc_chroma += (s4 - (float4)(y_s, y_s, y_s, 0.0f)) * w_chroma;
+            wsum_chroma += w_chroma;
+        } else {
+            float w = exp(-dot(d4, d4) * inv_2sigma_sq);
+            acc += s * w;
+            weight_sum += w;
+        }
     }
 
+    if (rgb) {
+        float y = acc_luma / wsum_luma;
+        float4 r = acc_chroma / wsum_chroma + (float4)(y, y, y, 0.0f);
+        r.w = centre4.w; // alpha is not noise; keep the centre's
+        DATA_TYPEF out = *(DATA_TYPEF *)&r;
+        return out;
+    }
     return acc / weight_sum;
 }
 

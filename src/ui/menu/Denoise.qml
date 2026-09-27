@@ -123,7 +123,7 @@ MenuItem {
 
     Label {
         text: qsTr("Chroma strength");
-        tooltip: qsTr("The same threshold for the colour planes. Chroma noise is usually coarser than luma noise, so this often wants to sit higher than Luma strength.");
+        tooltip: qsTr("How readily a neighbouring frame's colour is allowed to differ from this frame's and still be averaged in. Independent of Luma strength: colour noise is much finer than brightness noise, so it has its own scale. Higher removes more colour noise; too high smears colour across moving edges.");
         Column {
             width: parent.width;
             spacing: 3 * dpiScale;

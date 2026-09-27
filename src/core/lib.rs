@@ -948,9 +948,15 @@ impl StabilizationManager {
                 // its matrices from the transform, so the two must be built together or the
                 // kernel walks off the end of the matrix buffer.
                 let mut transform = undist.get_frame_transform_with_references::<T>(timestamp_us, &reference_timestamps, frame, buffers);
-                // Preview pixels are a single interleaved RGBA plane, so plane 0 - the luma
-                // strength - is the only sigma that applies.
-                transform.kernel_params.denoise_sigma = self.denoise.read().sigma_for_plane(0);
+                // Preview pixels are one interleaved RGBA plane, so luma and chroma are split
+                // per sample in the kernel (`denoise_rgb`) rather than per plane. Before that,
+                // only the luma sigma reached the preview and chroma strength did nothing.
+                let denoise = self.denoise.read();
+                transform.kernel_params.denoise_sigma = denoise.luma_sigma();
+                if T::COUNT >= 3 {
+                    transform.kernel_params.denoise_rgb = [denoise.chroma_sigma(), 0.0, 0.0, 0.0];
+                }
+                drop(denoise);
                 undist.process_pixels::<T>(timestamp_us, frame, buffers, Some(&transform))
             }
         } else {
