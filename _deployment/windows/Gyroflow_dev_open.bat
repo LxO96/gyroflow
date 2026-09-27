@@ -22,7 +22,9 @@ rem Repo root, derived from this script's own location (_deployment\windows\..\.
 set "ROOT=%~dp0..\.."
 
 for /d %%D in ("%ROOT%\ext\6.7.3\msvc*") do set "QTBIN=%%D\bin"
-set "FFBIN=%ROOT%\ext\ffmpeg-8.1-windows-desktop-vs2026-gpl-lite\bin"
+rem Keep this in step with FFmpeg in _scripts/common.just - an old ext\ffmpeg-* directory is
+rem left behind by an upgrade, so this names the version rather than globbing for one.
+set "FFBIN=%ROOT%\ext\ffmpeg-9.0-windows-desktop-vs2026-gpl-lite\bin"
 set "CVBIN=%ROOT%\ext\vcpkg\installed\x64-windows\bin"
 
 set "PATH=%QTBIN%;%FFBIN%;%CVBIN%;%PATH%"
