@@ -828,7 +828,7 @@ mod preview_toggle_tests {
         assert_eq!(&t.matrices[0][9..], &[0.0; 5], "IBIS/OIS shift survived the bypass");
         assert_eq!(p.f, [1.0, 1.0]);
         assert_eq!(p.c, [W as f32 / 2.0, H as f32 / 2.0]);
-        assert_eq!(p.k, [0.0; 12], "distortion coefficients survived the bypass");
+        assert_eq!(p.k, [0.0; 24], "distortion coefficients survived the bypass");
         assert_eq!(p.fov, 1.0);
         assert_eq!(p.r_limit, 0.0);
         assert_eq!(p.lens_correction_amount, 1.0, "anything below 1 re-enables the add-distortion-back branch");

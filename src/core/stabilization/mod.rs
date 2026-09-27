@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<KernelParams>() % 16, 0, "struct must stay 16-byte aligned");
         assert_eq!(std::mem::align_of::<KernelParams>(), 4);
         // Pinned so a new field cannot be added to one copy and not the other four.
-        assert_eq!(std::mem::size_of::<KernelParams>(), 416);
+        assert_eq!(std::mem::size_of::<KernelParams>(), 464);
     }
 }
 
