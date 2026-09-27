@@ -955,6 +955,8 @@ impl StabilizationManager {
                 transform.kernel_params.denoise_sigma = denoise.luma_sigma();
                 if T::COUNT >= 3 {
                     transform.kernel_params.denoise_rgb = [denoise.chroma_sigma(), 0.0, 0.0, 0.0];
+                    // Paused preview only (this path has references), matching the temporal pass.
+                    transform.chroma_filter = denoise.chroma_filter_params(denoise::chroma_filter::MODE_RGB, transform.kernel_params.max_pixel_value);
                 }
                 drop(denoise);
                 undist.process_pixels::<T>(timestamp_us, frame, buffers, Some(&transform))
