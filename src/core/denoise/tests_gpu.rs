@@ -778,3 +778,53 @@ fn chroma_gpu_wgpu_matches_the_reference_and_opencl() {
     let zero = run_wgpu_chroma_rgb(&scene, 0.0).unwrap();
     for i in 0..N { assert_eq!(zero[i], scene[i], "wgpu pixel {i} changed with amount 0"); }
 }
+
+/// A clipped saturated highlight on a 16-bit integer RGBA output (wgpu `Rgba16Uint`).
+/// RGB mode is not a convex combination, so pixels at r = max whose same-luma neighbours have
+/// a slightly larger `r - Y` come out above max. Unclamped, that value wrapped in the 16-bit
+/// target and a clipped red light turned into dark specks.
+fn run_wgpu_chroma_rgba16(px: &[[u16; 4]], amount: f32) -> Result<Vec<[u16; 4]>, String> {
+    if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { return Err("UNAVAILABLE: no usable wgpu adapter".into()); }
+    let mut itm = identity_transform(0, 0.02);
+    let p = &mut itm.kernel_params;
+    p.bytes_per_pixel = 8; p.stride = W * 8; p.output_stride = W * 8;
+    p.max_pixel_value = 65535.0; p.pixel_value_limit = 65535.0;
+    p.translation2d = [-0.5, -0.5];
+    itm.chroma_filter = ChromaFilterParams { mode: chroma_filter::MODE_RGB, amount, sigma_y: chroma_filter::SIGMA_LUMA, max_value: 65535.0, ..Default::default() };
+    let bytes = |px: &[[u16; 4]]| -> Vec<u8> { px.iter().flat_map(|p| p.iter().flat_map(|v| v.to_le_bytes())).collect() };
+    fn d(buf: &mut [u8]) -> BufferDescription<'_> { BufferDescription { size: (W as usize, H as usize, (W * 8) as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: buf }, texture_copy: false } }
+    let mut input = bytes(px);
+    let mut output = vec![0u8; (W * 8 * H) as usize];
+    let mut buffers = Buffers { input: d(&mut input), output: d(&mut output), references: vec![], guide: None };
+    let inst = crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, crate::stabilization::RGBA16::wgpu_format().ok_or("no format")?, DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("WgpuWrapper::new failed: {e:?}"))?;
+    if !inst.undistort_image(&mut buffers, &itm, &[]) { return Err("undistort_image returned false".into()); }
+    drop(buffers);
+    Ok(output.chunks_exact(8).map(|c| [0, 1, 2, 3].map(|i| u16::from_le_bytes([c[i * 2], c[i * 2 + 1]]))).collect())
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_clipped_highlights_do_not_wrap_on_16bit_integer_output() {
+    // Clipped red everywhere; every 4th pixel in both directions has G = 0.50, the rest 0.49,
+    // so those pixels' neighbours are within the luma sigma but carry more red chroma.
+    let px: Vec<[u16; 4]> = (0..N).map(|i| {
+        let (x, y) = (i % W as usize, i / W as usize);
+        let g = if x % 4 == 0 && y % 4 == 0 { 0.50 } else { 0.49 };
+        [65535, (g * 65535.0) as u16, 32768, 65535]
+    }).collect();
+    let out = resolve16(run_wgpu_chroma_rgba16(&px, 1.0));
+    if let Some(out) = out {
+        let min_r = out.iter().map(|p| p[0]).min().unwrap();
+        println!("wgpu RGBA16: lowest red in a fully clipped-red frame {min_r}");
+        assert!(min_r > 60000, "clipped red wrapped around to {min_r}");
+    }
+}
+
+fn resolve16(r: Result<Vec<[u16; 4]>, String>) -> Option<Vec<[u16; 4]>> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) if e.starts_with("UNAVAILABLE") => { println!("SKIPPED: {e}"); None }
+        Err(e) => panic!("run failed: {e}"),
+    }
+}

@@ -67,7 +67,10 @@ __kernel void chroma_filter(__global const uchar *src, __global uchar *dst, __gl
     }
     float4 out = v0 + p->amount * (acc / wsum - v0);
     if (rgb) { out.xyz += g0; out.w = c0.w; }
-    out = out * p->max_value + ROUND_OFFSET;
+    // RGB mode is not a convex combination: a clipped channel can land above full scale.
+    // `_sat` conversions would catch it for integers, but float outputs would not. Mirrors
+    // the Rust reference.
+    out = clamp(out, 0.0f, 1.0f) * p->max_value + ROUND_OFFSET;
     DATA_TYPEF o = *(DATA_TYPEF *)&out;
     *(__global DATA_TYPE *)(dst + y * p->stride + x * PIXEL_BYTES) = DATA_CONVERT(o);
 }

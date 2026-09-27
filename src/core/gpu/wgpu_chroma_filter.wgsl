@@ -69,6 +69,8 @@ fn cf_fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<SCAL
     }
     var out = v0 + p.amount * (acc / wsum - v0);
     if (rgb) { out = vec4<f32>(out.x + g0, out.y + g0, out.z + g0, c0.w); }
-    out = out * p.max_value;
+    // RGB mode is not a convex combination: a clipped channel can land above full scale, which
+    // an integer target (Rgba16Uint) may wrap to near zero. Mirrors the Rust reference.
+    out = clamp(out, vec4<f32>(0.0), vec4<f32>(1.0)) * p.max_value;
     return vec4<SCALAR>(CF_ROUND(out));
 }

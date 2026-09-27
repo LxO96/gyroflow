@@ -115,7 +115,9 @@ pub fn reference_rgb(pixels: &[f32], w: usize, h: usize, channels: usize, amount
             }
             for c in 0..3 {
                 let c0 = pixels[i0 * channels + c] - y0;
-                out[i0 * channels + c] = y0 + c0 + amount * (acc[c] / wsum - c0);
+                // Clamped: RGB mode is not a convex combination, so a clipped channel can come
+                // out above full scale (see `rgb_output_never_exceeds_full_scale`).
+                out[i0 * channels + c] = (y0 + c0 + amount * (acc[c] / wsum - c0)).clamp(0.0, 1.0);
             }
         }
     }
@@ -195,6 +197,22 @@ mod tests {
         // And the chroma did get smoother.
         let cb = |v: &[f32]| v.chunks_exact(4).map(|p| p[2] - y(p)).collect::<Vec<_>>();
         assert!(std(&cb(&out)) < std(&cb(&px)) / 2.0);
+    }
+
+    #[test]
+    fn rgb_output_never_exceeds_full_scale() {
+        // Clipped red everywhere; every 4th pixel both ways has G = 0.50, the rest 0.49. Those
+        // pixels' same-luma neighbours carry more red chroma, and since RGB mode is not a
+        // convex combination their red lands above 1.0 unless clamped. On a 16-bit integer
+        // target that value may wrap to near zero (driver-dependent).
+        let (w, h) = (32, 32);
+        let px: Vec<f32> = (0..w * h).flat_map(|i| {
+            let g = if (i % w) % 4 == 0 && (i / w) % 4 == 0 { 0.50 } else { 0.49 };
+            [1.0, g, 0.5, 1.0]
+        }).collect();
+        let out = reference_rgb(&px, w, h, 4, 1.0);
+        let max = out.iter().copied().fold(f32::MIN, f32::max);
+        assert!(max <= 1.0, "output reached {max}");
     }
 
     #[test]
