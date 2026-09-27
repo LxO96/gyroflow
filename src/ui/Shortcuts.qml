@@ -104,6 +104,12 @@ Item {
         onActivated: videoArea.scopesBtn.checked = !videoArea.scopesBtn.checked;
     }
 
+    // Preview zoom
+    Shortcut { sequence: "Ctrl+0"; onActivated: videoArea.zoomFit(); }
+    Shortcut { sequence: "Ctrl+1"; onActivated: videoArea.zoom100(); }
+    Shortcut { sequences: ["Ctrl+=", "Ctrl++"]; onActivated: videoArea.zoomStep(1); }
+    Shortcut { sequence: "Ctrl+-"; onActivated: videoArea.zoomStep(-1); }
+
     // Stabilization overview on/off
     Shortcut {
         sequence: "d";

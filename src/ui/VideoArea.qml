@@ -8,6 +8,7 @@ import Gyroflow
 import "components/"
 import "menu/" as Menu
 import "Util.js" as Util
+import "Zoom.js" as Zoom
 
 Item {
     id: root;
@@ -22,6 +23,34 @@ Item {
     property alias stabEnabledBtn: stabEnabledBtn;
     property alias fovOverviewBtn: fovOverviewBtn;
     property alias scopesBtn: scopesBtn;
+
+    // Preview zoom (Zoom.js). 1 = fit. The video item itself grows inside the clipped vidParent.
+    // Its texture is always the "Preview resolution" size, so up to 100% at "Full" this shows
+    // real source detail, and zooming costs no extra rendering.
+    property real zoom: 1;
+    property real zoomU: 0.5; // image point (0..1) at the centre of the view
+    property real zoomV: 0.5;
+    readonly property real zoomDpr: Screen.devicePixelRatio;
+    readonly property real zoomMax: Zoom.maxZoom(vidParent.width, zoomDpr, vidParent.orgW);
+    // Clamped at use, not on write: a larger window lowers the cap under an existing zoom.
+    readonly property real zoomEff: Zoom.clampZoom(zoom, zoomMax);
+    readonly property int zoomPercent: Math.round(Zoom.pixelRatio(zoomEff, vidParent.width, zoomDpr, vidParent.orgW) * 100);
+
+    // (cx, cy): the view point to zoom around, in vidParent's coordinates.
+    function setZoom(z: real, cx: real, cy: real): void {
+        let z1 = Zoom.clampZoom(z, zoomMax);
+        if (z1 < 1.02) z1 = 1; // snap, so scrolling back out lands exactly on fit
+        zoomU = Zoom.zoomAround(vidParent.width,  zoomEff, zoomU, z1, cx);
+        zoomV = Zoom.zoomAround(vidParent.height, zoomEff, zoomV, z1, cy);
+        zoom = z1;
+    }
+    function zoomStep(direction: int): void {
+        setZoom(Zoom.nextStop(zoomEff, direction, vidParent.width, zoomDpr, vidParent.orgW, zoomMax), vidParent.width / 2, vidParent.height / 2);
+    }
+    function zoom100(): void {
+        setZoom(Zoom.zoomForPixelRatio(1, vidParent.width, zoomDpr, vidParent.orgW), vidParent.width / 2, vidParent.height / 2);
+    }
+    function zoomFit(): void { zoom = 1; zoomU = 0.5; zoomV = 0.5; }
     property alias queue: queue.item;
     property alias statistics: statistics;
     property alias infoMessages: infoMessages;
@@ -645,6 +674,7 @@ Item {
                 width:  (ratio * h) > w ? w : (ratio * h)
                 height: (ratio * h) > w ? (w / ratio) : h
                 opacity: da.containsDrag? 0.5 : 1.0;
+                clip: root.zoomEff > 1;
 
                 /*Image {
                     // Transparency grid
@@ -658,7 +688,10 @@ Item {
                     visible: opacity > 0;
                     opacity: loaded? 1 : 0;
                     Ease on opacity { }
-                    anchors.fill: parent;
+                    x: Zoom.panOffset(vidParent.width,  root.zoomEff, root.zoomU);
+                    y: Zoom.panOffset(vidParent.height, root.zoomEff, root.zoomV);
+                    width:  vidParent.width  * root.zoomEff;
+                    height: vidParent.height * root.zoomEff;
                     property bool loaded: false;
 
                     property bool stabEnabled: stabEnabledBtn.checked;
@@ -718,6 +751,7 @@ Item {
                         vidInfo.loader = false;
                         timeline.resetTrim();
                         timeline.resetZoom();
+                        root.zoomFit();
 
                         controller.video_file_loaded(vid);
                         window.motionData.filename = "";
@@ -896,6 +930,57 @@ Item {
                         border.width: 1 * dpiScale;
                     }
                 }
+                // Preview zoom: Ctrl+scroll zooms around the cursor, dragging pans while zoomed.
+                // Ctrl is required so a plain scroll over the video stays free for everything else.
+                WheelHandler {
+                    target: null;
+                    acceptedModifiers: Qt.ControlModifier;
+                    enabled: vid.loaded;
+                    onWheel: (event) => {
+                        const steps = event.angleDelta.y / 120;
+                        if (steps) root.setZoom(root.zoomEff * Math.pow(1.25, steps), point.position.x, point.position.y);
+                    }
+                }
+                DragHandler {
+                    target: null;
+                    // Off while picking white balance: that drag draws the sampling rectangle.
+                    enabled: vid.loaded && root.zoomEff > 1 && !root.wbPickArmed;
+                    cursorShape: active? Qt.ClosedHandCursor : Qt.OpenHandCursor;
+                    property point last: Qt.point(0, 0);
+                    onActiveChanged: last = Qt.point(0, 0);
+                    onTranslationChanged: {
+                        const dx = translation.x - last.x, dy = translation.y - last.y;
+                        last = translation;
+                        root.zoomU = Zoom.dragTo(vidParent.width,  root.zoomEff, root.zoomU, dx);
+                        root.zoomV = Zoom.dragTo(vidParent.height, root.zoomEff, root.zoomV, dy);
+                    }
+                }
+                Rectangle {
+                    visible: root.zoomEff > 1;
+                    anchors.left: parent.left;
+                    anchors.bottom: parent.bottom;
+                    anchors.margins: 8 * dpiScale;
+                    width: zoomBadgeText.width + 16 * dpiScale;
+                    height: zoomBadgeText.height + 8 * dpiScale;
+                    radius: 4 * dpiScale;
+                    color: "#c0101010";
+                    border.color: "#40ffffff";
+                    border.width: 1;
+                    BasicText {
+                        id: zoomBadgeText;
+                        anchors.centerIn: parent;
+                        leftPadding: 0;
+                        font.pixelSize: 11 * dpiScale;
+                        text: qsTr("%1% · Fit").arg(root.zoomPercent);
+                    }
+                    MouseArea {
+                        anchors.fill: parent;
+                        cursorShape: Qt.PointingHandCursor;
+                        preventStealing: true;
+                        onClicked: root.zoomFit();
+                    }
+                }
+
                 // Video scopes of the *displayed* frame - the graded, stabilized preview, which
                 // is what the export will look like. See ScopeView.rs for where the pixels come
                 // from. A sibling of `vid`, not a child, so `vid.grabToImage` (the white balance
@@ -909,10 +994,10 @@ Item {
                     onKindChanged: if (restored) settings.setValue("scopeKind", kind);
                     Component.onCompleted: { kind = +settings.value("scopeKind", 0); restored = true; }
 
-                    anchors.top: vid.top;
-                    anchors.right: vid.right;
+                    anchors.top: parent.top;
+                    anchors.right: parent.right;
                     anchors.margins: 8 * dpiScale;
-                    width: Math.min(vid.width * 0.45, 360 * dpiScale);
+                    width: Math.min(parent.width * 0.45, 360 * dpiScale);
                     height: scopeHeader.height + scopeView.height + 8 * dpiScale;
                     color: "#c0101010";
                     border.color: "#40ffffff";
@@ -921,7 +1006,9 @@ Item {
 
                     // Clicks on the scope are not clicks on the video: without this, a quick
                     // double click on the tabs would toggle full screen.
-                    MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons; }
+                    // `preventStealing`: the zoom pan's DragHandler would otherwise take over a
+                    // drag that starts here.
+                    MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons; preventStealing: true; }
 
                     Row {
                         id: scopeHeader;
