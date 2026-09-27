@@ -23,6 +23,20 @@ pub enum TextureResult {
     /// away instead of after the failure threshold.
     UsePixels = 2,
 }
+
+/// (frame, timestamp_ms, width, height, stride, pixels)
+type ObserveFrameCb = Box<dyn Fn(u32, f64, u32, u32, u32, &[u8])>;
+
+/// When `onObserveFrame` runs. The values are the `Observe*` constants in MDKPlayer.h.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObserveMode {
+    Off = 0,
+    /// Only frames displayed while paused.
+    Paused = 1,
+    /// Paused frames, plus playing frames at most once per interval.
+    Always = 2,
+}
 type ReadyForProcessingCb = Box<dyn Fn() -> bool>;
 type ResizeCb = Box<dyn Fn(u32, u32)>;
 
@@ -113,6 +127,7 @@ pub struct MDKVideoItem {
     m_processPixelsCb: Option<ProcessPixelsCb>,
     m_processTextureCb: Option<ProcessTextureCb>,
     m_readyForProcessingCb: Option<ReadyForProcessingCb>,
+    m_observeFrameCb: Option<ObserveFrameCb>,
     m_resizeCb: Option<ResizeCb>
 }
 
@@ -140,6 +155,26 @@ impl MDKVideoItem {
     }
     pub fn onResize(&mut self, cb: ResizeCb) {
         self.m_resizeCb = Some(cb);
+    }
+    /// Receives each final displayed frame as RGBA8 (premultiplied, alpha is opaque for video),
+    /// read back from the GPU, while `setObserveFrameMode` is not `Off`. The slice is only valid
+    /// during the call - copy what you need. Runs on the render thread.
+    pub fn onObserveFrame(&mut self, cb: ObserveFrameCb) {
+        self.m_observeFrameCb = Some(cb);
+        let player = &self.m_player;
+        cpp!(unsafe [player as "MDKPlayerWrapper*"] {
+            player->mdkplayer->setObserveFrameCallback(observeFrameCb);
+        });
+    }
+    /// `playing_interval_ms` throttles observation during playback only; paused frames are
+    /// always observed. Redraws, so enabling it while paused delivers the current frame.
+    pub fn setObserveFrameMode(&mut self, mode: ObserveMode, playing_interval_ms: u32) {
+        let player = &self.m_player;
+        let mode = mode as u32;
+        cpp!(unsafe [player as "MDKPlayerWrapper*", mode as "uint32_t", playing_interval_ms as "uint32_t"] {
+            player->mdkplayer->setObserveFrameMode(mode, playing_interval_ms);
+        });
+        self.forceRedraw();
     }
 
     pub fn play (&mut self) { self.m_player.play(); }
@@ -242,6 +277,11 @@ impl MDKVideoItem {
             TextureResult::NotProcessed as u32
         }
     }
+    fn observe_frame(&mut self, frame: u32, timestamp: f64, width: u32, height: u32, stride: u32, pixels: &[u8]) {
+        if let Some(ref proc) = self.m_observeFrameCb {
+            proc(frame, timestamp, width, height, stride, pixels);
+        }
+    }
     fn ready_for_processing(&mut self) -> bool {
         if let Some(ref mut proc) = self.m_readyForProcessingCb {
             proc()
@@ -311,6 +351,21 @@ cpp! {{
             let mut vid_item = unsafe { &mut *vid_item.as_ptr() }; // vid_item.borrow_mut()
 
             vid_item.process_texture(frame, timestamp, width, height, backend_id, ptr1, ptr2, ptr3, ptr4, ptr5)
+        });
+    };
+    void observeFrameCb(QQuickItem *item, uint32_t frame, double timestamp, const QImage &img) {
+        uint32_t width = img.width();
+        uint32_t height = img.height();
+        uint32_t stride = img.bytesPerLine();
+        const uint8_t *bits = img.constBits();
+        uint64_t bitsSize = img.sizeInBytes();
+        rust!(Rust_MDKPlayerItem_observeFrame [item: *mut std::os::raw::c_void as "QQuickItem *", frame: u32 as "uint32_t", timestamp: f64 as "double", width: u32 as "uint32_t", height: u32 as "uint32_t", stride: u32 as "uint32_t", bitsSize: u64 as "uint64_t", bits: *const u8 as "const uint8_t *"] {
+            let slice = unsafe { std::slice::from_raw_parts(bits, bitsSize as usize) };
+
+            let mut vid_item = MDKVideoItem::get_from_cpp(item);
+            let mut vid_item = unsafe { &mut *vid_item.as_ptr() }; // vid_item.borrow_mut()
+
+            vid_item.observe_frame(frame, timestamp, width, height, stride, slice);
         });
     };
     bool readyForProcessingCb(QQuickItem *item) {

@@ -24,6 +24,12 @@ enum : uint32_t { TextureNotProcessed = 0, TextureProcessed = 1, TextureUsePixel
 typedef std::function<uint32_t(QQuickItem *item, uint32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t backend_id, uint64_t ptr1, uint64_t ptr2, uint64_t ptr3, uint64_t ptr4, uint64_t ptr5)> ProcessTextureCb;
 typedef std::function<QImage(QQuickItem *item, uint32_t frame, double timestamp, const QImage &img)> ProcessPixelsCb;
 typedef std::function<bool(QQuickItem *item)> ReadyForProcessingCb;
+// Receives the *final* displayed frame (after the texture or pixel callback), read back to the
+// CPU. Only runs while an observer mode is set, so a hidden consumer costs nothing.
+typedef std::function<void(QQuickItem *item, uint32_t frame, double timestamp, const QImage &img)> ObserveFrameCb;
+// When the observe callback runs. Paused renders are rare and each one may be a changed
+// setting on the same frame, so they are never throttled; playback is throttled.
+enum : uint32_t { ObserveOff = 0, ObservePaused = 1, ObserveAlways = 2 };
 typedef std::function<bool(int32_t frame, double timestamp, uint32_t width, uint32_t height, uint32_t org_width, uint32_t org_height, double fps, double duration_ms, uint32_t frame_count, const uint8_t *bits, uint64_t bitsSize)> VideoProcessCb;
 
 namespace mdk { class Player; }
@@ -54,6 +60,8 @@ public:
     void setProcessPixelsCallback(ProcessPixelsCb &&cb);
     void setProcessTextureCallback(ProcessTextureCb &&cb);
     void setReadyForProcessingCallback(ReadyForProcessingCb &&cb);
+    void setObserveFrameCallback(ObserveFrameCb &&cb);
+    void setObserveFrameMode(uint32_t mode, uint32_t playingIntervalMs) { m_observeMode = mode; m_observeIntervalMs = playingIntervalMs; }
 
     void setupPlayer();
 
@@ -115,6 +123,10 @@ private:
     ProcessPixelsCb m_processPixels;
     ProcessTextureCb m_processTexture;
     ReadyForProcessingCb m_readyForProcessing;
+    ObserveFrameCb m_observeFrame;
+    std::atomic<uint32_t> m_observeMode{ObserveOff};
+    std::atomic<uint32_t> m_observeIntervalMs{100};
+    std::chrono::steady_clock::time_point m_lastObserve;
 
     std::unique_ptr<mdk::Player> m_player;
     std::map<uint64_t, std::unique_ptr<mdk::Player>> m_processingPlayers;

@@ -103,6 +103,7 @@ MDKPlayer::~MDKPlayer() {
     m_processPixels = nullptr;
     m_processTexture = nullptr;
     m_readyForProcessing = nullptr;
+    m_observeFrame = nullptr;
     m_item = nullptr;
     m_window = nullptr;
 
@@ -204,6 +205,9 @@ void MDKPlayer::setProcessTextureCallback(ProcessTextureCb &&cb) {
 }
 void MDKPlayer::setReadyForProcessingCallback(ReadyForProcessingCb &&cb) {
     m_readyForProcessing = cb;
+}
+void MDKPlayer::setObserveFrameCallback(ObserveFrameCb &&cb) {
+    m_observeFrame = cb;
 }
 
 void MDKPlayer::setupPlayer() {
@@ -406,6 +410,7 @@ void MDKPlayer::windowBeforeRendering() {
 
     bool processed = false;
     bool usePixels = false;
+    QImage observed;
     if (m_firstFrameLoaded.load()) {
         if (!m_videoLoaded.load() || m_shuttingDown.load()) return;
         if (m_processTexture && m_texture) {
@@ -498,6 +503,24 @@ void MDKPlayer::windowBeforeRendering() {
                 const auto img2 = m_processPixels(m_item, frame, timestamp * 1000.0, img);
                 if (!img2.isNull() && img2.constBits()) {
                     fromImage(img2);
+                    observed = img2;
+                }
+            }
+        }
+
+        const uint32_t observeMode = m_observeMode.load();
+        if (m_observeFrame && observeMode != ObserveOff) {
+            const bool playing = player->state() == mdk::PlaybackState::Playing;
+            const auto now = std::chrono::steady_clock::now();
+            const bool due = !playing || now - m_lastObserve >= std::chrono::milliseconds(m_observeIntervalMs.load());
+            if ((observeMode == ObserveAlways || !playing) && due) {
+                m_lastObserve = now;
+                // The pixel path already holds the final frame on the CPU; anything else is
+                // in the texture and needs a readback.
+                if (observed.isNull()) observed = toImage();
+                if (!m_videoLoaded.load() || m_shuttingDown.load()) return;
+                if (!observed.isNull() && observed.constBits()) {
+                    m_observeFrame(m_item, frame, timestamp * 1000.0, observed);
                 }
             }
         }
