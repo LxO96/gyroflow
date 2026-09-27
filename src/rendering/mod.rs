@@ -790,7 +790,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
             let log = FFMPEG_LOG.read().clone();
             if let Some(enc) = ffmpeg_next::encoder::find_by_name("h264_videotoolbox") {
                 let ctx_ptr = unsafe { ffi::avcodec_alloc_context3(enc.as_ptr()) };
-                let context = unsafe { codec::context::Context::wrap(ctx_ptr, Some(Rc::new(0))) };
+                let context = unsafe { codec::context::Context::wrap(ctx_ptr, Some(std::sync::Arc::new(0))) };
                 let mut encoder = context.encoder().video()?;
                 encoder.set_width(1920);
                 encoder.set_height(1080);
@@ -815,8 +815,9 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
         proc.video.encoder_params.options.set("b_ref_mode", "disabled");
     }
 
-    if cfg!(target_os = "android") {
+    if encoder.0.contains("mediacodec") {
         proc.video.encoder_params.options.set("ndk_codec", "1");
+        proc.video.encoder_params.options.set("ndk_async", "1");
     }
 
     proc.video.encoder_params.keyframe_distance_s = render_options.keyframe_distance.max(0.0001);
@@ -1480,17 +1481,12 @@ unsafe fn codec_options(c: *const ffi::AVCodec) {
         let mut ret = String::new();
         let _ = writeln!(ret, "{} <b>{}</b>:\n", ["Decoder", "Encoder"][ffi::av_codec_is_encoder(c) as usize], to_str((*c).name));
 
-        if !(*c).pix_fmts.is_null() {
+        let pix_fmts = ffmpeg_hw::codec_pix_formats(std::ptr::null(), c);
+        if !pix_fmts.is_empty() {
             ret.push_str("Supported pixel formats (-pix_fmt): ");
-            for i in 0..100 {
-                let fmt = (*c).pix_fmts.offset(i);
-                if fmt.is_null() { break; }
-                let p = *fmt;
-                if p == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
-                    break;
-                }
+            for (i, p) in pix_fmts.iter().enumerate() {
                 if i > 0 { ret.push_str(", "); }
-                ret.push_str(&to_str(ffi::av_get_pix_fmt_name(p)));
+                ret.push_str(&to_str(ffi::av_get_pix_fmt_name((*p).into())));
             }
         }
 
@@ -1586,9 +1582,11 @@ pub fn check_export_pixel_format(codec: &str, gpu: bool, source_format: &str) ->
 
     let encoder_name = get_default_encoder(codec, gpu);
     let Some(enc) = ffmpeg_next::encoder::find_by_name(&encoder_name) else { return ok; };
+    // `avcodec_get_supported_config`, not the old `AVCodec::pix_fmts` field: ffmpeg 9.0 removed
+    // it, and `codec_pix_formats` is the accessor the rest of the renderer already uses.
     let supported = unsafe {
         if enc.as_ptr().is_null() { return ok; }
-        ffmpeg_hw::pix_formats_to_vec((*enc.as_ptr()).pix_fmts)
+        ffmpeg_hw::codec_pix_formats(std::ptr::null(), enc.as_ptr())
     };
     // An encoder that advertises nothing takes anything as far as this check is concerned - the
     // renderer's own test is `!supported.contains(..)`, which is false for an empty list too.
@@ -1941,7 +1939,7 @@ mod pixel_format_check_tests {
                     if c.cpu_only { continue; }
 
                     let enc = ffmpeg_next::encoder::find_by_name(&c.encoder).expect("resolved encoder must exist");
-                    let supported = unsafe { ffmpeg_hw::pix_formats_to_vec((*enc.as_ptr()).pix_fmts) };
+                    let supported = unsafe { ffmpeg_hw::codec_pix_formats(std::ptr::null(), enc.as_ptr()) };
                     let suggested = supported.iter().find(|f| format!("{f:?}").to_ascii_lowercase() == c.suggestion);
                     assert!(suggested.is_some(), "{codec} gpu={gpu} {source}: suggested {} which {} does not advertise", c.suggestion, c.encoder);
 

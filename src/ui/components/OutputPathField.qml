@@ -15,6 +15,8 @@ TextField {
     property var cbAfterSelect: null;
     property bool folderOnly: false;
 
+    signal folderSelectionCanceled();
+
     property url fullFileUrl;
     property url folderUrl;
     property string filename;
@@ -140,6 +142,10 @@ TextField {
                 root.cbAfterSelect(root.folderUrl);
                 root.cbAfterSelect = null;
             }
+        }
+        onRejected: {
+            root.cbAfterSelect = null;
+            root.folderSelectionCanceled();
         }
     }
 }

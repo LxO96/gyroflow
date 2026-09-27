@@ -225,6 +225,7 @@ MenuItem {
                 ["Portuguese - Brazilian (português brasileiro)", "pt_BR"],
                 ["Portuguese (português)",       "pt"],
                 ["Russian (русский)",            "ru"],
+                ["Serbian (srpski)",             "sr_CS"],
                 ["Slovak (slovenský)",           "sk"],
                 ["Spanish (español)",            "es"],
                 ["Turkish (Türkçe)",             "tr"],
