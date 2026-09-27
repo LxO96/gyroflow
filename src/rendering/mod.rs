@@ -1034,7 +1034,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                         // into directional smearing in flat ones.
                         let reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
-                        let mut buffers = Buffers {
+                        let mut buffers = Buffers { guide: None,
                             input:  get_plane_buffer_ref(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
                             output: get_plane_buffer(out_frame_data, out_size, plane_index, &mut g, wgpu_format),
                             references: references.iter().map(|r| {

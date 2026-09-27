@@ -289,6 +289,9 @@ pub struct Buffers<'a> {
     /// Temporal reference frames, in temporal order, excluding the centre frame
     /// which is `input`. Empty when denoising is off.
     pub references: Vec<BufferDescription<'a>>,
+    /// The luma plane guiding the chroma pass on a chroma plane (see
+    /// `denoise::chroma_filter`). `None` everywhere else, and whenever the pass is off.
+    pub guide: Option<BufferDescription<'a>>,
 }
 
 #[derive(Debug, Default)]

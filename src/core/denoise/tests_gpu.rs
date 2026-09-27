@@ -153,7 +153,7 @@ fn identity_transform(references: usize, sigma: f32) -> FrameTransform {
     p.denoise_sigma = sigma;
 
     let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-    FrameTransform {
+    FrameTransform { chroma_filter: Default::default(),
         matrices: vec![identity],
         reference_matrices: vec![vec![identity]; references],
         kernel_params: p,
@@ -200,7 +200,7 @@ fn run_wgpu_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f32
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();
     let mut output = vec![0u8; (STRIDE * H) as usize];
 
-    let mut buffers = Buffers {
+    let mut buffers = Buffers { guide: None,
         input: desc(&mut input),
         output: desc(&mut output),
         references: refs.iter_mut().map(|r| desc(r.as_mut_slice())).collect(),
@@ -243,7 +243,7 @@ fn run_opencl_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();
     let mut output = vec![0u8; (STRIDE * H) as usize];
 
-    let mut buffers = Buffers {
+    let mut buffers = Buffers { guide: None,
         input: desc(&mut input),
         output: desc(&mut output),
         references: refs.iter_mut().map(|r| desc(r.as_mut_slice())).collect(),

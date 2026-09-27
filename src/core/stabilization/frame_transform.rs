@@ -19,6 +19,8 @@ pub struct FrameTransform {
     pub minimal_fov: f64,
     pub focal_length: Option<f64>,
     pub mesh_data: Vec<f32>,
+    /// The spatial chroma pass to run after this frame's main kernel. Inactive by default.
+    pub chroma_filter: crate::denoise::chroma_filter::ChromaFilterParams,
 }
 
 impl FrameTransform {
@@ -523,7 +525,7 @@ impl FrameTransform {
             if c.lut_size > 0 { kernel_params.flags |= KernelParamsFlags::HAS_LUT.bits(); }
         }
 
-        Self {
+        Self { chroma_filter: Default::default(),
             matrices,
             reference_matrices: Vec::new(),
             kernel_params,
