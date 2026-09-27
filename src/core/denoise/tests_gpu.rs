@@ -710,3 +710,71 @@ fn chroma_gpu_amount_zero_is_bit_exact() {
         for i in 0..N { assert_eq!(out[i], scene[i], "pixel {i} changed with amount 0"); }
     }
 }
+
+fn run_wgpu_chroma_rgb(px: &[[f32; 4]], amount: f32) -> Result<Vec<[f32; 4]>, String> {
+    if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { return Err("UNAVAILABLE: no usable wgpu adapter".into()); }
+    let mut itm = identity_transform(0, 0.02);
+    itm.kernel_params.translation2d = [-0.5, -0.5]; // see run_wgpu
+    itm.chroma_filter = rgb_params(amount);
+    let mut input = to_bytes(px);
+    let mut output = vec![0u8; (STRIDE * H) as usize];
+    let mut buffers = Buffers { input: desc(&mut input), output: desc(&mut output), references: vec![], guide: None };
+    let inst = crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, RGBAf::wgpu_format().ok_or("no format")?, DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("WgpuWrapper::new failed: {e:?}"))?;
+    if !inst.undistort_image(&mut buffers, &itm, &[]) { return Err("undistort_image returned false".into()); }
+    drop(buffers);
+    Ok(read_pixels(&output))
+}
+
+fn run_wgpu_chroma_planar(s: &PlanarScene, amount: f32) -> Result<Vec<f32>, String> {
+    if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { return Err("UNAVAILABLE: no usable wgpu adapter".into()); }
+    let mut itm = uv16_transform(amount);
+    itm.kernel_params.translation2d = [-0.5, -0.5];
+    let mut input = uv_bytes(&s.uv);
+    let mut output = vec![0u8; (W * 4 * H) as usize];
+    let mut guide = s.guide.clone();
+    let mut buffers = Buffers {
+        input: uv_desc(&mut input), output: uv_desc(&mut output), references: vec![],
+        guide: Some(BufferDescription { size: (s.gw, s.gh, s.gstride), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut guide }, texture_copy: false }),
+    };
+    let inst = crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, UV16::wgpu_format().ok_or("no format")?, DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("WgpuWrapper::new failed: {e:?}"))?;
+    if !inst.undistort_image(&mut buffers, &itm, &[]) { return Err("undistort_image returned false".into()); }
+    drop(buffers);
+    Ok(uv_read(&output))
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_wgpu_matches_the_reference_and_opencl() {
+    let scene = rgb_chroma_scene();
+    let reference = chroma_filter::reference_rgb(&flat(&scene), W as usize, H as usize, 4, 0.5);
+    let ps = planar_chroma_scene();
+    let preference = planar_reference(&ps, 0.5);
+
+    let w_rgb = resolve("wgpu rgb", run_wgpu_chroma_rgb(&scene, 0.5)).expect("wgpu is required for this test");
+    let d = max_diff(&flat(&w_rgb), &reference);
+    println!("wgpu rgb: max diff vs reference {d:e}");
+    assert!(d < CHROMA_TOLERANCE, "wgpu rgb differs from the reference by {d}");
+
+    let w_planar = run_wgpu_chroma_planar(&ps, 0.5).expect("wgpu planar failed");
+    let d = max_diff(&w_planar, &preference);
+    println!("wgpu planar: max diff vs reference {d:e}");
+    assert!(d < CHROMA_TOLERANCE, "wgpu planar differs from the reference by {d}");
+
+    // The two backends against each other, per pixel.
+    if let Ok(o) = run_opencl_chroma_rgb(&scene, 0.5) {
+        let d = max_diff(&flat(&o), &flat(&w_rgb));
+        println!("wgpu vs OpenCL rgb: {d:e}");
+        assert!(d < CHROMA_TOLERANCE);
+    }
+    if let Ok(o) = run_opencl_chroma_planar(&ps, 0.5) {
+        let d = max_diff(&o, &w_planar);
+        println!("wgpu vs OpenCL planar: {d:e}");
+        assert!(d < CHROMA_TOLERANCE);
+    }
+
+    // amount 0: bit-exact with no pass.
+    let zero = run_wgpu_chroma_rgb(&scene, 0.0).unwrap();
+    for i in 0..N { assert_eq!(zero[i], scene[i], "wgpu pixel {i} changed with amount 0"); }
+}

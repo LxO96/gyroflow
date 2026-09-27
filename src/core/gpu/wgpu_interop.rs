@@ -45,7 +45,8 @@ pub fn init_texture(device: &wgpu::Device, backend: wgpu::Backend, buf: &BufferD
     let usage = if is_in {
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST
     } else {
-        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
+        // TEXTURE_BINDING: the chroma smoothing pass reads the main pass's output.
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING
     };
     // `array_layers` is 1 (a plain 2D texture) except for the wgpu-allocated input
     // textures used with temporal denoising, where layer 0 is the centre frame and
