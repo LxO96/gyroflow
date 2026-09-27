@@ -153,7 +153,7 @@ fn identity_transform(references: usize, sigma: f32) -> FrameTransform {
     p.denoise_sigma = sigma;
 
     let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-    FrameTransform {
+    FrameTransform { chroma_filter: Default::default(),
         matrices: vec![identity],
         reference_matrices: vec![vec![identity]; references],
         kernel_params: p,
@@ -200,7 +200,7 @@ fn run_wgpu_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f32
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();
     let mut output = vec![0u8; (STRIDE * H) as usize];
 
-    let mut buffers = Buffers {
+    let mut buffers = Buffers { guide: None,
         input: desc(&mut input),
         output: desc(&mut output),
         references: refs.iter_mut().map(|r| desc(r.as_mut_slice())).collect(),
@@ -243,7 +243,7 @@ fn run_opencl_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();
     let mut output = vec![0u8; (STRIDE * H) as usize];
 
-    let mut buffers = Buffers {
+    let mut buffers = Buffers { guide: None,
         input: desc(&mut input),
         output: desc(&mut output),
         references: refs.iter_mut().map(|r| desc(r.as_mut_slice())).collect(),
@@ -577,3 +577,272 @@ fn denoise_gpu_rgb_tight_chroma_still_denoises_luma() {
     assert!(ran_any, "no backend was available, so this test asserted nothing");
 }
 
+// ---------------------------------------------------------------------------------------
+// Chroma pass. No references: the gather is a no-op, so the output is exactly
+// geometry(identity) + chroma pass, which is compared against the Rust reference.
+
+use crate::denoise::chroma_filter::{ self, ChromaFilterParams };
+use crate::stabilization::{ UV16 };
+
+const CHROMA_TOLERANCE: f32 = 1.0 / 1024.0;
+
+/// A flat grey RGBAf frame with a vertical luma edge and chroma noise on both sides.
+fn rgb_chroma_scene() -> Vec<[f32; 4]> {
+    (0..N).map(|i| {
+        let y = if i % W as usize >= W as usize / 2 { 0.7 } else { 0.3 };
+        let (cb, cr) = (0.02 * noise(1, i, 1.0), 0.02 * noise(2, i, 1.0));
+        // Build rgb with luma y and small chroma offsets.
+        let r = y + 1.5748 * cr;
+        let b = y + 1.8556 * cb;
+        let g = (y - 0.2126 * r - 0.0722 * b) / 0.7152;
+        [r, g, b, 1.0]
+    }).collect()
+}
+
+fn rgb_params(amount: f32) -> ChromaFilterParams {
+    ChromaFilterParams { mode: chroma_filter::MODE_RGB, amount, sigma_y: chroma_filter::SIGMA_LUMA, max_value: 1.0, ..Default::default() }
+}
+
+#[cfg(feature = "use-opencl")]
+fn run_opencl_chroma_rgb(px: &[[f32; 4]], amount: f32) -> Result<Vec<[f32; 4]>, String> {
+    if crate::gpu::opencl::OclWrapper::list_devices().is_empty() { return Err("UNAVAILABLE: no OpenCL device".into()); }
+    let mut itm = identity_transform(0, 0.02);
+    itm.chroma_filter = rgb_params(amount);
+    let mut input = to_bytes(px);
+    let mut output = vec![0u8; (STRIDE * H) as usize];
+    let mut buffers = Buffers { input: desc(&mut input), output: desc(&mut output), references: vec![], guide: None };
+    let inst = crate::gpu::opencl::OclWrapper::new(&itm.kernel_params, RGBAf::ocl_names(), DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("OclWrapper::new failed: {e:?}"))?;
+    inst.undistort_image(&mut buffers, &itm, &[]).map_err(|e| format!("undistort_image failed: {e:?}"))?;
+    drop(buffers);
+    Ok(read_pixels(&output))
+}
+#[cfg(not(feature = "use-opencl"))]
+fn run_opencl_chroma_rgb(_px: &[[f32; 4]], _amount: f32) -> Result<Vec<[f32; 4]>, String> { Err("UNAVAILABLE: built without use-opencl".into()) }
+
+/// A 64x64 UV16 chroma plane (4:2:0) and its 127x127 Luma16 guide with a row stride padded by
+/// 64 bytes: odd luma size and padded stride are both review-focus cases.
+struct PlanarScene { uv: Vec<u16>, guide: Vec<u8>, gw: usize, gh: usize, gstride: usize }
+fn planar_chroma_scene() -> PlanarScene {
+    let (gw, gh) = (127usize, 127usize);
+    let gstride = gw * 2 + 64;
+    let mut guide = vec![0u8; gstride * gh];
+    for y in 0..gh { for x in 0..gw {
+        let v: u16 = if x < gw / 2 { 20000 } else { 45000 };
+        guide[y * gstride + x * 2..y * gstride + x * 2 + 2].copy_from_slice(&v.to_le_bytes());
+    } }
+    let uv = (0..N * 2).map(|i| (32768.0 + 1500.0 * noise(3, i, 1.0)) as u16).collect();
+    PlanarScene { uv, guide, gw, gh, gstride }
+}
+fn planar_reference(s: &PlanarScene, amount: f32) -> Vec<f32> {
+    let plane: Vec<f32> = s.uv.iter().map(|&v| v as f32 / 65535.0).collect();
+    let guide: Vec<f32> = (0..s.gw * s.gh).map(|i| {
+        let (x, y) = (i % s.gw, i / s.gw);
+        u16::from_le_bytes([s.guide[y * s.gstride + x * 2], s.guide[y * s.gstride + x * 2 + 1]]) as f32 / 65535.0
+    }).collect();
+    chroma_filter::reference_planar(&plane, W as usize, H as usize, 2, &guide, s.gw, s.gh, amount)
+}
+/// Identity transform for a UV16 plane.
+fn uv16_transform(amount: f32) -> FrameTransform {
+    let mut itm = identity_transform(0, 0.02);
+    let p = &mut itm.kernel_params;
+    p.bytes_per_pixel = 4; p.pix_element_count = 2; p.stride = W * 4; p.output_stride = W * 4;
+    p.max_pixel_value = 65535.0; p.pixel_value_limit = 65535.0;
+    itm.chroma_filter = ChromaFilterParams { mode: chroma_filter::MODE_PLANAR, amount, sigma_y: chroma_filter::SIGMA_LUMA, max_value: 65535.0, ..Default::default() };
+    itm
+}
+fn uv_desc(buf: &mut [u8]) -> BufferDescription<'_> {
+    BufferDescription { size: (W as usize, H as usize, (W * 4) as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: buf }, texture_copy: false }
+}
+fn uv_bytes(uv: &[u16]) -> Vec<u8> { uv.iter().flat_map(|v| v.to_le_bytes()).collect() }
+fn uv_read(b: &[u8]) -> Vec<f32> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]) as f32 / 65535.0).collect() }
+
+#[cfg(feature = "use-opencl")]
+fn run_opencl_chroma_planar(s: &PlanarScene, amount: f32) -> Result<Vec<f32>, String> {
+    if crate::gpu::opencl::OclWrapper::list_devices().is_empty() { return Err("UNAVAILABLE: no OpenCL device".into()); }
+    let itm = uv16_transform(amount);
+    let mut input = uv_bytes(&s.uv);
+    let mut output = vec![0u8; (W * 4 * H) as usize];
+    let mut guide = s.guide.clone();
+    let mut buffers = Buffers {
+        input: uv_desc(&mut input), output: uv_desc(&mut output), references: vec![],
+        guide: Some(BufferDescription { size: (s.gw, s.gh, s.gstride), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut guide }, texture_copy: false }),
+    };
+    let inst = crate::gpu::opencl::OclWrapper::new(&itm.kernel_params, UV16::ocl_names(), DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("OclWrapper::new failed: {e:?}"))?;
+    inst.undistort_image(&mut buffers, &itm, &[]).map_err(|e| format!("undistort_image failed: {e:?}"))?;
+    drop(buffers);
+    Ok(uv_read(&output))
+}
+#[cfg(not(feature = "use-opencl"))]
+fn run_opencl_chroma_planar(_s: &PlanarScene, _amount: f32) -> Result<Vec<f32>, String> { Err("UNAVAILABLE: built without use-opencl".into()) }
+
+fn max_diff(a: &[f32], b: &[f32]) -> f32 { a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max) }
+fn flat(px: &[[f32; 4]]) -> Vec<f32> { px.iter().flat_map(|p| p.iter().copied()).collect() }
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_opencl_matches_the_reference() {
+    let scene = rgb_chroma_scene();
+    let reference = chroma_filter::reference_rgb(&flat(&scene), W as usize, H as usize, 4, 0.5);
+    let ps = planar_chroma_scene();
+    let preference = planar_reference(&ps, 0.5);
+    let mut ran = false;
+    if let Some(out) = resolve("OpenCL rgb", run_opencl_chroma_rgb(&scene, 0.5)) {
+        ran = true;
+        let d = max_diff(&flat(&out), &reference);
+        println!("OpenCL rgb: max diff vs reference {d:e}");
+        assert!(d < CHROMA_TOLERANCE, "OpenCL rgb differs from the reference by {d}");
+    }
+    match run_opencl_chroma_planar(&ps, 0.5) {
+        Ok(out) => { let d = max_diff(&out, &preference); println!("OpenCL planar: max diff {d:e}"); assert!(d < CHROMA_TOLERANCE, "OpenCL planar differs by {d}"); }
+        Err(e) if e.starts_with("UNAVAILABLE") => println!("SKIPPED OpenCL planar: {e}"),
+        Err(e) => panic!("OpenCL planar failed: {e}"),
+    }
+    assert!(ran, "no backend ran");
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_amount_zero_is_bit_exact() {
+    let scene = rgb_chroma_scene();
+    if let Some(out) = resolve("OpenCL", run_opencl_chroma_rgb(&scene, 0.0)) {
+        for i in 0..N { assert_eq!(out[i], scene[i], "pixel {i} changed with amount 0"); }
+    }
+}
+
+fn run_wgpu_chroma_rgb(px: &[[f32; 4]], amount: f32) -> Result<Vec<[f32; 4]>, String> {
+    if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { return Err("UNAVAILABLE: no usable wgpu adapter".into()); }
+    let mut itm = identity_transform(0, 0.02);
+    itm.kernel_params.translation2d = [-0.5, -0.5]; // see run_wgpu
+    itm.chroma_filter = rgb_params(amount);
+    let mut input = to_bytes(px);
+    let mut output = vec![0u8; (STRIDE * H) as usize];
+    let mut buffers = Buffers { input: desc(&mut input), output: desc(&mut output), references: vec![], guide: None };
+    let inst = crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, RGBAf::wgpu_format().ok_or("no format")?, DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("WgpuWrapper::new failed: {e:?}"))?;
+    if !inst.undistort_image(&mut buffers, &itm, &[]) { return Err("undistort_image returned false".into()); }
+    drop(buffers);
+    Ok(read_pixels(&output))
+}
+
+fn run_wgpu_chroma_planar(s: &PlanarScene, amount: f32) -> Result<Vec<f32>, String> {
+    if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { return Err("UNAVAILABLE: no usable wgpu adapter".into()); }
+    let mut itm = uv16_transform(amount);
+    itm.kernel_params.translation2d = [-0.5, -0.5];
+    let mut input = uv_bytes(&s.uv);
+    let mut output = vec![0u8; (W * 4 * H) as usize];
+    let mut guide = s.guide.clone();
+    let mut buffers = Buffers {
+        input: uv_desc(&mut input), output: uv_desc(&mut output), references: vec![],
+        guide: Some(BufferDescription { size: (s.gw, s.gh, s.gstride), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut guide }, texture_copy: false }),
+    };
+    let inst = crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, UV16::wgpu_format().ok_or("no format")?, DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("WgpuWrapper::new failed: {e:?}"))?;
+    if !inst.undistort_image(&mut buffers, &itm, &[]) { return Err("undistort_image returned false".into()); }
+    drop(buffers);
+    Ok(uv_read(&output))
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_wgpu_matches_the_reference_and_opencl() {
+    let scene = rgb_chroma_scene();
+    let reference = chroma_filter::reference_rgb(&flat(&scene), W as usize, H as usize, 4, 0.5);
+    let ps = planar_chroma_scene();
+    let preference = planar_reference(&ps, 0.5);
+
+    let w_rgb = resolve("wgpu rgb", run_wgpu_chroma_rgb(&scene, 0.5)).expect("wgpu is required for this test");
+    let d = max_diff(&flat(&w_rgb), &reference);
+    println!("wgpu rgb: max diff vs reference {d:e}");
+    assert!(d < CHROMA_TOLERANCE, "wgpu rgb differs from the reference by {d}");
+
+    let w_planar = run_wgpu_chroma_planar(&ps, 0.5).expect("wgpu planar failed");
+    let d = max_diff(&w_planar, &preference);
+    println!("wgpu planar: max diff vs reference {d:e}");
+    assert!(d < CHROMA_TOLERANCE, "wgpu planar differs from the reference by {d}");
+
+    // The two backends against each other, per pixel.
+    if let Ok(o) = run_opencl_chroma_rgb(&scene, 0.5) {
+        let d = max_diff(&flat(&o), &flat(&w_rgb));
+        println!("wgpu vs OpenCL rgb: {d:e}");
+        assert!(d < CHROMA_TOLERANCE);
+    }
+    if let Ok(o) = run_opencl_chroma_planar(&ps, 0.5) {
+        let d = max_diff(&o, &w_planar);
+        println!("wgpu vs OpenCL planar: {d:e}");
+        assert!(d < CHROMA_TOLERANCE);
+    }
+
+    // amount 0: bit-exact with no pass.
+    let zero = run_wgpu_chroma_rgb(&scene, 0.0).unwrap();
+    for i in 0..N { assert_eq!(zero[i], scene[i], "wgpu pixel {i} changed with amount 0"); }
+}
+
+/// A clipped saturated highlight on a 16-bit integer RGBA output (wgpu `Rgba16Uint`).
+/// RGB mode is not a convex combination, so pixels at r = max whose same-luma neighbours have
+/// a slightly larger `r - Y` come out above max. Unclamped, that value wrapped in the 16-bit
+/// target and a clipped red light turned into dark specks.
+fn run_wgpu_chroma_rgba16(px: &[[u16; 4]], amount: f32) -> Result<Vec<[u16; 4]>, String> {
+    if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { return Err("UNAVAILABLE: no usable wgpu adapter".into()); }
+    let mut itm = identity_transform(0, 0.02);
+    let p = &mut itm.kernel_params;
+    p.bytes_per_pixel = 8; p.stride = W * 8; p.output_stride = W * 8;
+    p.max_pixel_value = 65535.0; p.pixel_value_limit = 65535.0;
+    p.translation2d = [-0.5, -0.5];
+    itm.chroma_filter = ChromaFilterParams { mode: chroma_filter::MODE_RGB, amount, sigma_y: chroma_filter::SIGMA_LUMA, max_value: 65535.0, ..Default::default() };
+    let bytes = |px: &[[u16; 4]]| -> Vec<u8> { px.iter().flat_map(|p| p.iter().flat_map(|v| v.to_le_bytes())).collect() };
+    fn d(buf: &mut [u8]) -> BufferDescription<'_> { BufferDescription { size: (W as usize, H as usize, (W * 8) as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: buf }, texture_copy: false } }
+    let mut input = bytes(px);
+    let mut output = vec![0u8; (W * 8 * H) as usize];
+    let mut buffers = Buffers { input: d(&mut input), output: d(&mut output), references: vec![], guide: None };
+    let inst = crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, crate::stabilization::RGBA16::wgpu_format().ok_or("no format")?, DistortionModel::default(), None, &buffers, 0, None)
+        .map_err(|e| format!("WgpuWrapper::new failed: {e:?}"))?;
+    if !inst.undistort_image(&mut buffers, &itm, &[]) { return Err("undistort_image returned false".into()); }
+    drop(buffers);
+    Ok(output.chunks_exact(8).map(|c| [0, 1, 2, 3].map(|i| u16::from_le_bytes([c[i * 2], c[i * 2 + 1]]))).collect())
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_clipped_highlights_do_not_wrap_on_16bit_integer_output() {
+    // Clipped red everywhere; every 4th pixel in both directions has G = 0.50, the rest 0.49,
+    // so those pixels' neighbours are within the luma sigma but carry more red chroma.
+    let px: Vec<[u16; 4]> = (0..N).map(|i| {
+        let (x, y) = (i % W as usize, i / W as usize);
+        let g = if x % 4 == 0 && y % 4 == 0 { 0.50 } else { 0.49 };
+        [65535, (g * 65535.0) as u16, 32768, 65535]
+    }).collect();
+    let out = resolve16(run_wgpu_chroma_rgba16(&px, 1.0));
+    if let Some(out) = out {
+        let min_r = out.iter().map(|p| p[0]).min().unwrap();
+        println!("wgpu RGBA16: lowest red in a fully clipped-red frame {min_r}");
+        assert!(min_r > 60000, "clipped red wrapped around to {min_r}");
+    }
+}
+
+fn resolve16(r: Result<Vec<[u16; 4]>, String>) -> Option<Vec<[u16; 4]>> {
+    match r {
+        Ok(v) => Some(v),
+        Err(e) if e.starts_with("UNAVAILABLE") => { println!("SKIPPED: {e}"); None }
+        Err(e) => panic!("run failed: {e}"),
+    }
+}
+
+/// A driver that rejects the chroma kernel (or runs out of memory for its scratch buffer) must
+/// cost only the chroma pass, never the whole OpenCL backend: the spec's only failure mode is
+/// skipping the pass. Before the fix, OclWrapper::new failed and OpenCL was lost even for
+/// users who never enable denoising.
+#[cfg(feature = "use-opencl")]
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_a_failed_pass_build_keeps_opencl_working() {
+    let scene = rgb_chroma_scene();
+    crate::gpu::opencl::FAIL_CHROMA_BUILD.with(|f| f.set(true));
+    let result = run_opencl_chroma_rgb(&scene, 0.5);
+    crate::gpu::opencl::FAIL_CHROMA_BUILD.with(|f| f.set(false));
+    if let Some(out) = resolve("OpenCL", result) {
+        // The main kernel still ran (identity), and the pass was skipped, not half-applied.
+        for i in 0..N { assert_eq!(out[i], scene[i], "pixel {i}: expected the unsmoothed frame"); }
+    }
+}

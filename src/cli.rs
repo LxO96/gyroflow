@@ -101,6 +101,10 @@ struct Opts {
     #[argh(option)]
     denoise_chroma: Option<f64>,
 
+    /// denoise chroma smoothing (spatial colour-blotch reduction), 0.0 to 1.0
+    #[argh(option)]
+    denoise_chroma_smoothing: Option<f64>,
+
     /// open file in the GUI (video or project)
     #[argh(option)]
     open: Option<String>,
@@ -197,6 +201,7 @@ pub fn run(open_file: &mut String, open_preset: &mut String) -> bool {
             // project file already enabled denoising, and harmless when nothing did.
             if let Some(v) = opts.denoise_luma   { denoise.insert("luma_strength".into(),   v.into()); }
             if let Some(v) = opts.denoise_chroma { denoise.insert("chroma_strength".into(), v.into()); }
+            if let Some(v) = opts.denoise_chroma_smoothing { denoise.insert("chroma_smoothing".into(), v.into()); }
             if !denoise.is_empty() {
                 let mut root = serde_json::Map::new();
                 root.insert("denoise".into(), serde_json::Value::Object(denoise));

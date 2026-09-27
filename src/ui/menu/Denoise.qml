@@ -32,6 +32,7 @@ MenuItem {
 
         if (typeof d.luma_strength   !== "undefined") lumaSlider  .value = +d.luma_strength;
         if (typeof d.chroma_strength !== "undefined") chromaSlider.value = +d.chroma_strength;
+        if (typeof d.chroma_smoothing !== "undefined") smoothingSlider.value = +d.chroma_smoothing;
         if (typeof d.enabled         !== "undefined") enableCb.checked = !!d.enabled;
         // Read back from the core rather than from `d.quality`: the core rejects an
         // unknown id and keeps its current value, and the dropdown must follow what was
@@ -138,6 +139,28 @@ MenuItem {
             }
             SliderSteppers {
                 target: chromaSlider;
+                step: 5;
+            }
+        }
+    }
+
+    Label {
+        text: qsTr("Colour smoothing");
+        tooltip: qsTr("Smooths colour blotches that temporal denoising leaves on moving subjects, following brightness edges so colours stay inside their outlines. 0% turns it off.");
+        Column {
+            width: parent.width;
+            spacing: 3 * dpiScale;
+            SliderWithField {
+                id: smoothingSlider;
+                width: parent.width;
+                from: 0; to: 100;              // core: 0 .. 1
+                value: 0.5; defaultValue: 0.5;
+                scaler: 100.0;
+                unit: "%"; precision: 0;
+                onValueChanged: controller.set_denoise_param("chroma_smoothing", value);
+            }
+            SliderSteppers {
+                target: smoothingSlider;
                 step: 5;
             }
         }

@@ -91,6 +91,9 @@ pub struct DenoiseSettings {
     pub luma_strength: f64,
     /// 0..1. Maps to the rejection sigma for planes 1 and above.
     pub chroma_strength: f64,
+    /// 0..1. Blend of the spatial chroma pass (`chroma_filter`) into the temporal result;
+    /// 0 skips the pass entirely.
+    pub chroma_smoothing: f64,
 }
 
 impl Default for DenoiseSettings {
@@ -100,6 +103,7 @@ impl Default for DenoiseSettings {
             quality: DenoiseQuality::default(),
             luma_strength: 0.5,
             chroma_strength: 0.5,
+            chroma_smoothing: 0.5,
         }
     }
 }
@@ -148,6 +152,7 @@ impl DenoiseSettings {
         match name {
             "luma_strength"   => self.luma_strength   = val.clamp(MIN_STRENGTH, MAX_STRENGTH),
             "chroma_strength" => self.chroma_strength = val.clamp(MIN_STRENGTH, MAX_STRENGTH),
+            "chroma_smoothing" => self.chroma_smoothing = val.clamp(MIN_STRENGTH, MAX_STRENGTH),
             _ => return false,
         }
         true
@@ -159,7 +164,21 @@ impl DenoiseSettings {
         match name {
             "luma_strength"   => self.luma_strength,
             "chroma_strength" => self.chroma_strength,
+            "chroma_smoothing" => self.chroma_smoothing,
             _ => f64::NAN,
+        }
+    }
+
+    /// The chroma pass's parameters for a plane of the given mode. Sizes are left at 0: the
+    /// backend fills them from the buffers it is actually given.
+    pub fn chroma_filter_params(&self, mode: i32, max_value: f32) -> chroma_filter::ChromaFilterParams {
+        if !self.enabled || self.chroma_smoothing <= 0.0 { return Default::default(); }
+        chroma_filter::ChromaFilterParams {
+            mode,
+            amount: self.chroma_smoothing.clamp(MIN_STRENGTH, MAX_STRENGTH) as f32,
+            sigma_y: chroma_filter::SIGMA_LUMA,
+            max_value,
+            ..Default::default()
         }
     }
 
@@ -170,7 +189,7 @@ impl DenoiseSettings {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         h.write_u8(self.enabled as u8);
         h.write_u8(self.quality.radius() as u8);
-        for v in [self.luma_strength, self.chroma_strength] {
+        for v in [self.luma_strength, self.chroma_strength, self.chroma_smoothing] {
             h.write_u64(v.to_bits());
         }
         h.finish()
@@ -178,6 +197,8 @@ impl DenoiseSettings {
 }
 
 /// End-to-end GPU tests for the temporal gather. `#[ignore]`d - they need a real device.
+pub mod chroma_filter;
+
 #[cfg(test)] mod tests_gpu;
 
 #[cfg(test)]
@@ -224,7 +245,7 @@ mod tests {
     #[test]
     fn set_param_clamps_every_scalar_to_its_range() {
         let mut d = DenoiseSettings::default();
-        for name in ["luma_strength", "chroma_strength"] {
+        for name in ["luma_strength", "chroma_strength", "chroma_smoothing"] {
             assert!(d.set_param(name, -1e6));
             assert_eq!(d.set_param_value(name), MIN_STRENGTH);
             assert!(d.set_param(name, 1e6));
@@ -258,6 +279,7 @@ mod tests {
             ("quality",         { let mut d = base.clone(); d.quality = DenoiseQuality::High; d }),
             ("luma_strength",   { let mut d = base.clone(); d.luma_strength = 0.123; d }),
             ("chroma_strength", { let mut d = base.clone(); d.chroma_strength = 0.456; d }),
+            ("chroma_smoothing", { let mut d = base.clone(); d.chroma_smoothing = 0.9; d }),
         ] {
             assert_ne!(base.get_checksum(), m.get_checksum(), "{name} must invalidate the preview");
         }
@@ -284,6 +306,31 @@ mod tests {
             assert!(w < prev, "weight must fall monotonically with distance");
             prev = w;
         }
+    }
+
+    #[test]
+    fn chroma_smoothing_defaults_clamps_and_changes_the_checksum() {
+        let mut d = DenoiseSettings::default();
+        assert_eq!(d.chroma_smoothing, 0.5);
+        assert!(d.set_param("chroma_smoothing", 7.0));
+        assert_eq!(d.set_param_value("chroma_smoothing"), MAX_STRENGTH);
+        let before = d.get_checksum();
+        d.chroma_smoothing = 0.2;
+        assert_ne!(before, d.get_checksum());
+    }
+
+    #[test]
+    fn chroma_filter_params_are_inactive_unless_enabled_and_nonzero() {
+        let mut d = DenoiseSettings::default();
+        d.enabled = false;
+        assert!(!d.chroma_filter_params(chroma_filter::MODE_RGB, 1.0).is_active(), "disabled denoise must not smooth");
+        d.enabled = true;
+        d.chroma_smoothing = 0.0;
+        assert!(!d.chroma_filter_params(chroma_filter::MODE_RGB, 1.0).is_active());
+        d.chroma_smoothing = 0.5;
+        let p = d.chroma_filter_params(chroma_filter::MODE_PLANAR, 65535.0);
+        assert!(p.is_active());
+        assert_eq!((p.mode, p.amount, p.sigma_y, p.max_value), (chroma_filter::MODE_PLANAR, 0.5, chroma_filter::SIGMA_LUMA, 65535.0));
     }
 
     #[test]

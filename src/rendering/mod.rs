@@ -349,6 +349,23 @@ fn should_bake_color<T: PixelType>(bake_color: bool) -> bool {
     bake_color && T::COUNT >= 3
 }
 
+/// Which chroma smoothing mode applies to a dispatched plane (`denoise::chroma_filter`).
+/// `yuvi` is the plane's YUV component list from the dispatch table: empty for packed RGB,
+/// `[0]` for luma, `[1]`/`[2]`/`[1,2]`/`[2,1]` for chroma, `[3]` for alpha. Planar RGB float
+/// planes (`R32f`) reuse those indices for G/B/R, so they are excluded by type.
+fn chroma_plane_mode<T: PixelType>(plane_index: usize, yuvi: &[usize]) -> i32 {
+    use crate::core::denoise::chroma_filter::{ MODE_OFF, MODE_PLANAR, MODE_RGB };
+    if yuvi.is_empty() {
+        return if T::COUNT >= 3 { MODE_RGB } else { MODE_OFF };
+    }
+    let planar_rgb_float = T::COUNT == 1 && T::SCALAR_BYTES == 4;
+    if !planar_rgb_float && plane_index >= 1 && T::COUNT <= 2 && yuvi.iter().all(|&c| c == 1 || c == 2) {
+        MODE_PLANAR
+    } else {
+        MODE_OFF
+    }
+}
+
 /// Whether `timestamp_us` falls outside every trim range, i.e. this output frame should be
 /// replaced with the configured background rather than real (trimmed-away) content.
 /// Factored out so the trailing frames a temporal window drains after decoding ends
@@ -1022,6 +1039,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     // kernel splits them itself (`denoise_rgb`); every other plane is one
                     // component class and takes its sigma by plane index.
                     let packed_rgb = { let yuvi: &[usize] = &$yuvi; yuvi.is_empty() && $t::COUNT >= 3 };
+                    let yuvi_owned: Vec<usize> = { let yuvi: &[usize] = &$yuvi; yuvi.to_vec() };
                     $planes.borrow_mut().push(Box::new(move |timestamp_us: i64, in_frame_data: &Video, references: &[&Video], reference_timestamps: &[i64], out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
                         let mut g = render_globals.borrow_mut();
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
@@ -1034,7 +1052,24 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                         // into directional smearing in flat ones.
                         let reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
-                        let mut buffers = Buffers {
+                        // Chroma smoothing (`denoise::chroma_filter`). A chroma plane is guided by
+                        // luma: plane 0 of the output, already written because `run_planes` runs
+                        // the planes in order.
+                        let chroma_mode = chroma_plane_mode::<$t>(plane_index, &yuvi_owned);
+                        let wants_guide = chroma_mode == crate::core::denoise::chroma_filter::MODE_PLANAR
+                            && denoise.read().chroma_filter_params(chroma_mode, 1.0).is_active();
+                        let guide = if wants_guide {
+                            let (w, h, s) = (out_frame_data.plane_width(0) as usize, out_frame_data.plane_height(0) as usize, out_frame_data.stride(0));
+                            let data = out_frame_data.data(0);
+                            // SAFETY: plane 0 and `plane_index` (>= 1 here) are separate allocations
+                            // inside the frame. The guide is only ever read (uploaded); the `&mut`
+                            // is what `BufferSource::Cpu` requires, and the output plane borrowed
+                            // below is a different plane.
+                            let guide_data = unsafe { std::slice::from_raw_parts_mut(data.as_ptr() as *mut u8, data.len()) };
+                            Some(gyroflow_core::gpu::BufferDescription { size: (w, h, s), data: gyroflow_core::gpu::BufferSource::Cpu { buffer: guide_data }, ..Default::default() })
+                        } else { None };
+
+                        let mut buffers = Buffers { guide,
                             input:  get_plane_buffer_ref(in_frame_data, in_size, plane_index, &mut g, wgpu_format),
                             output: get_plane_buffer(out_frame_data, out_size, plane_index, &mut g, wgpu_format),
                             references: references.iter().map(|r| {
@@ -1063,6 +1098,8 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                             } else {
                                 transform.kernel_params.denoise_sigma = denoise.sigma_for_plane(plane_index as i32);
                             }
+                            // `max_pixel_value` is final for this backend by now.
+                            transform.chroma_filter = denoise.chroma_filter_params(chroma_mode, transform.kernel_params.max_pixel_value);
                         }
                         if fill_with_background {
                             transform.kernel_params.flags |= KernelParamsFlags::FILL_WITH_BACKGROUND.bits();
@@ -2100,5 +2137,33 @@ mod thumbnail_rotation_tests {
         assert_eq!(px(&out, w, 0, 0), GREEN);
         assert_eq!(px(&out, w, 0, 1), RED);
         assert!(!out.windows(4).any(|c| c == [9,9,9,9]), "padding leaked into the image");
+    }
+}
+
+#[cfg(test)]
+mod chroma_plane_tests {
+    use super::*;
+    use crate::core::denoise::chroma_filter::{ MODE_OFF, MODE_PLANAR, MODE_RGB };
+
+    #[test]
+    fn classifies_every_dispatched_plane() {
+        // NV12 / P010
+        assert_eq!(chroma_plane_mode::<Luma8>(0, &[0]), MODE_OFF);
+        assert_eq!(chroma_plane_mode::<UV8>(1, &[1, 2]), MODE_PLANAR);
+        assert_eq!(chroma_plane_mode::<UV16>(1, &[1, 2]), MODE_PLANAR);
+        // NV21: swapped order is still chroma
+        assert_eq!(chroma_plane_mode::<UV8>(1, &[2, 1]), MODE_PLANAR);
+        // YUV420P / YUV444P16
+        assert_eq!(chroma_plane_mode::<Luma16>(1, &[1]), MODE_PLANAR);
+        assert_eq!(chroma_plane_mode::<Luma16>(2, &[2]), MODE_PLANAR);
+        // YUVA: alpha plane
+        assert_eq!(chroma_plane_mode::<Luma16>(3, &[3]), MODE_OFF);
+        // packed RGB (preview-like and baked colour)
+        assert_eq!(chroma_plane_mode::<RGBA8>(0, &[]), MODE_RGB);
+        assert_eq!(chroma_plane_mode::<RGBA16>(0, &[]), MODE_RGB);
+        // planar RGB float: plane 2 carries [1], which must not be mistaken for Cb
+        assert_eq!(chroma_plane_mode::<R32f>(2, &[1]), MODE_OFF);
+        // packed YUV
+        assert_eq!(chroma_plane_mode::<AYUV16>(0, &[3, 0, 1, 2]), MODE_OFF);
     }
 }

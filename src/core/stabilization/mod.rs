@@ -913,7 +913,7 @@ mod color_cache_key_tests {
     use super::*;
 
     fn buffers() -> Buffers<'static> {
-        Buffers { input: BufferDescription::default(), output: BufferDescription::default(), references: Vec::new() }
+        Buffers { guide: None, input: BufferDescription::default(), output: BufferDescription::default(), references: Vec::new() }
     }
 
     fn stab_with(color: crate::color::ColorAdjustments) -> Stabilization {
@@ -1080,7 +1080,7 @@ mod cross_backend_color_tests {
         p.color_params_2 = COLOR_PARAMS_2;
         p.color_params_3 = COLOR_PARAMS_3;
 
-        FrameTransform {
+        FrameTransform { chroma_filter: Default::default(),
             // Identity 3x3 in the first 9 fields; the trailing 5 stay zero, which disables
             // the extra shift/angle adjustment.
             matrices: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
@@ -1158,7 +1158,7 @@ mod cross_backend_color_tests {
         itm.kernel_params.translation2d = [-0.5, -0.5];
         let mut input = input_bytes();
         let mut output = vec![0u8; (STRIDE * H) as usize];
-        let mut buffers = Buffers {
+        let mut buffers = Buffers { guide: None,
             input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
             output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
             references: Vec::new(),
@@ -1188,7 +1188,7 @@ mod cross_backend_color_tests {
         let mut input = input_bytes();
         let mut output = vec![0u8; (STRIDE * H) as usize];
         {
-            let mut buffers = Buffers {
+            let mut buffers = Buffers { guide: None,
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
                 references: Vec::new(),
@@ -1275,7 +1275,7 @@ mod cross_backend_color_tests {
         let mut inp_buf = input.clone();
         let mut output = vec![0u8; (STRIDE8 * H) as usize];
         {
-            let mut buffers = Buffers {
+            let mut buffers = Buffers { guide: None,
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE8 as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut inp_buf }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE8 as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
                 references: Vec::new(),
@@ -1323,7 +1323,7 @@ mod cross_backend_color_tests {
         let mut inp_buf = input.clone();
         let mut output = vec![0u8; (STRIDE * H) as usize];
         {
-            let mut buffers = Buffers {
+            let mut buffers = Buffers { guide: None,
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut inp_buf }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
                 references: Vec::new(),
@@ -1344,7 +1344,7 @@ mod cross_backend_color_tests {
         let mut cpu_in = input.clone();
         let mut cpu_out = vec![0u8; (STRIDE * H) as usize];
         {
-            let mut b = Buffers {
+            let mut b = Buffers { guide: None,
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_in }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut cpu_out }, texture_copy: false },
                 references: Vec::new(),

@@ -66,6 +66,18 @@ pub struct WgpuWrapper  {
     out_size: u64,
     params_size: u64,
     drawing_size: u64,
+
+    /// The chroma smoothing pass (`wgpu_chroma_filter.wgsl`): render path, CPU output only.
+    chroma: Option<WgpuChroma>,
+    chroma_warned: std::sync::atomic::AtomicBool,
+}
+
+struct WgpuChroma {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    params: wgpu::Buffer,
+    out: wgpu::Texture,
+    guide: Option<wgpu::Texture>,
 }
 impl Drop for WgpuWrapper {
     fn drop(&mut self) {
@@ -452,7 +464,54 @@ impl WgpuWrapper {
                 }
             };
 
+            // Chroma smoothing: render path + CPU output only (see the spec).
+            let chroma = if uses_textures && matches!(buffers.output.data, BufferSource::Cpu { .. }) {
+                let src_tex = out_texture.wgpu_texture.as_ref().unwrap();
+                let size = wgpu::Extent3d { width: buffers.output.size.0 as u32, height: buffers.output.size.1 as u32, depth_or_array_layers: 1 };
+                let out = device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu_format.0, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
+                // The guide is the same scalar type as the plane, one channel.
+                let guide_format = match wgpu_format.0 {
+                    wgpu::TextureFormat::R8Unorm | wgpu::TextureFormat::Rg8Unorm => Some(wgpu::TextureFormat::R8Unorm),
+                    wgpu::TextureFormat::R16Uint | wgpu::TextureFormat::Rg16Uint => Some(wgpu::TextureFormat::R16Uint),
+                    _ => None,
+                };
+                let guide = match (&buffers.guide, guide_format) {
+                    (Some(g), Some(f)) => Some(device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: g.size.0 as u32, height: g.size.1 as u32, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: f, usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST, view_formats: &[] })),
+                    _ => None,
+                };
+                let params = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: std::mem::size_of::<crate::denoise::chroma_filter::ChromaFilterParams>() as u64, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false });
+                let src = include_str!("wgpu_chroma_filter.wgsl")
+                    .replace("SCALAR", wgpu_format.1)
+                    .replace("CF_ROUND", if wgpu_format.1 == "u32" { "round" } else { "" });
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)) });
+                let sample_type = if wgpu_format.1 == "u32" { wgpu::TextureSampleType::Uint } else { wgpu::TextureSampleType::Float { filterable: false } };
+                let tex_entry = |binding| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None };
+                let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[
+                    wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                    tex_entry(1), tex_entry(2),
+                ] });
+                let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: None, layout: Some(&pl),
+                    vertex: wgpu::VertexState { module: &module, entry_point: Some("cf_vertex"), buffers: &[], compilation_options: Default::default() },
+                    fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("cf_fragment"), targets: &[Some(wgpu::ColorTargetState { format: wgpu_format.0, blend: None, write_mask: wgpu::ColorWrites::default() })], compilation_options: Default::default() }),
+                    primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+                    multiview_mask: None, depth_stencil: None, multisample: wgpu::MultisampleState::default(), cache: Default::default(),
+                });
+                let src_view = src_tex.create_view(&Default::default());
+                // RGB mode never reads the guide; bind the source again so the layout is satisfied.
+                let guide_view = guide.as_ref().map(|g| g.create_view(&Default::default())).unwrap_or_else(|| src_tex.create_view(&Default::default()));
+                let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &layout, entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src_view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&guide_view) },
+                ] });
+                Some(WgpuChroma { pipeline, bind_group, params, out, guide })
+            } else { None };
+
             Ok(Self {
+                chroma,
+                chroma_warned: Default::default(),
                 device,
                 queue,
                 staging_buffer: Some(staging_buffer),
@@ -474,6 +533,47 @@ impl WgpuWrapper {
         } else {
             Err(WgpuError::NoAvailableAdapter)
         }
+    }
+
+    /// Records the chroma pass into `encoder` if it applies; returns whether it did. Skipping
+    /// is the pass's only failure mode (see the spec): a reason to skip warns once.
+    fn encode_chroma(&self, buffers: &Buffers, p: &crate::denoise::chroma_filter::ChromaFilterParams, encoder: &mut wgpu::CommandEncoder) -> bool {
+        use crate::denoise::chroma_filter::MODE_PLANAR;
+        if !p.is_active() { return false; }
+        let skip = |why: &str| {
+            if !self.chroma_warned.swap(true, std::sync::atomic::Ordering::Relaxed) { log::warn!("Chroma smoothing skipped: {why}"); }
+            false
+        };
+        let Some(c) = &self.chroma else { return skip("this output, pixel format or pipeline is not supported"); };
+        let mut kp = *p;
+        kp.width = buffers.output.size.0 as i32;
+        kp.height = buffers.output.size.1 as i32;
+        kp.stride = buffers.output.size.2 as i32;
+        if p.mode == MODE_PLANAR {
+            let (Some(g), Some(gtex)) = (&buffers.guide, &c.guide) else { return skip("no luma guide for a chroma plane"); };
+            let BufferSource::Cpu { buffer } = &g.data else { return skip("the luma guide is not a CPU buffer"); };
+            let len = g.size.1 * g.size.2;
+            if buffer.len() < len { return skip("the luma guide is smaller than its size says"); }
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: gtex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &buffer[..len],
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(g.size.2 as u32), rows_per_image: None },
+                wgpu::Extent3d { width: g.size.0 as u32, height: g.size.1 as u32, depth_or_array_layers: 1 },
+            );
+            kp.guide_width = g.size.0 as i32;
+            kp.guide_height = g.size.1 as i32;
+            kp.guide_stride = g.size.2 as i32;
+        }
+        self.queue.write_buffer(&c.params, 0, bytemuck::bytes_of(&kp));
+        let view = c.out.create_view(&Default::default());
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None, depth_stencil_attachment: None,
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &view, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+        });
+        rpass.set_pipeline(&c.pipeline);
+        rpass.set_bind_group(0, &c.bind_group, &[]);
+        rpass.draw(0..4, 0..1);
+        true
     }
 
     pub fn undistort_image(&self, buffers: &mut Buffers, itm: &crate::stabilization::FrameTransform, drawing_buffer: &[u8]) -> bool {
@@ -608,7 +708,17 @@ impl WgpuWrapper {
             }
         }
 
-        let _temp_texture2 = handle_output_texture(&self.device, &buffers.output, &self.queue, &mut encoder, &self.out_texture, self.pixel_format, self.staging_buffer.as_ref().unwrap(), self.padded_out_stride);
+        let chroma_ran = self.encode_chroma(buffers, &itm.chroma_filter, &mut encoder);
+        let _temp_texture2 = if chroma_ran {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &self.chroma.as_ref().unwrap().out, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: self.staging_buffer.as_ref().unwrap(), layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.padded_out_stride), rows_per_image: None } },
+                wgpu::Extent3d { width: buffers.output.size.0 as u32, height: buffers.output.size.1 as u32, depth_or_array_layers: 1 },
+            );
+            None
+        } else {
+            handle_output_texture(&self.device, &buffers.output, &self.queue, &mut encoder, &self.out_texture, self.pixel_format, self.staging_buffer.as_ref().unwrap(), self.padded_out_stride)
+        };
 
         let sub_index = self.queue.submit(Some(encoder.finish()));
 

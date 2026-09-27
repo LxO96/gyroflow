@@ -11,8 +11,8 @@ pub mod wgpu_interop;
 #[cfg(target_os = "windows")]                            pub mod wgpu_interop_directx;
 #[cfg(any(target_os = "windows", target_os = "linux"))]  pub mod wgpu_interop_cuda;
 
-pub mod drawing;
-use std::hash::Hasher;
+pub mod drawing;
+use std::hash::Hasher;
 
 /// Frames an input allocation must hold when temporal denoising is active: the largest
 /// `2k + 1` any quality tier asks for (`DenoiseQuality::High`, k = 3).
@@ -289,6 +289,9 @@ pub struct Buffers<'a> {
     /// Temporal reference frames, in temporal order, excluding the centre frame
     /// which is `input`. Empty when denoising is off.
     pub references: Vec<BufferDescription<'a>>,
+    /// The luma plane guiding the chroma pass on a chroma plane (see
+    /// `denoise::chroma_filter`). `None` everywhere else, and whenever the pass is off.
+    pub guide: Option<BufferDescription<'a>>,
 }
 
 #[derive(Debug, Default)]
@@ -415,10 +418,39 @@ impl<'a> Buffers<'a> {
         // count would rebuild (and recompile) the whole pipeline several times per
         // render; the wrapper is instead sized once for `MAX_GATHER_FRAMES`.
         hasher.write_u8(!self.references.is_empty() as u8);
+        // The chroma pass's guide buffer is allocated from the guide at creation, so a wrapper
+        // built without one (or for another size) must not be reused for a plane that has one.
+        // On 4:4:4 formats every plane has the same size, so without this the chroma planes
+        // picked up the luma plane's wrapper and chroma smoothing silently never ran.
+        match &self.guide {
+            Some(g) => { hasher.write_u8(1); hasher.write_u32(g.get_checksum()); },
+            None => hasher.write_u8(0),
+        }
         hasher.finalize()
     }
 }
 
+
+#[cfg(test)]
+mod guide_checksum_tests {
+    use super::*;
+
+    /// The checksum keys the GPU wrapper cache. On 4:4:4 formats planes 0, 1 and 2 have the
+    /// same size and stride, so without the guide in the key the chroma planes reused plane
+    /// 0's wrapper, which was built without a guide buffer, and chroma smoothing never ran.
+    #[test]
+    fn a_guide_changes_the_cache_checksum() {
+        let (mut a, mut b, mut g1, mut g2) = (vec![0u8; 64 * 16], vec![0u8; 64 * 16], vec![0u8; 64 * 16], vec![0u8; 128 * 32]);
+        fn desc(buf: &mut Vec<u8>, w: usize, h: usize) -> BufferDescription<'_> { BufferDescription { size: (w, h, w), data: BufferSource::Cpu { buffer: buf.as_mut_slice() }, ..Default::default() } }
+        let plain = Buffers { input: desc(&mut a, 64, 16), output: desc(&mut b, 64, 16), references: vec![], guide: None }.get_checksum();
+        let (mut a, mut b) = (vec![0u8; 64 * 16], vec![0u8; 64 * 16]);
+        let guided = Buffers { input: desc(&mut a, 64, 16), output: desc(&mut b, 64, 16), references: vec![], guide: Some(desc(&mut g1, 64, 16)) }.get_checksum();
+        let (mut a, mut b) = (vec![0u8; 64 * 16], vec![0u8; 64 * 16]);
+        let guided_bigger = Buffers { input: desc(&mut a, 64, 16), output: desc(&mut b, 64, 16), references: vec![], guide: Some(desc(&mut g2, 128, 32)) }.get_checksum();
+        assert_ne!(plain, guided, "a wrapper built without a guide must not serve a plane that has one");
+        assert_ne!(guided, guided_bigger, "the guide buffer is sized from the guide, so its size must key the wrapper too");
+    }
+}
 
 #[cfg(test)]
 mod reference_layout_tests {

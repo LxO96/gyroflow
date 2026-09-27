@@ -1235,7 +1235,7 @@ mod color_stage_tests {
             let params = base_params(flags, color_params_1, color_params_2, color_params_3);
             let mut input = input_bytes.clone();
             let mut output = vec![0u8; (STRIDE * H) as usize];
-            let mut buffers = Buffers {
+            let mut buffers = Buffers { guide: None,
                 input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
                 output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
                 references: Vec::new(),

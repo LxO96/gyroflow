@@ -1288,7 +1288,7 @@ impl Controller {
                 let _time = std::time::Instant::now();
 
                 if preview_pipeline.load(SeqCst) == 0 {
-                    let mut buffers = Buffers{
+                    let mut buffers = Buffers{ guide: None,
                         input:  BufferDescription { size: (width as usize, height as usize, width as usize * 4), ..Default::default() },
                         output: BufferDescription { size: (width as usize, height as usize, width as usize * 4), ..Default::default() },
                         references: Vec::new(),
@@ -1318,7 +1318,7 @@ impl Controller {
                 let mut buffers =
                     match backend_id {
                         1 => { // OpenGL, ptr1: texture, ptr2: opengl context
-                            Some((Buffers {
+                            Some((Buffers { guide: None,
                                 input: BufferDescription {
                                     size,
                                     data: BufferSource::OpenGL {
@@ -1355,7 +1355,7 @@ impl Controller {
                         },
                         #[cfg(target_os = "windows")]
                         3 => { // D3D11, ptr1: texture, ptr2: device, ptr3: device context
-                            Some((Buffers {
+                            Some((Buffers { guide: None,
                                 input: BufferDescription {
                                     size,
                                     texture_copy: true,
@@ -1380,7 +1380,7 @@ impl Controller {
                         },
                         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                         4 => { // Vulkan, ptr1: VkImage, ptr2: VkDevice, ptr3: VkCommandBuffer, ptr4: VkPhysicalDevice, ptr5: VkInstance
-                            Some((Buffers {
+                            Some((Buffers { guide: None,
                                 input: BufferDescription {
                                     size,
                                     texture_copy: false,
@@ -1452,7 +1452,7 @@ impl Controller {
                     ..Default::default()
                 }).collect();
 
-                let ret = stab.process_pixels_with_references::<RGBA8>(timestamp_us, Some(frame as usize), &mut Buffers {
+                let ret = stab.process_pixels_with_references::<RGBA8>(timestamp_us, Some(frame as usize), &mut Buffers { guide: None,
                     input: BufferDescription {
                         size: in_size,
                         data: BufferSource::Cpu { buffer: pixels },
