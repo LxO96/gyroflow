@@ -106,8 +106,12 @@ thumbnail-handler:
     $ErrorActionPreference = 'Stop'
     $ProjectDir = resolve-path "{{ProjectDir}}"
     $Out = "$ProjectDir\target\release"
+    # $ErrorActionPreference does not cover native exit codes, and a failed build would
+    # otherwise copy the previous binaries below and report success.
     cargo build --release --manifest-path "$ProjectDir\src\thumbnail_handler\Cargo.toml"
+    if ($LASTEXITCODE -ne 0) { throw "thumbnail_handler build failed" }
     cargo build --release --manifest-path "$ProjectDir\src\thumbnailer\Cargo.toml"
+    if ($LASTEXITCODE -ne 0) { throw "thumbnailer build failed" }
     copy-item "$ProjectDir\src\thumbnail_handler\target\release\gyroflow_thumbnail.dll" "$Out" -Force
     copy-item "$ProjectDir\src\thumbnailer\target\release\gyroflow-thumbnailer.exe" "$Out" -Force
     $FFmpegDir = "{{FFMPEG_DIR}}\bin"
