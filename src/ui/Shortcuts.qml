@@ -98,6 +98,12 @@ Item {
         onActivated: videoArea.stabEnabledBtn.checked = !videoArea.stabEnabledBtn.checked;
     }
 
+    // Video scopes on/off
+    Shortcut {
+        sequence: "Shift+S";
+        onActivated: videoArea.scopesBtn.checked = !videoArea.scopesBtn.checked;
+    }
+
     // Stabilization overview on/off
     Shortcut {
         sequence: "d";

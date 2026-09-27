@@ -3,6 +3,7 @@
 
 import QtQuick
 import MDKVideo
+import Gyroflow
 
 import "components/"
 import "menu/" as Menu
@@ -20,6 +21,7 @@ Item {
     property alias videoLoader: videoLoader;
     property alias stabEnabledBtn: stabEnabledBtn;
     property alias fovOverviewBtn: fovOverviewBtn;
+    property alias scopesBtn: scopesBtn;
     property alias queue: queue.item;
     property alias statistics: statistics;
     property alias infoMessages: infoMessages;
@@ -894,6 +896,78 @@ Item {
                         border.width: 1 * dpiScale;
                     }
                 }
+                // Video scopes of the *displayed* frame - the graded, stabilized preview, which
+                // is what the export will look like. See ScopeView.rs for where the pixels come
+                // from. A sibling of `vid`, not a child, so `vid.grabToImage` (the white balance
+                // picker) never samples the scope.
+                Rectangle {
+                    id: scopesOverlay;
+                    visible: scopesBtn.checked && vid.loaded;
+                    // 0 waveform, 1 histogram, 2 vectorscope - ScopeKind's values.
+                    property int kind: 0;
+                    property bool restored: false;
+                    onKindChanged: if (restored) settings.setValue("scopeKind", kind);
+                    Component.onCompleted: { kind = +settings.value("scopeKind", 0); restored = true; }
+
+                    anchors.top: vid.top;
+                    anchors.right: vid.right;
+                    anchors.margins: 8 * dpiScale;
+                    width: Math.min(vid.width * 0.45, 360 * dpiScale);
+                    height: scopeHeader.height + scopeView.height + 8 * dpiScale;
+                    color: "#c0101010";
+                    border.color: "#40ffffff";
+                    border.width: 1;
+                    radius: 5 * dpiScale;
+
+                    // Clicks on the scope are not clicks on the video: without this, a quick
+                    // double click on the tabs would toggle full screen.
+                    MouseArea { anchors.fill: parent; acceptedButtons: Qt.AllButtons; }
+
+                    Row {
+                        id: scopeHeader;
+                        x: 4 * dpiScale;
+                        y: 2 * dpiScale;
+                        component ScopeTab: LinkButton {
+                            property int scopeKind: 0;
+                            readonly property bool selected: scopesOverlay.kind == scopeKind;
+                            font.pixelSize: 11 * dpiScale;
+                            font.underline: false;
+                            leftPadding: 5 * dpiScale; rightPadding: 5 * dpiScale;
+                            topPadding: 3 * dpiScale; bottomPadding: 3 * dpiScale;
+                            textColor: selected? styleAccentColor : styleTextColor;
+                            opacity: selected? 1 : 0.6;
+                            onClicked: scopesOverlay.kind = scopeKind;
+                        }
+                        ScopeTab { scopeKind: 0; text: qsTr("Waveform"); }
+                        ScopeTab { scopeKind: 1; text: qsTr("Histogram"); }
+                        ScopeTab { scopeKind: 2; text: qsTr("Vectorscope"); }
+                        LinkButton {
+                            id: scopeLive;
+                            property bool on: false;
+                            Component.onCompleted: on = settings.value("scopeLive", false);
+                            onClicked: { on = !on; settings.setValue("scopeLive", on); }
+                            text: qsTr("Live");
+                            font.pixelSize: 11 * dpiScale;
+                            font.underline: false;
+                            leftPadding: 8 * dpiScale; rightPadding: 5 * dpiScale;
+                            topPadding: 3 * dpiScale; bottomPadding: 3 * dpiScale;
+                            textColor: on? styleAccentColor : styleTextColor;
+                            opacity: on? 1 : 0.6;
+                            tooltip: qsTr("Also update during playback, about 10 times a second. Off: only while paused.");
+                        }
+                    }
+                    ScopeView {
+                        id: scopeView;
+                        x: 4 * dpiScale;
+                        anchors.top: scopeHeader.bottom;
+                        width: parent.width - 8 * dpiScale;
+                        height: scopesOverlay.kind == 2? Math.min(width, 220 * dpiScale) : width * 0.5;
+                        kind: scopesOverlay.kind;
+                        live: scopeLive.on;
+                        active: scopesOverlay.visible;
+                        Component.onCompleted: attach(vid);
+                    }
+                }
             }
             Item {
                 id: secondPreview;
@@ -1186,6 +1260,15 @@ Item {
                     iconName: "pencil-outline";
                     onCheckedChanged: { controller.preview_color_enabled = checked; vid.forceRedraw(); }
                     tooltip: qsTr("Toggle color adjustments");
+                }
+
+                SmallLinkButton {
+                    id: scopesBtn;
+                    iconName: "chart";
+                    checked: false;
+                    onCheckedChanged: settings.setValue("scopesShown", checked);
+                    Component.onCompleted: checked = settings.value("scopesShown", false);
+                    tooltip: qsTr("Toggle video scopes (Shift+S)");
                 }
 
                 SmallLinkButton {
