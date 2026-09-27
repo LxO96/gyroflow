@@ -32,6 +32,12 @@ pub struct OclWrapper {
     chroma_warned: std::sync::atomic::AtomicBool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: makes building the chroma pass fail, as a driver rejecting its kernel would.
+    pub(crate) static FAIL_CHROMA_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct OclChroma {
     kernel: Kernel,
     dst: Buffer<u8>,
@@ -346,7 +352,12 @@ impl OclWrapper {
 
             let kernel = builder.build()?;
 
-            let chroma = if matches!(buffers.output.data, BufferSource::Cpu { .. }) && ocl_names.1 != "convert_half4" {
+            // Built in a closure so that any failure (a driver rejecting the kernel, no memory
+            // for the scratch buffer) costs only the pass, never the wrapper: skipping the pass
+            // is its only failure mode, and OpenCL must keep working for everyone else.
+            let build_chroma = || -> ocl::Result<OclChroma> {
+                #[cfg(test)]
+                if FAIL_CHROMA_BUILD.with(|f| f.get()) { return Err(ocl::Error::from(String::from("forced chroma build failure"))); }
                 let guide_type = ocl_names.0.trim_end_matches(|c: char| c.is_ascii_digit());
                 let src = include_str!("opencl_chroma_filter.cl")
                     .replace("DATA_CONVERTF", ocl_names.3)
@@ -373,7 +384,13 @@ impl OclWrapper {
                         .arg(cguide.as_ref().unwrap_or(&dest_buffer)) // 2: unused in RGB mode
                         .arg(&cparams);                               // 3
                 }
-                Some(OclChroma { kernel: b.build()?, dst: cdst, guide: cguide, params: cparams })
+                Ok(OclChroma { kernel: b.build()?, dst: cdst, guide: cguide, params: cparams })
+            };
+            let chroma = if matches!(buffers.output.data, BufferSource::Cpu { .. }) && ocl_names.1 != "convert_half4" {
+                match build_chroma() {
+                    Ok(c) => Some(c),
+                    Err(e) => { log::warn!("Chroma smoothing is unavailable on this OpenCL device and will be skipped: {e:?}"); None }
+                }
             } else { None };
 
             // Clear the drawing buffer

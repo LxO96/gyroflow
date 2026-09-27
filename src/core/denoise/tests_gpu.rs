@@ -828,3 +828,21 @@ fn resolve16(r: Result<Vec<[u16; 4]>, String>) -> Option<Vec<[u16; 4]>> {
         Err(e) => panic!("run failed: {e}"),
     }
 }
+
+/// A driver that rejects the chroma kernel (or runs out of memory for its scratch buffer) must
+/// cost only the chroma pass, never the whole OpenCL backend: the spec's only failure mode is
+/// skipping the pass. Before the fix, OclWrapper::new failed and OpenCL was lost even for
+/// users who never enable denoising.
+#[cfg(feature = "use-opencl")]
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored chroma_gpu"]
+fn chroma_gpu_a_failed_pass_build_keeps_opencl_working() {
+    let scene = rgb_chroma_scene();
+    crate::gpu::opencl::FAIL_CHROMA_BUILD.with(|f| f.set(true));
+    let result = run_opencl_chroma_rgb(&scene, 0.5);
+    crate::gpu::opencl::FAIL_CHROMA_BUILD.with(|f| f.set(false));
+    if let Some(out) = resolve("OpenCL", result) {
+        // The main kernel still ran (identity), and the pass was skipped, not half-applied.
+        for i in 0..N { assert_eq!(out[i], scene[i], "pixel {i}: expected the unsmoothed frame"); }
+    }
+}
