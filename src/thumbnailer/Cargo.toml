@@ -13,7 +13,9 @@ path = "src/main.rs"
 # ffmpeg only. Deliberately no Qt and no OpenCV: this is spawned per thumbnail, so its
 # startup cost is paid every time Explorer draws a file. Measured ~43 ms, against ~314 ms
 # for the Qt-linked gyroflow.exe.
-ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format", "software-scaling"] }
+# Kept in step with the main crate's ffmpeg-next: both link the one runtime in ext\ffmpeg-*,
+# so a version skew here fails to compile against those headers rather than failing at load.
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-scaling"] }
 
 [profile.release]
 opt-level = "z"
