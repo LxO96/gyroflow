@@ -1367,6 +1367,7 @@ impl StabilizationManager {
                 "quality":         d.quality.id(),
                 "luma_strength":   d.luma_strength,
                 "chroma_strength": d.chroma_strength,
+                "chroma_smoothing": d.chroma_smoothing,
             })
         };
 
@@ -1960,7 +1961,7 @@ impl StabilizationManager {
                 // Clamped through set_param so a hand-edited or corrupted project
                 // cannot produce a nonsensical sigma. The ranges live in
                 // `DenoiseSettings::set_param`, shared with the QML entry point.
-                for key in ["luma_strength", "chroma_strength"] {
+                for key in ["luma_strength", "chroma_strength", "chroma_smoothing"] {
                     if let Some(v) = obj.get(key).and_then(|x| x.as_f64()) { d.set_param(key, v); }
                 }
                 // An unknown id (an older or newer build, a hand-edited file) falls
@@ -2518,6 +2519,7 @@ DOMAIN_MAX 1.0 1.0 1.0
             d.quality = denoise::DenoiseQuality::High;
             d.luma_strength = 0.25;
             d.chroma_strength = 0.75;
+            d.chroma_smoothing = 0.3;
         }
         let restored = round_trip(&mgr);
 
@@ -2527,6 +2529,14 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert_eq!(a.quality, b.quality);
         assert_eq!(a.luma_strength, b.luma_strength);
         assert_eq!(a.chroma_strength, b.chroma_strength);
+        assert_eq!(a.chroma_smoothing, b.chroma_smoothing);
+    }
+
+    #[test]
+    fn denoise_import_clamps_chroma_smoothing() {
+        let mgr = StabilizationManager::default();
+        apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"denoise":{"chroma_smoothing":-3.0}}"#);
+        assert_eq!(mgr.denoise.read().chroma_smoothing, denoise::MIN_STRENGTH);
     }
 
     #[test]
