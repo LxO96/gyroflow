@@ -15,6 +15,7 @@ pub mod keyframes;
 pub mod stmap;
 pub mod color;
 pub mod denoise;
+pub mod film;
 pub mod scopes;
 
 pub mod zooming;
