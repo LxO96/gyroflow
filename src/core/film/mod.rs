@@ -27,6 +27,152 @@ pub fn halo_factor(r: f64) -> u32 {
     if r <= 8.0 { 1 } else { (2f64.powf((r / 8.0).log2().ceil())).min(64.0) as u32 }
 }
 
+pub mod params;
+pub mod reference;
+pub use params::FilmParams;
+use params::*;
+use stocks::FilmFormat;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FilmSettings {
+    /// `None` = Off.
+    pub stock: Option<String>,
+    pub format: FilmFormat,
+    pub tone: bool,
+    pub grain: bool,
+    pub halation: bool,
+    /// 0..2, 1 = the stock's own grain.
+    pub grain_amount: f64,
+    /// 0..1.
+    pub halation_amount: f64,
+}
+impl Default for FilmSettings {
+    fn default() -> Self { Self { stock: None, format: FilmFormat::Mm35, tone: true, grain: true, halation: true, grain_amount: 1.0, halation_amount: 0.5 } }
+}
+impl FilmSettings {
+    pub fn set_param(&mut self, name: &str, v: f64) -> bool {
+        if !v.is_finite() { return false; }
+        match name {
+            "grain_amount" => self.grain_amount = v.clamp(0.0, 2.0),
+            "halation_amount" => self.halation_amount = v.clamp(0.0, 1.0),
+            _ => return false,
+        }
+        true
+    }
+    pub fn set_flag(&mut self, name: &str, v: bool) -> bool {
+        match name { "tone" => self.tone = v, "grain" => self.grain = v, "halation" => self.halation = v, _ => return false }
+        true
+    }
+    /// An unknown stock id is Off: a newer project opened in an older build must not crash or guess.
+    pub fn set_stock(&mut self, id: &str) { self.stock = stocks::stock(id).map(|s| s.id.to_string()); }
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "stock": self.stock.clone().unwrap_or_else(|| "off".into()),
+            "format": self.format.id(),
+            "tone": self.tone, "grain": self.grain, "halation": self.halation,
+            "grain_amount": self.grain_amount, "halation_amount": self.halation_amount,
+        })
+    }
+    /// Missing keys keep their current value; out-of-range values are clamped.
+    pub fn apply_json(&mut self, v: &serde_json::Value) {
+        if let Some(s) = v.get("stock").and_then(|x| x.as_str()) { self.set_stock(s); }
+        if let Some(f) = v.get("format").and_then(|x| x.as_str()).and_then(FilmFormat::from_id) { self.format = f; }
+        for k in ["tone", "grain", "halation"] { if let Some(b) = v.get(k).and_then(|x| x.as_bool()) { self.set_flag(k, b); } }
+        for k in ["grain_amount", "halation_amount"] { if let Some(x) = v.get(k).and_then(|x| x.as_f64()) { self.set_param(k, x); } }
+    }
+}
+
+/// Everything per-clip the film chain needs; `frame_params` makes one frame's block.
+#[derive(Clone, Debug)]
+pub struct FilmContext { pub settings: FilmSettings, pub export_short: usize, pub fps: f64, pub seed: u32 }
+
+impl FilmContext {
+    /// `None` when the chain would do nothing: stock Off or unknown, or every part off.
+    pub fn new(settings: FilmSettings, export_short: usize, fps: f64, file_name: &str) -> Option<Self> {
+        let stock = stocks::stock(settings.stock.as_deref()?)?;
+        let grain = settings.grain && settings.grain_amount > 0.0;
+        let halo = settings.halation && settings.halation_amount > 0.0 && stock.halation.gain > 0.0;
+        if !(settings.tone || grain || halo) || export_short == 0 { return None; }
+        Some(Self { settings, export_short, fps, seed: noise::fnv1a_utf16(file_name) })
+    }
+
+    /// One frame's parameters for a `buf_w` x `buf_h` buffer. Sizes and stride are filled by the backend.
+    pub fn frame_params(&self, buf_w: usize, buf_h: usize, source_timestamp_us: i64, max_value: f32) -> FilmParams {
+        let s = &self.settings;
+        let stock = stocks::stock(s.stock.as_deref().unwrap_or_default()).expect("FilmContext::new checked the stock");
+        let gate = s.format.gate_short_mm();
+        let d = self.export_short as f64;
+        let p = (buf_w.min(buf_h) as f64 / d).min(1.0);
+        let mut fp = FilmParams { max_value, inv_p: (1.0 / p) as f32, ..Default::default() };
+
+        if s.tone {
+            fp.flags |= FLAG_TONE;
+            let fit = curve::fit_curve(stock);
+            fp.fit_b = fit.b as f32; fp.fit_s = fit.s as f32; fp.fit_umin_a = fit.u_min_a as f32;
+            for i in 0..3 {
+                let l = &stock.layers[i];
+                let range = l.u_max - l.u_min;
+                fp.log_e0[i] = l.log_e0 as f32; fp.k[i] = (4.0 * l.gamma / range) as f32;
+                fp.u_min[i] = l.u_min as f32; fp.range[i] = range as f32;
+                for j in 0..3 { fp.sens[i][j] = stock.sensitivity[i * 3 + j] as f32; fp.cross[i][j] = stock.crosstalk[i * 3 + j] as f32; }
+            }
+        }
+        if stock.bw { fp.flags |= FLAG_BW; }
+        if s.grain && s.grain_amount > 0.0 {
+            fp.flags |= FLAG_GRAIN;
+            let scale = grain::quantize_scale(d / REF_SHORT_PX * REF_SHORT_MM / gate);
+            let z = if p >= 1.0 { 1.0 } else { grain::quantize_scale(p) };
+            let g = grain::grain_setup(&stock.grain, scale, z);
+            fp.grain_sigma = g.sigma as f32;
+            fp.grain_radius = g.radius as i32;
+            fp.grain_k = (s.grain_amount * g.norm) as f32;
+            fp.std_table[..=grain::STD_TABLE].copy_from_slice(&g.std);
+            let frame = (source_timestamp_us as f64 * self.fps / 1_000_000.0).round().max(0.0) as u32;
+            let ls = noise::layer_seeds(self.seed, frame);
+            fp.seeds = [ls[0], ls[1], ls[2], 0];
+        }
+        if s.halation && s.halation_amount > 0.0 && stock.halation.gain > 0.0 {
+            fp.flags |= FLAG_HALATION;
+            let r = halation_radius(d, gate) * p;
+            let f = halo_factor(r);
+            fp.halo_f = f as i32;
+            fp.halo_w = buf_w.div_ceil(f as usize) as i32;
+            fp.halo_h = buf_h.div_ceil(f as usize) as i32;
+            fp.halo_sigma = (r / f as f64) as f32;
+            fp.halo_radius = ((grain::gaussian_kernel(r / f as f64).len() - 1) / 2) as i32;
+            fp.halo_strength = (s.halation_amount * stock.halation.gain) as f32;
+            fp.halo_tint = [stock.halation.tint[0] as f32, stock.halation.tint[1] as f32, stock.halation.tint[2] as f32, 0.0];
+        }
+        fp
+    }
+}
+
+/// The film chain runs on packed RGBA only, in R, G, B order, 8 or 16 bits. By type name rather
+/// than `TypeId`: the generic callers (`process_pixels_with_references::<T>`) carry no `'static`
+/// bound, and BGRA8 / AYUV16 share these types' OpenCL and wgpu formats, so formats cannot tell.
+pub fn supported<T: crate::stabilization::PixelType>() -> bool {
+    let n = std::any::type_name::<T>();
+    n.ends_with("::RGBA8") || n.ends_with("::RGBA16")
+}
+
+/// Test support: a halo grid of factor `f` regardless of the radius the settings give.
+#[cfg(test)]
+pub(crate) fn force_halo_grid(p: &mut FilmParams, f: i32, w: usize, h: usize) {
+    p.flags |= FLAG_HALATION;
+    p.halo_f = f;
+    p.halo_w = w.div_ceil(f as usize) as i32;
+    p.halo_h = h.div_ceil(f as usize) as i32;
+    p.halo_sigma = 2.0;
+    p.halo_radius = 6;
+    if p.halo_strength == 0.0 { p.halo_strength = 1.0; p.halo_tint = [1.0, 0.28, 0.05, 0.0]; }
+}
+
+static LAST_SKIP: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+/// Why the GPU last skipped a film frame it was asked to render (build failure, unsupported
+/// output). Shown in the Film panel; the render itself continues without film.
+pub fn set_last_skip(why: String) { ::log::warn!("Film simulation skipped: {why}"); *LAST_SKIP.lock() = Some(why); }
+pub fn last_skip() -> Option<String> { LAST_SKIP.lock().clone() }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,5 +276,133 @@ mod tests {
         let s16 = 5100.0 / REF_SHORT_PX * REF_SHORT_MM / stocks::FilmFormat::Super16.gate_short_mm();
         assert!((s16 - 0.902).abs() < 0.001);
         assert!((halation_radius(5100.0, 24.0) - 40.8).abs() < 0.1);
+    }
+    fn ctx(stock: &str) -> FilmContext {
+        let s = FilmSettings { stock: Some(stock.into()), ..Default::default() };
+        FilmContext::new(s, 256, 25.0, "C0001.MP4").unwrap()
+    }
+    fn grey(w: usize, h: usize, v: f32) -> Vec<[f32; 4]> { vec![[v, v, v, 1.0]; w * h] }
+    fn mean_std(xs: &[f32]) -> (f64, f64) {
+        let n = xs.len() as f64;
+        let m = xs.iter().map(|&x| x as f64).sum::<f64>() / n;
+        (m, (xs.iter().map(|&x| (x as f64 - m).powi(2)).sum::<f64>() / n).sqrt())
+    }
+
+    #[test]
+    fn film_params_has_the_layout_every_kernel_mirrors() {
+        assert_eq!(std::mem::size_of::<params::FilmParams>(), 1296);
+        assert_eq!(std::mem::offset_of!(params::FilmParams, seeds), 80);
+        assert_eq!(std::mem::offset_of!(params::FilmParams, std_table), 272);
+    }
+
+    #[test]
+    fn off_or_nothing_enabled_is_no_context() {
+        assert!(FilmContext::new(FilmSettings::default(), 256, 25.0, "a").is_none(), "stock Off");
+        let s = FilmSettings { stock: Some("golden200".into()), tone: false, grain: false, halation: false, ..Default::default() };
+        assert!(FilmContext::new(s, 256, 25.0, "a").is_none(), "all toggles off");
+        let s = FilmSettings { stock: Some("no-such-stock".into()), ..Default::default() };
+        assert!(FilmContext::new(s, 256, 25.0, "a").is_none(), "unknown stock");
+    }
+
+    #[test]
+    fn grain_moves_every_frame_and_repeats_per_frame() {
+        let c = ctx("golden200");
+        let src = grey(64, 64, 0.46);
+        let a = reference::render(&src, 64, 64, &c.frame_params(64, 64, 0, 1.0));
+        let a2 = reference::render(&src, 64, 64, &c.frame_params(64, 64, 0, 1.0));
+        let b = reference::render(&src, 64, 64, &c.frame_params(64, 64, 40_000, 1.0)); // next frame at 25 fps
+        assert_eq!(a, a2, "same frame must render identically");
+        assert!(a.iter().zip(&b).filter(|(x, y)| x != y).count() > 64 * 64 / 2, "grain did not move between frames");
+    }
+
+    /// Handover verification: on a flat patch the measured std is amount·std(u) and the lag-1
+    /// correlation the model's, at full size and at a 1/4 preview.
+    #[test]
+    fn grain_statistics_match_the_model() {
+        for (w, export_short) in [(256usize, 256usize), (256, 1024)] {
+            let s = FilmSettings { stock: Some("golden200".into()), tone: false, halation: false, ..Default::default() };
+            let c = FilmContext::new(s, export_short, 25.0, "x").unwrap();
+            let p = c.frame_params(w, w, 0, 1.0);
+            let out = reference::render(&grey(w, w, 0.46), w, w, &p);
+            let d: Vec<f32> = out.iter().map(|px| px[1] - 0.46).collect();
+            let (_, sd) = mean_std(&d);
+            let want = p.std_table[(0.46f32 * 200.0 + 0.5) as usize] as f64;
+            assert!((sd / want - 1.0).abs() < 0.05, "std {sd} vs model {want} (export_short {export_short})");
+            let num: f64 = (0..w).flat_map(|y| (0..w - 1).map(move |x| (y, x))).map(|(y, x)| d[y * w + x] as f64 * d[y * w + x + 1] as f64).sum::<f64>() / (w * (w - 1)) as f64;
+            let lag1 = num / (sd * sd);
+            let setup = grain::grain_setup(&stocks::stock("golden200").unwrap().grain, p_scale(&c), p_z(&c, w));
+            assert!((lag1 - setup.lag_one).abs() < 0.05, "lag1 {lag1} vs model {} (export_short {export_short})", setup.lag_one);
+        }
+    }
+    fn p_scale(c: &FilmContext) -> f64 { grain::quantize_scale(c.export_short as f64 / REF_SHORT_PX * REF_SHORT_MM / c.settings.format.gate_short_mm()) }
+    fn p_z(c: &FilmContext, buf_short: usize) -> f64 { let p = (buf_short as f64 / c.export_short as f64).min(1.0); if p >= 1.0 { 1.0 } else { grain::quantize_scale(p) } }
+
+    #[test]
+    fn bw_grain_stays_neutral() {
+        let s = FilmSettings { stock: Some("classic400bw".into()), tone: false, halation: false, ..Default::default() };
+        let c = FilmContext::new(s, 64, 25.0, "x").unwrap();
+        for px in reference::render(&grey(64, 64, 0.4), 64, 64, &c.frame_params(64, 64, 0, 1.0)) {
+            assert!(px[0] == px[1] && px[1] == px[2], "B&W grain tinted a pixel: {px:?}");
+        }
+    }
+
+    #[test]
+    fn zero_amounts_equal_tone_only() {
+        let src: Vec<[f32; 4]> = (0..64 * 64).map(|i| { let v = (i % 64) as f32 / 63.0; [v, 0.5 * v, 1.0 - v, 1.0] }).collect();
+        let tone_only = FilmSettings { stock: Some("golden200".into()), grain: false, halation: false, ..Default::default() };
+        let zeroed = FilmSettings { stock: Some("golden200".into()), grain_amount: 0.0, halation_amount: 0.0, ..Default::default() };
+        let a = reference::render(&src, 64, 64, &FilmContext::new(tone_only, 64, 25.0, "x").unwrap().frame_params(64, 64, 0, 1.0));
+        let b = reference::render(&src, 64, 64, &FilmContext::new(zeroed, 64, 25.0, "x").unwrap().frame_params(64, 64, 0, 1.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn halation_only_glows_around_highlights() {
+        // Super 8 at a 64 px frame: R = 0.008·64·24/4.01 ≈ 3.1 px, f = 1.
+        let s = FilmSettings { stock: Some("tungsten800".into()), format: stocks::FilmFormat::Super8, tone: false, grain: false, halation_amount: 1.0, ..Default::default() };
+        let c = FilmContext::new(s, 64, 25.0, "x").unwrap();
+        // Nothing near clipping: only the decode/encode round trip may differ.
+        let dark = grey(64, 64, 0.5);
+        let out = reference::render(&dark, 64, 64, &c.frame_params(64, 64, 0, 1.0));
+        assert!(out.iter().zip(&dark).all(|(a, b)| (0..4).all(|i| (a[i] - b[i]).abs() < 1e-5)), "a frame without highlights changed");
+        let mut src = grey(64, 64, 0.3);
+        for y in 28..36 { for x in 28..36 { src[y * 64 + x] = [1.0, 1.0, 1.0, 1.0]; } }
+        let out = reference::render(&src, 64, 64, &c.frame_params(64, 64, 0, 1.0));
+        let near = out[32 * 64 + 38];
+        assert!(near[0] > 0.3 + 0.01, "no red glow next to the highlight: {near:?}");
+        assert!(near[0] - 0.3 > 3.0 * (near[2] - 0.3), "glow is not red-dominant: {near:?}");
+        let far = out[2 * 64 + 2];
+        assert!((far[0] - 0.3).abs() < 1e-4, "glow reached the far corner: {far:?}");
+    }
+
+    /// Review focus 1: a halo grid whose last block hangs off the frame. R = 0.008·D·24/gate·p
+    /// cannot exceed 8 px on a frame this small (`D·p` is the buffer's short side), so the
+    /// grid is forced to f = 4; the arithmetic is the same at any size.
+    #[test]
+    fn halo_grid_on_an_odd_frame_reads_inside_the_frame() {
+        let s = FilmSettings { stock: Some("golden200".into()), tone: false, grain: false, ..Default::default() };
+        let mut p = FilmContext::new(s, 45, 25.0, "x").unwrap().frame_params(67, 45, 0, 1.0);
+        force_halo_grid(&mut p, 4, 67, 45);
+        assert_eq!((p.halo_w, p.halo_h), (17, 12));
+        let mut src = grey(67, 45, 0.3);
+        for y in 40..45 { for x in 64..67 { src[y * 67 + x] = [1.0; 4]; } } // highlight in the clipped corner block
+        let out = reference::render(&src, 67, 45, &p);
+        assert!(out[44 * 67 + 60][0] > 0.3, "the corner block's highlight did not glow");
+    }
+
+    #[test]
+    fn settings_round_trip_and_clamp() {
+        let s = FilmSettings { stock: Some("vivid100".into()), format: stocks::FilmFormat::Super16, tone: false, grain_amount: 1.5, ..Default::default() };
+        let mut t = FilmSettings::default();
+        t.apply_json(&s.to_json());
+        assert_eq!(t, s);
+        let mut u = FilmSettings::default();
+        u.apply_json(&serde_json::json!({ "stock": "bogus", "grain_amount": 9.0, "halation_amount": -1.0, "format": "70mm" }));
+        assert_eq!(u.stock, None);
+        assert_eq!(u.grain_amount, 2.0);
+        assert_eq!(u.halation_amount, 0.0);
+        assert_eq!(u.format, stocks::FilmFormat::Mm35);
+        assert!(super::supported::<crate::stabilization::RGBA8>() && super::supported::<crate::stabilization::RGBA16>());
+        assert!(!super::supported::<crate::stabilization::BGRA8>() && !super::supported::<crate::stabilization::RGBAf>() && !super::supported::<crate::stabilization::Luma16>());
     }
 }
