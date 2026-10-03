@@ -73,15 +73,15 @@ gateShortMm)`. Preview renders at reduced resolution `p = preview_short /
 output_short ≤ 1`; per the handover's zoom-out rule its grain model is
 `model.for_render_scale(q(scale)).for_render_scale(q(p))` (applied on top of
 the export scale, not multiplied into it), and halation uses `R·p`. `p = 1`
-(export, or Full preview) skips the second step. Noise is hashed on the **preview** pixel
-lattice (no export-lattice trick: Gyroflow's viewer zoom magnifies the preview
+(export, or Full preview) skips the second step. Noise is hashed on the export pixel under each preview pixel,
+`floor((x+0.5)/p)` (no export-lattice trick: Gyroflow's viewer zoom magnifies the preview
 texture, it never re-renders). To see export-exact grain the user sets Preview
 resolution to Full; the viewer zoom then shows it 1:1 or magnified.
 
 ### Seed
 
-`seed = FNV-1a(video file name)`, `frameSeed = hash4(seed, frame_index, 0, 0x51)`,
-`layerSeed[l] = hash4(frameSeed, 0, l, 0x51)`. Grain moves every frame; the
+`seed = FNV-1a(video file name)`, `layerSeed[l] = hash4(seed, frame_index, l, 0x51)`
+(Wigglecam's `FilmPipeline.layerSeed`; at frame 0 it equals Photo360's `layerSeeds`). Grain moves every frame; the
 same frame always renders identically, in preview and export.
 
 ## GPU side: the film chain
@@ -103,8 +103,10 @@ chain is not dispatched at all and output is byte-identical to today.
   133 MB).
 - `FilmParams` (with the std table) is one small uniform/constant buffer per
   frame.
-- The GPU wrapper cache key (`Buffers::get_checksum`) includes the film
-  presence and buffer sizes, so toggling film never reuses a stale wrapper.
+- Film buffers are built lazily inside the GPU wrapper, at full output size, on
+  the first frame that asks for film. Toggling film or changing its settings
+  therefore never needs a different wrapper, and the cache key
+  (`Buffers::get_checksum`) is unchanged.
 
 ### OpenCL (`src/core/gpu/opencl_film.cl`)
 
@@ -116,8 +118,9 @@ Runs after `run_chroma`; its output buffer becomes the readback source.
 
 ### wgpu (`src/core/gpu/wgpu_film.wgsl`)
 
-Compute pipelines for the four passes; G2 writes a storage buffer/texture that
-is copied to staging in place of the chroma/main output. Same fallible
+Render (fragment) passes for the five passes, like the chroma pass; G2 writes a
+texture that is copied to staging in place of the chroma/main output. Halo
+textures are recreated when the halo grid changes size. Same fallible
 construction and logging as OpenCL. Like the chroma pass, render path with CPU
 output only.
 
@@ -136,7 +139,7 @@ CPU-only processing skips the film chain with a warning.
 - CLI: `--film-stock <id|off>`, `--film-format`, `--film-grain`,
   `--film-halation`, `--film-no-tone`.
 - When the chain is skipped because the GPU program failed, the log warns and
-  the export dialog shows it once.
+  the Film panel's status line shows the reason (`film::last_skip`).
 
 ## Testing
 
