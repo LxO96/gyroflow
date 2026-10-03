@@ -181,6 +181,7 @@ Item {
                 window.lensProfile.loadGyroflow(obj);
                 window.colorAdjustments.loadGyroflow(obj);
                 window.denoise.loadGyroflow(obj);
+                window.film.loadGyroflow(obj);
                 Qt.callLater(window.exportSettings.loadGyroflow, obj);
 
                 if (obj.hasOwnProperty("image_sequence_start") && +obj.image_sequence_start > 0) {

@@ -173,3 +173,34 @@ grain std vs model and export time with vs without film.
 
 Keyframing film parameters; HDR (PQ/HLG) film; export-lattice preview grain;
 custom stocks; CPU fallback renderer.
+
+## Results
+
+Measured 2026-10-04 on `testfiles/C2520.MP4` (S-Log3, 4K portrait), graded with
+`SL3SG3Ctos709.cube` baked in, Rec.709, HEVC P010 150 Mbps, OpenCL backend, 108 frames:
+
+| Film | Export time |
+|---|---|
+| Off | 15.05 s |
+| Golden 200, Super 16, everything on | 15.16 s (+0.7 %) |
+| Golden 200, Super 16, grain only | 15.27 s (+1.5 %) |
+
+Grain on the eight flattest 64×64 mid-tone patches of frame 8 (grain-only render minus the
+unfilmed render, 10-bit luma): std 23.2–24.4 codes. The model predicts 21.5–23.1 codes
+(`std(u)` 0.033–0.035 at scale 0.386, three independent layers through Rec.709 luma), so the
+export lands within 8 % of it; the excess is HEVC noise in the difference and the patches not
+being exactly grey.
+
+GPU parity (`film/tests_gpu.rs`, 67×45 frames incl. a forced f = 4 halo grid and a p = 0.25
+preview lattice): OpenCL and wgpu are both within 0.56 codes of the Rust reference at 16 and
+8 bits, and within 1 code of each other.
+
+Decisions taken while implementing (ledger rulings):
+
+- `std(u)` is read with linear interpolation between the 201 table entries, not the
+  nearest entry: a nearest lookup flipped at step boundaries under f32 differences
+  (one pixel in 3015 two codes off on wgpu). The difference from Photo360 is under one
+  table step.
+- The wgpu film pass normalises unorm (RGBA8) targets itself; the preview hands RGBA8
+  frames over with a 255 scale.
+- Film buffers are built lazily per wrapper, so the GPU cache key is unchanged.

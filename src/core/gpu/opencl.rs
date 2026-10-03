@@ -30,12 +30,32 @@ pub struct OclWrapper {
     /// support it: CPU outputs only, not half-float.
     chroma: Option<OclChroma>,
     chroma_warned: std::sync::atomic::AtomicBool,
+
+    /// The film chain's program source, prepared at creation when this output and format can
+    /// run it (CPU output, packed RGBA8/16). The chain itself is built on first use: its
+    /// buffers are big (16 B/px) and most renders never ask for film.
+    film_src: Option<String>,
+    film: std::sync::OnceLock<Option<OclFilm>>,
 }
 
 #[cfg(test)]
 thread_local! {
     /// Test-only: makes building the chroma pass fail, as a driver rejecting its kernel would.
     pub(crate) static FAIL_CHROMA_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: makes building the film chain fail.
+    pub(crate) static FAIL_FILM_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct OclFilm {
+    halo_source: Kernel,
+    halo_blur_x: Kernel,
+    halo_blur_y: Kernel,
+    noise_blur_x: Kernel,
+    apply: Kernel,
+    params: Buffer<u8>,
+    dst: Buffer<u8>,
+    /// g1, halo_a, halo_b: bound as kernel args, owned here.
+    _scratch: [Buffer<f32>; 3],
 }
 
 struct OclChroma {
@@ -368,7 +388,8 @@ impl OclWrapper {
                     .replace("PIXEL_BYTES", &format!("{}", params.bytes_per_pixel))
                     .replace("ROUND_OFFSET", if ocl_names.0.starts_with('u') { "0.5f" } else { "0.0f" });
                 let program = Program::builder().src(&src).devices(ctx.device).build(&ctx.context)?;
-                let cdst = Buffer::<u8>::builder().queue(ocl_queue.clone()).len(dest_buffer.len()).flags(MemFlags::new().write_only().host_read_only().alloc_host_ptr()).build()?;
+                // read_write: the film chain reads the chroma pass's output.
+                let cdst = Buffer::<u8>::builder().queue(ocl_queue.clone()).len(dest_buffer.len()).flags(MemFlags::new().read_write().host_read_only().alloc_host_ptr()).build()?;
                 let cguide = match &buffers.guide {
                     Some(g) => Some(Buffer::<u8>::builder().queue(ocl_queue.clone()).len((g.size.1 * g.size.2).max(4)).flags(MemFlags::new().read_only().host_write_only()).build()?),
                     None => None,
@@ -393,6 +414,16 @@ impl OclWrapper {
                 }
             } else { None };
 
+            let film_src = (matches!(buffers.output.data, BufferSource::Cpu { .. }) && matches!(ocl_names.0, "uchar4" | "ushort4")).then(|| {
+                include_str!("opencl_film.cl")
+                    .replace("DATA_CONVERTF", ocl_names.3)
+                    .replace("DATA_TYPEF", ocl_names.2)
+                    .replace("DATA_CONVERT", ocl_names.1)
+                    .replace("DATA_TYPE", ocl_names.0)
+                    .replace("PIXEL_BYTES", &format!("{}", params.bytes_per_pixel))
+                    .replace("ROUND_OFFSET", "0.5f")
+            });
+
             // Clear the drawing buffer
             buf_drawing.write(&vec![0u8; buf_drawing.len()]).enq()?;
 
@@ -410,6 +441,8 @@ impl OclWrapper {
                 buf_coeffs,
                 chroma,
                 chroma_warned: Default::default(),
+                film_src,
+                film: Default::default(),
             })
         } else {
             Err(ocl::BufferCmdError::AlreadyMapped.into())
@@ -534,13 +567,16 @@ impl OclWrapper {
         unsafe { self.kernel.enq()?; }
 
         let chroma_ran = self.run_chroma(buffers, &itm.chroma_filter)?;
+        let film_src = match (&self.chroma, chroma_ran) { (Some(c), true) => &c.dst, _ => &self.dst };
+        let film_ran = self.run_film(buffers, film_src, &itm.film)?;
 
         match &mut buffers.output.data {
             BufferSource::None => { },
             BufferSource::Cpu { buffer, .. } => {
-                match (&self.chroma, chroma_ran) {
-                    (Some(c), true) => c.dst.read(&mut **buffer).enq()?,
-                    _ => self.dst.read(&mut **buffer).enq()?,
+                if film_ran {
+                    self.film.get().and_then(|f| f.as_ref()).unwrap().dst.read(&mut **buffer).enq()?;
+                } else {
+                    film_src.read(&mut **buffer).enq()?;
                 }
             },
             BufferSource::OpenGL { texture, .. } => {
@@ -576,6 +612,65 @@ impl OclWrapper {
         // self.queue.finish();
 
         Ok(())
+    }
+
+    /// Builds the film chain on first use, for `pixels` output pixels. `None` (reason kept for
+    /// the Film panel) when this output cannot run it or the driver rejects it; the wrapper
+    /// keeps working either way. The source buffer is bound per frame in `run_film`.
+    fn film_chain(&self, pixels: usize) -> Option<&OclFilm> {
+        self.film.get_or_init(|| {
+            let Some(code) = &self.film_src else { crate::film::set_last_skip("this output or pixel format is not supported by the film chain".into()); return None; };
+            let build = || -> ocl::Result<OclFilm> {
+                #[cfg(test)]
+                if FAIL_FILM_BUILD.with(|f| f.get()) { return Err(ocl::Error::from(String::from("forced film build failure"))); }
+                let program = Program::builder().src(code.as_str()).devices(self.queue.device()).build(&self.queue.context())?;
+                let scratch = |len: usize| Buffer::<f32>::builder().queue(self.queue.clone()).len(len.max(1)).flags(MemFlags::new().read_write().host_no_access()).build();
+                // Halo grids are at most the frame (f = 1); g1 holds one float4 per pixel.
+                let (g1, halo_a, halo_b) = (scratch(pixels * 4)?, scratch(pixels)?, scratch(pixels)?);
+                let params = Buffer::<u8>::builder().queue(self.queue.clone()).len(std::mem::size_of::<crate::film::FilmParams>()).flags(MemFlags::new().read_only().host_write_only()).build()?;
+                let dst = Buffer::<u8>::builder().queue(self.queue.clone()).len(self.dst.len()).flags(MemFlags::new().write_only().host_read_only().alloc_host_ptr()).build()?;
+                let kernel = |name: &str| { let mut b = Kernel::builder(); unsafe { b.program(&program).name(name).queue(self.queue.clone()).global_work_size(1).disable_arg_type_check(); } b };
+                let halo_source  = kernel("film_halo_source").arg(&self.dst).arg(&halo_a).arg(&params).build()?;
+                let halo_blur_x  = kernel("film_halo_blur").arg(&halo_a).arg(&halo_b).arg(&params).arg(1i32).build()?;
+                let halo_blur_y  = kernel("film_halo_blur").arg(&halo_b).arg(&halo_a).arg(&params).arg(0i32).build()?;
+                let noise_blur_x = kernel("film_noise_blur_x").arg(&g1).arg(&params).build()?;
+                let apply        = kernel("film_apply").arg(&self.dst).arg(&g1).arg(&halo_a).arg(&dst).arg(&params).build()?;
+                Ok(OclFilm { halo_source, halo_blur_x, halo_blur_y, noise_blur_x, apply, params, dst, _scratch: [g1, halo_a, halo_b] })
+            };
+            match build() {
+                Ok(f) => Some(f),
+                Err(e) => { crate::film::set_last_skip(format!("the OpenCL film chain failed to build: {e:?}")); None }
+            }
+        }).as_ref()
+    }
+
+    /// Runs the film chain on `src` (the chroma pass's output when it ran, else the main
+    /// kernel's) if it applies. Returns whether it ran.
+    fn run_film(&self, buffers: &Buffers, src: &Buffer<u8>, p: &crate::film::FilmParams) -> ocl::Result<bool> {
+        if !p.is_active() { return Ok(false); }
+        let (w, h) = (buffers.output.size.0, buffers.output.size.1);
+        let Some(f) = self.film_chain(w * h) else { return Ok(false); };
+        // Per frame: the chroma pass may run on one frame and not the next.
+        f.halo_source.set_arg(0, src)?;
+        f.apply.set_arg(0, src)?;
+        let mut kp = *p;
+        kp.width = w as i32;
+        kp.height = h as i32;
+        kp.stride = buffers.output.size.2 as i32;
+        f.params.write(bytemuck::bytes_of(&kp)).enq()?;
+        unsafe {
+            if kp.flags & crate::film::params::FLAG_HALATION != 0 {
+                let g = (kp.halo_w as usize, kp.halo_h as usize);
+                f.halo_source.cmd().global_work_size(g).enq()?;
+                f.halo_blur_x.cmd().global_work_size(g).enq()?;
+                f.halo_blur_y.cmd().global_work_size(g).enq()?;
+            }
+            if kp.flags & crate::film::params::FLAG_GRAIN != 0 {
+                f.noise_blur_x.cmd().global_work_size((w, h)).enq()?;
+            }
+            f.apply.cmd().global_work_size((w, h)).enq()?;
+        }
+        Ok(true)
     }
 
     /// Runs the chroma pass if it applies. Returns whether it ran. Skipping is the pass's only

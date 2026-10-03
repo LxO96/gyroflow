@@ -840,6 +840,9 @@ impl Stabilization {
 
             //let ok = Self::undistort_image_cpu_spirv::<T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer);
             // CPU path
+            if itm.film.is_active() {
+                crate::film::set_last_skip("no GPU backend is in use; film simulation runs on OpenCL or wgpu only".into());
+            }
             // Only build the combined coeffs+LUT buffer (and allocate) when colour is actually
             // enabled for this frame; otherwise reuse the static COEFFS table with no extra
             // allocation. `enabled` and `lut` are independent fields (Task 15's UI and Task 13's
@@ -1080,7 +1083,7 @@ mod cross_backend_color_tests {
         p.color_params_2 = COLOR_PARAMS_2;
         p.color_params_3 = COLOR_PARAMS_3;
 
-        FrameTransform { chroma_filter: Default::default(),
+        FrameTransform { chroma_filter: Default::default(), film: Default::default(),
             // Identity 3x3 in the first 9 fields; the trailing 5 stay zero, which disables
             // the extra shift/angle adjustment.
             matrices: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
@@ -1179,6 +1182,29 @@ mod cross_backend_color_tests {
         }
         drop(buffers);
         Ok(read_pixels(&output))
+    }
+
+    /// The film chain exists only on OpenCL and wgpu. A CPU render that was asked for film must
+    /// say so in the Film panel rather than silently drop it (spec: "skips with a warning").
+    #[test]
+    fn cpu_path_reports_that_it_skipped_film() {
+        let mut itm = identity_transform(0);
+        let s = crate::film::FilmSettings { stock: Some("golden200".into()), ..Default::default() };
+        itm.film = crate::film::FilmContext::new(s, H as usize, 25.0, "x").unwrap().frame_params(W as usize, H as usize, 0, 1.0);
+        let mut stab = Stabilization::default();
+        stab.init_size((W as usize, H as usize), (W as usize, H as usize));
+        stab.initialized_backend = BackendType::Cpu(0);
+        crate::film::clear_last_skip();
+        let mut input = input_bytes();
+        let mut output = vec![0u8; (STRIDE * H) as usize];
+        let mut buffers = Buffers { guide: None,
+            input:  BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut input }, texture_copy: false },
+            output: BufferDescription { size: (W as usize, H as usize, STRIDE as usize), rect: None, rotation: None, data: BufferSource::Cpu { buffer: &mut output }, texture_copy: false },
+            references: Vec::new(),
+        };
+        let r = stab.process_pixels::<RGBAf>(0, None, &mut buffers, Some(&itm));
+        assert!(r.is_ok(), "CPU render failed: {r:?}");
+        assert!(crate::film::last_skip().is_some_and(|w| w.contains("GPU")), "no skip reason recorded: {:?}", crate::film::last_skip());
     }
 
     /// Same identity setup through the CPU pixel path, for comparison.

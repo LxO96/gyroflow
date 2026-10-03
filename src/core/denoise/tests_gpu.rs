@@ -153,7 +153,7 @@ fn identity_transform(references: usize, sigma: f32) -> FrameTransform {
     p.denoise_sigma = sigma;
 
     let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-    FrameTransform { chroma_filter: Default::default(),
+    FrameTransform { chroma_filter: Default::default(), film: Default::default(),
         matrices: vec![identity],
         reference_matrices: vec![vec![identity]; references],
         kernel_params: p,

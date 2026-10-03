@@ -15,6 +15,7 @@ pub mod keyframes;
 pub mod stmap;
 pub mod color;
 pub mod denoise;
+pub mod film;
 pub mod scopes;
 
 pub mod zooming;
@@ -88,6 +89,9 @@ pub struct StabilizationManager {
     pub smoothing: Arc<RwLock<Smoothing>>,
     pub color: Arc<RwLock<color::ColorAdjustments>>,
     pub denoise: Arc<RwLock<denoise::DenoiseSettings>>,
+    /// Film simulation (`film`). Render-only, like `denoise`: read per frame by the export
+    /// closure and the preview, never by the stabilization maths.
+    pub film: Arc<RwLock<film::FilmSettings>>,
     /// A small JPEG of the first frame, for Windows Explorer's thumbnail handler and for the
     /// render queue. Base64, no `data:` prefix, together with the pixel size it was encoded at.
     ///
@@ -130,6 +134,7 @@ impl Default for StabilizationManager {
             smoothing: Arc::new(RwLock::new(Smoothing::default())),
             color: Arc::new(RwLock::new(color::ColorAdjustments::default())),
             denoise: Arc::new(RwLock::new(denoise::DenoiseSettings::default())),
+            film: Arc::new(RwLock::new(film::FilmSettings::default())),
             thumbnail: Arc::new(RwLock::new(None)),
 
             params: Arc::new(RwLock::new(StabilizationParams::default())),
@@ -897,6 +902,8 @@ impl StabilizationManager {
         };
         let frame = frame.map(|x| (x as i32 + offset).max(0) as usize);
         let offset_us = (offset as f64 / fps * 1000000.0).round() as i64;
+        // The film grain's frame index comes from the source timestamp, as in exports.
+        let source_timestamp_us = timestamp_us;
         timestamp_us += offset_us;
         let mut reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
@@ -935,7 +942,9 @@ impl StabilizationManager {
         }
 
         if let Some(undist) = self.stabilization.try_read_for(std::time::Duration::from_millis(30000)) {
-            if reference_timestamps.is_empty() || buffers.references.is_empty() {
+            let film_ctx = if T::COUNT >= 3 && film::supported::<T>() { self.film_context(self.film_preview_graded()) } else { None };
+            let has_references = !reference_timestamps.is_empty() && !buffers.references.is_empty();
+            if !has_references && film_ctx.is_none() {
                 // Clear rather than merely branch: the backends derive `reference_count` from
                 // `buffers.references`, but the matrices come from the transform, and the
                 // plain path builds one with no `reference_matrices` at all. Leaving the
@@ -946,19 +955,23 @@ impl StabilizationManager {
             } else {
                 // The gather reads `reference_count` from `buffers.references.len()` but takes
                 // its matrices from the transform, so the two must be built together or the
-                // kernel walks off the end of the matrix buffer.
+                // kernel walks off the end of the matrix buffer. A film-only frame has neither.
+                if !has_references { buffers.references.clear(); reference_timestamps.clear(); }
                 let mut transform = undist.get_frame_transform_with_references::<T>(timestamp_us, &reference_timestamps, frame, buffers);
                 // Preview pixels are one interleaved RGBA plane, so luma and chroma are split
                 // per sample in the kernel (`denoise_rgb`) rather than per plane. Before that,
                 // only the luma sigma reached the preview and chroma strength did nothing.
                 let denoise = self.denoise.read();
                 transform.kernel_params.denoise_sigma = denoise.luma_sigma();
-                if T::COUNT >= 3 {
+                if T::COUNT >= 3 && has_references {
                     transform.kernel_params.denoise_rgb = [denoise.chroma_sigma(), 0.0, 0.0, 0.0];
                     // Paused preview only (this path has references), matching the temporal pass.
                     transform.chroma_filter = denoise.chroma_filter_params(denoise::chroma_filter::MODE_RGB, transform.kernel_params.max_pixel_value);
                 }
                 drop(denoise);
+                if let Some(ctx) = &film_ctx {
+                    transform.film = ctx.frame_params(buffers.output.size.0, buffers.output.size.1, source_timestamp_us, transform.kernel_params.max_pixel_value);
+                }
                 undist.process_pixels::<T>(timestamp_us, frame, buffers, Some(&transform))
             }
         } else {
@@ -983,6 +996,32 @@ impl StabilizationManager {
     pub fn set_show_optical_flow     (&self, v: bool) { self.params.write().show_optical_flow      = v; }
     pub fn set_stab_enabled          (&self, v: bool) { self.params.write().stab_enabled           = v; }
     pub fn set_preview_color_enabled (&self, v: bool) { self.params.write().preview_color_enabled  = v; }
+
+    /// Whether the preview shows a grade, which is what the film chain needs as input.
+    pub fn film_preview_graded(&self) -> bool {
+        self.params.read().preview_color_enabled && self.color.read().is_active()
+    }
+
+    /// The film chain's per-clip context, or `None` when it must not run: not graded
+    /// (`graded` is the caller's bake/preview decision), HDR output, or nothing enabled.
+    pub fn film_context(&self, graded: bool) -> Option<film::FilmContext> {
+        use color::OutputColorSpace::{ Rec2020Pq, Rec2020Hlg };
+        if !graded || matches!(self.color.read().output_color_space, Rec2020Pq | Rec2020Hlg) { return None; }
+        let (output_size, fps) = { let p = self.params.read(); (p.output_size, p.fps) };
+        let name = filesystem::get_filename(&self.input_file.read().url);
+        film::FilmContext::new(self.film.read().clone(), output_size.0.min(output_size.1), fps, &name)
+    }
+
+    /// Why the preview shows no film, or empty when it does (or film is Off).
+    pub fn film_gate_message(&self) -> String {
+        if self.film.read().stock.is_none() { return String::new(); }
+        use color::OutputColorSpace::{ Rec2020Pq, Rec2020Hlg };
+        if matches!(self.color.read().output_color_space, Rec2020Pq | Rec2020Hlg) { return "Film is not available for HDR (PQ/HLG) output.".into(); }
+        if !self.film_preview_graded() { return "Film needs a colour grade: enable colour adjustments (with a LUT for log footage).".into(); }
+        // The preview shows the grade whenever it is on; exports only bake it (and so film) on request.
+        if !self.color.read().bake_in_render { return "Preview only: enable \"Apply to rendered video\" in Color adjustments to include film in the export.".into(); }
+        film::last_skip().map(|w| format!("Film was skipped: {w}")).unwrap_or_default()
+    }
 
     /// Force both toolbar toggles back on.
     ///
@@ -1218,6 +1257,7 @@ impl StabilizationManager {
             smoothing:  Arc::new(RwLock::new(self.smoothing.read().clone())),
             color:      Arc::new(RwLock::new(self.color.read().clone())),
             denoise:    Arc::new(RwLock::new(self.denoise.read().clone())),
+            film:       Arc::new(RwLock::new(self.film.read().clone())),
             input_file: Arc::new(RwLock::new(self.input_file.read().clone())),
             lens_profile_db: self.lens_profile_db.clone(),
 
@@ -1372,6 +1412,7 @@ impl StabilizationManager {
                 "chroma_smoothing": d.chroma_smoothing,
             })
         };
+        let film = self.film.read().to_json();
 
         let trim_ranges_ms = params.trim_ranges.iter().map(|(a, b)| (a * params.duration_ms, b * params.duration_ms)).collect::<Vec<_>>();
 
@@ -1454,6 +1495,7 @@ impl StabilizationManager {
 
             "color": color,
             "denoise": denoise,
+            "film": film,
 
             "offsets": gyro.get_offsets(), // timestamp, offset value
             "keyframes": self.keyframes.read().serialize(),
@@ -1971,6 +2013,9 @@ impl StabilizationManager {
                 if let Some(v) = obj.get("quality").and_then(|x| x.as_str()) {
                     if let Some(q) = denoise::DenoiseQuality::from_id(v) { d.quality = q; }
                 }
+            }
+            if let Some(v @ serde_json::Value::Object(_)) = obj.get("film") {
+                self.film.write().apply_json(v);
             }
             if let Some(serde_json::Value::Object(obj)) = obj.get_mut("output") {
                 if let Some(w) =  obj.get("output_width").and_then(|x| x.as_u64()) {
@@ -2558,6 +2603,59 @@ DOMAIN_MAX 1.0 1.0 1.0
         // rather than fail the import, matching how output_color_space behaves.
         apply_as_preset(&mgr, r#"{"title":"Gyroflow data file","version":4,"denoise":{"quality":"ultra"}}"#);
         assert_eq!(mgr.denoise.read().quality, denoise::DenoiseQuality::High);
+    }
+
+    #[test]
+    fn film_section_round_trips_and_old_projects_load_with_film_off() {
+        let mgr = configured_manager(None);
+        *mgr.film.write() = film::FilmSettings { stock: Some("golden200".into()), format: film::stocks::FilmFormat::Super16, grain_amount: 1.4, ..Default::default() };
+        let restored = round_trip(&mgr);
+        assert_eq!(*restored.film.read(), *mgr.film.read());
+
+        let old = StabilizationManager::default();
+        apply_as_preset(&old, r#"{"title":"Gyroflow data file","version":4}"#);
+        assert_eq!(old.film.read().stock, None);
+    }
+
+    #[test]
+    fn film_runs_only_on_graded_display_output() {
+        let mgr = StabilizationManager::default();
+        mgr.params.write().output_size = (3840, 2160);
+        mgr.params.write().fps = 25.0;
+        mgr.film.write().stock = Some("golden200".into());
+        assert!(mgr.film_context(false).is_none(), "ungraded output must not get film");
+        assert!(mgr.film_context(true).is_some());
+        assert_eq!(mgr.film_context(true).unwrap().export_short, 2160);
+        for cs in [color::OutputColorSpace::Rec2020Pq, color::OutputColorSpace::Rec2020Hlg] {
+            mgr.color.write().output_color_space = cs;
+            assert!(mgr.film_context(true).is_none(), "{cs:?} must not get film");
+        }
+        mgr.color.write().output_color_space = color::OutputColorSpace::Rec709;
+        assert!(mgr.film_context(true).is_some());
+        mgr.film.write().stock = None;
+        assert!(mgr.film_context(true).is_none());
+    }
+
+    /// The preview shows film whenever the grade is visible, but exports only bake it when
+    /// "Apply to rendered video" is on; the panel must say so instead of staying silent.
+    #[test]
+    fn film_gate_message_warns_when_the_grade_is_preview_only() {
+        let mgr = configured_manager(None);
+        mgr.film.write().stock = Some("golden200".into());
+        mgr.set_preview_color_enabled(true);
+        mgr.color.write().bake_in_render = false;
+        assert!(mgr.film_gate_message().contains("Apply to rendered video"), "got {:?}", mgr.film_gate_message());
+        mgr.color.write().bake_in_render = true;
+        assert!(!mgr.film_gate_message().contains("Apply to rendered video"));
+    }
+
+    #[test]
+    fn film_is_cloned_into_the_export_manager() {
+        let mgr = StabilizationManager::default();
+        mgr.film.write().stock = Some("vivid100".into());
+        // The export renders from a clone; see the denoise line next to it.
+        let cloned = mgr.get_cloned();
+        assert_eq!(cloned.film.read().stock.as_deref(), Some("vivid100"));
     }
 
     #[test]

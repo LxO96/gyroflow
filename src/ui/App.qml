@@ -102,6 +102,7 @@ Rectangle {
     property alias stab: stab.item;
     property alias colorAdjustments: colorAdjustments.item;
     property alias denoise: denoise.item;
+    property alias film: film.item;
     property alias exportSettings: exportSettings.item;
     property alias advanced: advanced.item;
     property alias renderBtn: renderBtn;
@@ -524,6 +525,8 @@ Rectangle {
             Hr { id: colorAdjustmentsHr; }
             ItemLoader { id: denoise; sourceComponent: Component { Menu.Denoise { } } }
             Hr { id: denoiseHr; }
+            ItemLoader { id: film; sourceComponent: Component { Menu.Film { } } }
+            Hr { id: filmHr; }
             ItemLoader { id: exportSettings; sourceComponent: Component { Menu.Export { showBtn: !window.isMobileLayout; } } }
             Hr { id: exportHr; visible: !isMobileLayout; }
             ItemLoader { id: advanced; sourceComponent: Component { Menu.Advanced { } } }

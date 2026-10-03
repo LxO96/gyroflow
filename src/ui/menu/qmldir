@@ -3,6 +3,7 @@ Advanced 1.0 Advanced.qml
 ColorAdjustments 1.0 ColorAdjustments.qml
 Denoise 1.0 Denoise.qml
 Export 1.0 Export.qml
+Film 1.0 Film.qml
 LensCalibrate 1.0 LensCalibrate.qml
 LensProfile 1.0 LensProfile.qml
 MotionData 1.0 MotionData.qml
