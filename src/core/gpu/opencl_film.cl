@@ -146,7 +146,11 @@ __kernel void film_apply(__global const uchar *src, __global const float4 *g1, _
         float nn[3] = { n.x, n.y, n.z };
         int bw = (p->flags & FILM_BW) != 0;
         for (int i = 0; i < 3; i++) {
-            float sd = p->std_table[(int)(clamp(u[i], 0.0f, 1.0f) * 200.0f + 0.5f)];
+            // Linear between table entries; mirrors `reference::std_of`.
+            float fu = clamp(u[i], 0.0f, 1.0f) * 200.0f;
+            int i0 = min((int)floor(fu), 199);
+            float tt = fu - (float)i0;
+            float sd = p->std_table[i0] * (1.0f - tt) + p->std_table[i0 + 1] * tt;
             u[i] = clamp(u[i] + p->grain_k * sd * nn[bw ? 0 : i], 0.0f, 1.0f);
         }
     }

@@ -156,3 +156,74 @@ fn film_gpu_opencl_build_failure_skips_film_and_keeps_the_backend() {
         assert!(super::last_skip().is_some(), "the skip reason must be recorded for the panel");
     }
 }
+
+fn run_wgpu(input: &[u8], bpp: usize, films: &[FilmParams]) -> Result<Vec<Vec<u8>>, String> {
+    if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() { return Err("UNAVAILABLE: no usable wgpu adapter".into()); }
+    let max = if bpp == 8 { 65535.0 } else { 1.0 }; // Rgba8Unorm is normalised on wgpu
+    let fmt = if bpp == 8 { RGBA16::wgpu_format() } else { RGBA8::wgpu_format() }.ok_or("no format")?;
+    let mut itm = identity(bpp, max, FilmParams::default());
+    itm.kernel_params.translation2d = [-0.5, -0.5]; // fragment path samples at pixel centres; see denoise::tests_gpu::run_wgpu
+    let mut inp = input.to_vec();
+    let mut out = vec![0u8; W * H * bpp];
+    let mut buffers = Buffers { input: desc(&mut inp, bpp), output: desc(&mut out, bpp), references: vec![], guide: None };
+    let inst = crate::gpu::wgpu::WgpuWrapper::new(&itm.kernel_params, fmt, DistortionModel::default(), None, &buffers, 0, None).map_err(|e| format!("WgpuWrapper::new failed: {e:?}"))?;
+    let mut results = vec![];
+    for f in films {
+        itm.film = *f;
+        if !inst.undistort_image(&mut buffers, &itm, &[]) { return Err("undistort_image returned false".into()); }
+        if let BufferSource::Cpu { buffer } = &buffers.output.data { results.push(buffer.to_vec()); }
+    }
+    Ok(results)
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored film_gpu"]
+fn film_gpu_wgpu_matches_the_reference_and_opencl() {
+    let input = to16(&scene());
+    // One wrapper, three frames: full chain, a different halo grid (review focus 4), then off.
+    let frames = [params(65535.0), halo_f_params(65535.0), preview_params(65535.0), FilmParams::default()];
+    let out = ok("wgpu 16", run_wgpu(&input, 8, &frames)).expect("wgpu is required for this test");
+    for (i, name) in ["full", "halo f=4", "preview p=0.25"].iter().enumerate() {
+        let d = max_diff(&from16(&out[i]), &expected(&from16(&input), &frames[i]));
+        println!("wgpu RGBA16 {name}: max diff {:.2} codes", d * 65535.0);
+        assert!(d <= 1.0 / 65535.0 + 1e-6, "wgpu RGBA16 {name} differs by {} codes", d * 65535.0);
+        if let Some(o) = ok("OpenCL 16", run_opencl16(&input, frames[i])) {
+            let d = max_diff(&from16(&o), &from16(&out[i]));
+            println!("wgpu vs OpenCL {name}: {:.2} codes", d * 65535.0);
+            assert!(d <= 1.0 / 65535.0 + 1e-6);
+        }
+    }
+    assert_eq!(out[3], input, "film off must be bit-exact after film frames on the same wrapper");
+
+    let input8 = to8(&scene());
+    let mut p8 = params(1.0);
+    p8.max_value = 1.0;
+    let out8 = ok("wgpu 8", run_wgpu(&input8, 4, &[p8])).unwrap();
+    let d = max_diff(&from8(&out8[0]), &expected(&from8(&input8), &p8));
+    println!("wgpu RGBA8: max diff {:.2} codes", d * 255.0);
+    assert!(d <= 1.0 / 255.0 + 1e-6, "wgpu RGBA8 differs by {} codes", d * 255.0);
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored film_gpu"]
+fn film_gpu_wgpu_full_scale_does_not_wrap() {
+    let s = FilmSettings { stock: Some("tungsten800".into()), tone: false, grain_amount: 2.0, halation_amount: 1.0, ..Default::default() };
+    let mut p = FilmContext::new(s, H, 25.0, "x").unwrap().frame_params(W, H, 0, 65535.0);
+    p.width = W as i32; p.height = H as i32;
+    let input = to16(&vec![[1.0, 1.0, 1.0, 1.0]; W * H]);
+    if let Some(out) = ok("wgpu", run_wgpu(&input, 8, &[p])) {
+        let min = from16(&out[0]).iter().map(|px| px[0]).fold(1.0, f32::min);
+        assert!(min > 60000.0 / 65535.0, "a clipped pixel wrapped to {}", min * 65535.0);
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU; run with: cd src/core && cargo test --features use-opencl -- --ignored film_gpu"]
+fn film_gpu_wgpu_build_failure_skips_film_and_keeps_the_backend() {
+    crate::gpu::wgpu::FAIL_FILM_BUILD_WGPU.with(|f| f.set(true));
+    let input = to16(&scene());
+    let r = run_wgpu(&input, 8, &[params(65535.0)]);
+    crate::gpu::wgpu::FAIL_FILM_BUILD_WGPU.with(|f| f.set(false));
+    if let Some(out) = ok("wgpu", r) { assert_eq!(out[0], input); }
+}
+

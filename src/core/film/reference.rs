@@ -15,6 +15,16 @@ fn weights(r: i32, sigma: f32) -> Vec<f32> {
     let s: f32 = w.iter().sum();
     w.into_iter().map(|x| x / s).collect()
 }
+/// `std(u)`, linearly interpolated between the 201 table entries. Interpolated rather than
+/// nearest (Photo360 rounds): a nearest lookup flips at each step boundary, so f32 differences
+/// between backends showed up as whole-step jumps in grain amplitude.
+pub(crate) fn std_of(p: &FilmParams, u: f32) -> f32 {
+    let f = u.clamp(0.0, 1.0) * 200.0;
+    let i = (f.floor() as usize).min(199);
+    let t = f - i as f32;
+    p.std_table[i] * (1.0 - t) + p.std_table[i + 1] * t
+}
+
 /// The export pixel under render pixel `x`.
 fn export_px(x: i32, inv_p: f32) -> u32 { ((x as f32 + 0.5) * inv_p).floor() as i32 as u32 }
 
@@ -102,7 +112,7 @@ pub fn render(src: &[[f32; 4]], w: usize, h: usize, p: &FilmParams) -> Vec<[f32;
         if let Some(n) = &noise {
             let n = n[y * w + x];
             for i in 0..3 {
-                let sd = p.std_table[(u[i].clamp(0.0, 1.0) * 200.0 + 0.5) as usize];
+                let sd = std_of(p, u[i]);
                 u[i] = (u[i] + p.grain_k * sd * n[if bw { 0 } else { i }]).clamp(0.0, 1.0);
             }
         }

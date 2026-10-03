@@ -328,7 +328,7 @@ mod tests {
             let out = reference::render(&grey(w, w, 0.46), w, w, &p);
             let d: Vec<f32> = out.iter().map(|px| px[1] - 0.46).collect();
             let (_, sd) = mean_std(&d);
-            let want = p.std_table[(0.46f32 * 200.0 + 0.5) as usize] as f64;
+            let want = reference::std_of(&p, 0.46) as f64;
             assert!((sd / want - 1.0).abs() < 0.05, "std {sd} vs model {want} (export_short {export_short})");
             let num: f64 = (0..w).flat_map(|y| (0..w - 1).map(move |x| (y, x))).map(|(y, x)| d[y * w + x] as f64 * d[y * w + x + 1] as f64).sum::<f64>() / (w * (w - 1)) as f64;
             let lag1 = num / (sd * sd);

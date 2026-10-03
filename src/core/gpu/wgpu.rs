@@ -70,6 +70,31 @@ pub struct WgpuWrapper  {
     /// The chroma smoothing pass (`wgpu_chroma_filter.wgsl`): render path, CPU output only.
     chroma: Option<WgpuChroma>,
     chroma_warned: std::sync::atomic::AtomicBool,
+
+    /// The film chain (`wgpu_film.wgsl`), built on first use: render path, CPU output,
+    /// Rgba8Unorm/Rgba16Uint only. `None` inside = unsupported or failed to build.
+    film_format: Option<(wgpu::TextureFormat, &'static str)>,
+    film: parking_lot::Mutex<Option<Option<WgpuFilm>>>,
+}
+
+struct WgpuFilm {
+    layout: wgpu::BindGroupLayout,
+    halo_source: wgpu::RenderPipeline,
+    halo_blur_x: wgpu::RenderPipeline,
+    halo_blur_y: wgpu::RenderPipeline,
+    noise_blur_x: wgpu::RenderPipeline,
+    apply: wgpu::RenderPipeline,
+    params: wgpu::Buffer,
+    g1: wgpu::Texture,
+    out: wgpu::Texture,
+    dummy: wgpu::Texture,
+    /// (halo_w, halo_h, a, b): recreated when the halo grid changes size.
+    halo: Option<(u32, u32, wgpu::Texture, wgpu::Texture)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FAIL_FILM_BUILD_WGPU: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct WgpuChroma {
@@ -81,6 +106,7 @@ struct WgpuChroma {
 }
 impl Drop for WgpuWrapper {
     fn drop(&mut self) {
+        *self.film.lock() = None;
         // We need to delete all texture references and then call device.poll() to actually release them properly
         self.staging_buffer = None;
         self.buf_matrices = None;
@@ -465,10 +491,12 @@ impl WgpuWrapper {
             };
 
             // Chroma smoothing: render path + CPU output only (see the spec).
+            // The film chain: render path, CPU output, packed RGBA8/16 (built on first use).
+            let film_format = (uses_textures && matches!(buffers.output.data, BufferSource::Cpu { .. }) && matches!(wgpu_format.0, wgpu::TextureFormat::Rgba8Unorm | wgpu::TextureFormat::Rgba16Uint)).then_some((wgpu_format.0, if wgpu_format.1 == "u32" { "u32" } else { "f32" }));
             let chroma = if uses_textures && matches!(buffers.output.data, BufferSource::Cpu { .. }) {
                 let src_tex = out_texture.wgpu_texture.as_ref().unwrap();
                 let size = wgpu::Extent3d { width: buffers.output.size.0 as u32, height: buffers.output.size.1 as u32, depth_or_array_layers: 1 };
-                let out = device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu_format.0, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC, view_formats: &[] });
+                let out = device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu_format.0, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
                 // The guide is the same scalar type as the plane, one channel.
                 let guide_format = match wgpu_format.0 {
                     wgpu::TextureFormat::R8Unorm | wgpu::TextureFormat::Rg8Unorm => Some(wgpu::TextureFormat::R8Unorm),
@@ -512,6 +540,8 @@ impl WgpuWrapper {
             Ok(Self {
                 chroma,
                 chroma_warned: Default::default(),
+                film_format,
+                film: Default::default(),
                 device,
                 queue,
                 staging_buffer: Some(staging_buffer),
@@ -533,6 +563,103 @@ impl WgpuWrapper {
         } else {
             Err(WgpuError::NoAvailableAdapter)
         }
+    }
+
+    fn build_film(&self, (format, scalar): (wgpu::TextureFormat, &'static str), w: u32, h: u32) -> Result<WgpuFilm, String> {
+        let device = &self.device;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let src = include_str!("wgpu_film.wgsl").replace("SCALAR", scalar).replace("FILM_ROUND", if scalar == "u32" { "round" } else { "" });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("film"), source: wgpu::ShaderSource::Wgsl(Cow::Owned(src)) });
+        let src_sample = if scalar == "u32" { wgpu::TextureSampleType::Uint } else { wgpu::TextureSampleType::Float { filterable: false } };
+        let tex = |binding, sample_type| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None };
+        let float = wgpu::TextureSampleType::Float { filterable: false };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("film"), entries: &[
+            wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            tex(1, src_sample), tex(2, float), tex(3, float),
+        ] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
+        let pipe = |entry: &str, target: wgpu::TextureFormat| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(entry), layout: Some(&pl),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("film_vertex"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some(entry), targets: &[Some(wgpu::ColorTargetState { format: target, blend: None, write_mask: wgpu::ColorWrites::default() })], compilation_options: Default::default() }),
+            primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
+            multiview_mask: None, depth_stencil: None, multisample: wgpu::MultisampleState::default(), cache: Default::default(),
+        });
+        let r32 = wgpu::TextureFormat::R32Float;
+        let tex2d = |w: u32, h: u32, f: wgpu::TextureFormat, usage: wgpu::TextureUsages| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: f, usage, view_formats: &[] });
+        let rw = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let film = WgpuFilm {
+            halo_source: pipe("film_halo_source", r32), halo_blur_x: pipe("film_halo_blur_x", r32), halo_blur_y: pipe("film_halo_blur_y", r32),
+            noise_blur_x: pipe("film_noise_blur_x", wgpu::TextureFormat::Rgba32Float), apply: pipe("film_apply", format),
+            params: device.create_buffer(&wgpu::BufferDescriptor { label: Some("film params"), size: std::mem::size_of::<crate::film::FilmParams>() as u64, usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST, mapped_at_creation: false }),
+            g1: tex2d(w, h, wgpu::TextureFormat::Rgba32Float, rw),
+            out: tex2d(w, h, format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC),
+            dummy: tex2d(1, 1, r32, wgpu::TextureUsages::TEXTURE_BINDING),
+            halo: None, layout,
+        };
+        #[cfg(test)]
+        if FAIL_FILM_BUILD_WGPU.with(|f| f.get()) { return Err("forced film build failure".into()); }
+        match pollster::block_on(scope.pop()) { Some(e) => Err(format!("{e}")), None => Ok(film) }
+    }
+
+    /// Records the film chain into `encoder` if it applies; returns whether it did.
+    fn encode_film(&self, buffers: &Buffers, src: &wgpu::Texture, p: &crate::film::FilmParams, encoder: &mut wgpu::CommandEncoder) -> bool {
+        use crate::film::params::{ FLAG_GRAIN, FLAG_HALATION };
+        if !p.is_active() { return false; }
+        let (w, h) = (buffers.output.size.0 as u32, buffers.output.size.1 as u32);
+        let mut guard = self.film.lock();
+        if guard.is_none() {
+            *guard = Some(match self.film_format {
+                None => { crate::film::set_last_skip("this output, pixel format or pipeline is not supported by the film chain".into()); None },
+                Some(fmt) => match self.build_film(fmt, w, h) {
+                    Ok(f) => Some(f),
+                    Err(e) => { crate::film::set_last_skip(format!("the wgpu film chain failed to build: {e}")); None },
+                },
+            });
+        }
+        let Some(Some(film)) = guard.as_mut() else { return false; };
+        let mut kp = *p;
+        kp.width = w as i32; kp.height = h as i32; kp.stride = buffers.output.size.2 as i32;
+        self.queue.write_buffer(&film.params, 0, bytemuck::bytes_of(&kp));
+
+        if kp.flags & FLAG_HALATION != 0 {
+            let (hw, hh) = (kp.halo_w as u32, kp.halo_h as u32);
+            if !matches!(&film.halo, Some((a, b, _, _)) if *a == hw && *b == hh) {
+                let mk = || self.device.create_texture(&wgpu::TextureDescriptor { label: Some("film halo"), size: wgpu::Extent3d { width: hw, height: hh, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::R32Float, usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING, view_formats: &[] });
+                film.halo = Some((hw, hh, mk(), mk()));
+            }
+        }
+        let view = |t: &wgpu::Texture| t.create_view(&Default::default());
+        let src_v = view(src);
+        let dummy_v = view(&film.dummy);
+        let bind = |a: &wgpu::TextureView, b: &wgpu::TextureView| self.device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &film.layout, entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: film.params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&src_v) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(a) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(b) },
+        ] });
+        let pass = |encoder: &mut wgpu::CommandEncoder, target: &wgpu::TextureView, pipeline: &wgpu::RenderPipeline, group: &wgpu::BindGroup| {
+            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None, timestamp_writes: None, occlusion_query_set: None, multiview_mask: None, depth_stencil_attachment: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: target, resolve_target: None, depth_slice: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })],
+            });
+            rp.set_pipeline(pipeline);
+            rp.set_bind_group(0, group, &[]);
+            rp.draw(0..4, 0..1);
+        };
+        let g1_v = view(&film.g1);
+        let (halo_a_v, halo_b_v) = match &film.halo { Some((_, _, a, b)) => (view(a), view(b)), None => (view(&film.dummy), view(&film.dummy)) };
+        if kp.flags & FLAG_HALATION != 0 {
+            pass(encoder, &halo_a_v, &film.halo_source, &bind(&dummy_v, &dummy_v));
+            pass(encoder, &halo_b_v, &film.halo_blur_x, &bind(&halo_a_v, &dummy_v));
+            pass(encoder, &halo_a_v, &film.halo_blur_y, &bind(&halo_b_v, &dummy_v));
+        }
+        if kp.flags & FLAG_GRAIN != 0 {
+            pass(encoder, &g1_v, &film.noise_blur_x, &bind(&dummy_v, &dummy_v));
+        }
+        let halo_for_apply = if kp.flags & FLAG_HALATION != 0 { &halo_a_v } else { &dummy_v };
+        pass(encoder, &view(&film.out), &film.apply, &bind(&g1_v, halo_for_apply));
+        true
     }
 
     /// Records the chroma pass into `encoder` if it applies; returns whether it did. Skipping
@@ -709,9 +836,14 @@ impl WgpuWrapper {
         }
 
         let chroma_ran = self.encode_chroma(buffers, &itm.chroma_filter, &mut encoder);
-        let _temp_texture2 = if chroma_ran {
+        let film_src: Option<&wgpu::Texture> = if chroma_ran { Some(&self.chroma.as_ref().unwrap().out) } else { self.out_texture.wgpu_texture.as_ref() };
+        let film_ran = match film_src { Some(t) => self.encode_film(buffers, t, &itm.film, &mut encoder), None => false };
+        let copy_from: Option<wgpu::Texture> = if film_ran {
+            self.film.lock().as_ref().and_then(|f| f.as_ref()).map(|f| f.out.clone())
+        } else if chroma_ran { Some(self.chroma.as_ref().unwrap().out.clone()) } else { None };
+        let _temp_texture2 = if let Some(tex) = copy_from {
             encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo { texture: &self.chroma.as_ref().unwrap().out, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 wgpu::TexelCopyBufferInfo { buffer: self.staging_buffer.as_ref().unwrap(), layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(self.padded_out_stride), rows_per_image: None } },
                 wgpu::Extent3d { width: buffers.output.size.0 as u32, height: buffers.output.size.1 as u32, depth_or_array_layers: 1 },
             );
