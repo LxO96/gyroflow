@@ -349,6 +349,12 @@ fn should_bake_color<T: PixelType>(bake_color: bool) -> bool {
     bake_color && T::COUNT >= 3
 }
 
+/// Whether the film chain may run on this plane: only the packed RGBA planes colour baking
+/// produces (see `packed_color_format`), and only when the grade is actually baked in.
+fn film_plane_ok<T: PixelType>(packed_rgb: bool, bake_color: bool) -> bool {
+    packed_rgb && bake_color && gyroflow_core::film::supported::<T>()
+}
+
 /// Which chroma smoothing mode applies to a dispatched plane (`denoise::chroma_filter`).
 /// `yuvi` is the plane's YUV component list from the dispatch table: empty for packed RGB,
 /// `[0]` for luma, `[1]`/`[2]`/`[1,2]`/`[2,1]` for chroma, `[3]` for alpha. Planar RGB float
@@ -1040,9 +1046,14 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                     // component class and takes its sigma by plane index.
                     let packed_rgb = { let yuvi: &[usize] = &$yuvi; yuvi.is_empty() && $t::COUNT >= 3 };
                     let yuvi_owned: Vec<usize> = { let yuvi: &[usize] = &$yuvi; yuvi.to_vec() };
+                    // Read once per plane: the film chain's settings, gate and seed for this render.
+                    let film_ctx = if film_plane_ok::<$t>(packed_rgb, bake_color) { stab.film_context(true) } else { None };
                     $planes.borrow_mut().push(Box::new(move |timestamp_us: i64, in_frame_data: &Video, references: &[&Video], reference_timestamps: &[i64], out_frame_data: &mut Video, plane_index: usize, fill_with_background: bool| {
                         let mut g = render_globals.borrow_mut();
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
+                        // The film grain's frame index is taken from the source timestamp,
+                        // before `frame_offset`, as the preview does.
+                        let source_timestamp_us = timestamp_us;
                         let timestamp_us = timestamp_us + offset_us;
                         // The references go through the same `get_frame_transform_at`, in the same
                         // timestamp domain, so the frame offset has to apply to them too. Shifting
@@ -1100,6 +1111,10 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                             }
                             // `max_pixel_value` is final for this backend by now.
                             transform.chroma_filter = denoise.chroma_filter_params(chroma_mode, transform.kernel_params.max_pixel_value);
+                        }
+                        if let Some(ctx) = &film_ctx {
+                            // `max_pixel_value` is final for this backend by now (1.0 on wgpu unorm).
+                            transform.film = ctx.frame_params(out_size.0, out_size.1, source_timestamp_us, transform.kernel_params.max_pixel_value);
                         }
                         if fill_with_background {
                             transform.kernel_params.flags |= KernelParamsFlags::FILL_WITH_BACKGROUND.bits();
@@ -2137,6 +2152,22 @@ mod thumbnail_rotation_tests {
         assert_eq!(px(&out, w, 0, 0), GREEN);
         assert_eq!(px(&out, w, 0, 1), RED);
         assert!(!out.windows(4).any(|c| c == [9,9,9,9]), "padding leaked into the image");
+    }
+}
+
+#[cfg(test)]
+mod film_plane_tests {
+    use super::*;
+    #[test]
+    fn film_runs_only_on_baked_packed_rgba() {
+        assert!(film_plane_ok::<RGBA8>(true, true));
+        assert!(film_plane_ok::<RGBA16>(true, true));
+        assert!(!film_plane_ok::<RGBA16>(true, false), "not baked");
+        assert!(!film_plane_ok::<RGBA16>(false, true), "packed YUV (AYUV16 dispatch has yuvi)");
+        assert!(!film_plane_ok::<BGRA8>(true, true), "BGRA would swap R and B in OpenCL");
+        assert!(!film_plane_ok::<RGBAf>(true, true));
+        assert!(!film_plane_ok::<Luma16>(true, true));
+        assert!(!film_plane_ok::<UV16>(true, true));
     }
 }
 

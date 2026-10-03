@@ -234,6 +234,13 @@ pub struct Controller {
     get_output_ranges: qt_method!(fn(&self) -> QJsonArray),
     get_source_exposure: qt_method!(fn(&self) -> QJsonObject),
     set_denoise_param: qt_method!(fn(&self, name: QString, val: f64)),
+    set_film_stock: qt_method!(fn(&self, id: QString)),
+    set_film_format: qt_method!(fn(&self, id: QString)),
+    set_film_flag: qt_method!(fn(&self, name: QString, v: bool)),
+    set_film_param: qt_method!(fn(&self, name: QString, v: f64)),
+    get_film_stocks: qt_method!(fn(&self) -> QJsonArray),
+    get_film_formats: qt_method!(fn(&self) -> QJsonArray),
+    get_film_gate_message: qt_method!(fn(&self) -> QString),
     set_denoise_enabled: qt_method!(fn(&self, enabled: bool)),
     #[cfg(target_os = "windows")]
     set_video_thumbnails_enabled: qt_method!(fn(&self, enabled: bool) -> bool),
@@ -1284,6 +1291,9 @@ impl Controller {
                 // redrawn once or twice - so a plain failure left the raw, unstabilized frame
                 // on screen, and toggling denoise looked like the framing jumping.
                 if preview_denoise_radius(&stab, vid2.playing) > 0 { return TextureResult::UsePixels; }
+                // The film chain runs only on CPU outputs; hand film frames to the pixel callback
+                // like denoised ones. During playback too: the grain has to move.
+                if stab.film_context(stab.film_preview_graded()).is_some() { return TextureResult::UsePixels; }
 
                 let _time = std::time::Instant::now();
 
@@ -1548,6 +1558,52 @@ impl Controller {
         }
         self.request_recompute();
     }
+
+    // Film is render-only like denoise: `request_recompute()` redraws the preview.
+    fn set_film_stock(&mut self, id: QString) {
+        let id = id.to_string();
+        {
+            let mut f = self.stabilizer.film.write();
+            if id == "off" { f.stock = None; } else { f.set_stock(&id); }
+        }
+        self.request_recompute();
+    }
+    fn set_film_format(&mut self, id: QString) {
+        match core::film::stocks::FilmFormat::from_id(&id.to_string()) {
+            Some(f) => self.stabilizer.film.write().format = f,
+            None => { ::log::warn!("Unknown film format: {id}"); return; }
+        }
+        self.request_recompute();
+    }
+    fn set_film_flag(&mut self, name: QString, v: bool) {
+        if !self.stabilizer.film.write().set_flag(&name.to_string(), v) { ::log::warn!("Unknown film flag: {name}"); return; }
+        self.request_recompute();
+    }
+    fn set_film_param(&mut self, name: QString, v: f64) {
+        if !self.stabilizer.film.write().set_param(&name.to_string(), v) { ::log::warn!("Rejected film parameter: {name} = {v}"); return; }
+        self.request_recompute();
+    }
+    fn get_film_stocks(&self) -> QJsonArray {
+        let mut arr = QJsonArray::default();
+        for s in core::film::stocks::STOCKS.iter() {
+            let mut o = QJsonObject::default();
+            o.insert("id",    QString::from(s.id).into());
+            o.insert("label", QString::from(s.name).into());
+            arr.push(o.into());
+        }
+        arr
+    }
+    fn get_film_formats(&self) -> QJsonArray {
+        let mut arr = QJsonArray::default();
+        for f in core::film::stocks::FilmFormat::ALL {
+            let mut o = QJsonObject::default();
+            o.insert("id",    QString::from(f.id()).into());
+            o.insert("label", QString::from(f.label()).into());
+            arr.push(o.into());
+        }
+        arr
+    }
+    fn get_film_gate_message(&self) -> QString { QString::from(self.stabilizer.film_gate_message()) }
 
     /// Register or unregister the Explorer thumbnail handler for video files.
     ///

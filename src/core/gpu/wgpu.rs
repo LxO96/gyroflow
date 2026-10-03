@@ -620,6 +620,9 @@ impl WgpuWrapper {
         let Some(Some(film)) = guard.as_mut() else { return false; };
         let mut kp = *p;
         kp.width = w as i32; kp.height = h as i32; kp.stride = buffers.output.size.2 as i32;
+        // A unorm target (Rgba8Unorm) reads and writes 0..1 whatever the caller's pixel scale:
+        // the preview hands RGBA8 frames over with 255 (only exports normalise it for wgpu).
+        if matches!(self.film_format, Some((_, "f32"))) { kp.max_value = 1.0; }
         self.queue.write_buffer(&film.params, 0, bytemuck::bytes_of(&kp));
 
         if kp.flags & FLAG_HALATION != 0 {

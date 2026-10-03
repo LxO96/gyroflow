@@ -902,6 +902,8 @@ impl StabilizationManager {
         };
         let frame = frame.map(|x| (x as i32 + offset).max(0) as usize);
         let offset_us = (offset as f64 / fps * 1000000.0).round() as i64;
+        // The film grain's frame index comes from the source timestamp, as in exports.
+        let source_timestamp_us = timestamp_us;
         timestamp_us += offset_us;
         let mut reference_timestamps: Vec<i64> = reference_timestamps.iter().map(|ts| ts + offset_us).collect();
 
@@ -940,7 +942,9 @@ impl StabilizationManager {
         }
 
         if let Some(undist) = self.stabilization.try_read_for(std::time::Duration::from_millis(30000)) {
-            if reference_timestamps.is_empty() || buffers.references.is_empty() {
+            let film_ctx = if T::COUNT >= 3 && film::supported::<T>() { self.film_context(self.film_preview_graded()) } else { None };
+            let has_references = !reference_timestamps.is_empty() && !buffers.references.is_empty();
+            if !has_references && film_ctx.is_none() {
                 // Clear rather than merely branch: the backends derive `reference_count` from
                 // `buffers.references`, but the matrices come from the transform, and the
                 // plain path builds one with no `reference_matrices` at all. Leaving the
@@ -951,19 +955,23 @@ impl StabilizationManager {
             } else {
                 // The gather reads `reference_count` from `buffers.references.len()` but takes
                 // its matrices from the transform, so the two must be built together or the
-                // kernel walks off the end of the matrix buffer.
+                // kernel walks off the end of the matrix buffer. A film-only frame has neither.
+                if !has_references { buffers.references.clear(); reference_timestamps.clear(); }
                 let mut transform = undist.get_frame_transform_with_references::<T>(timestamp_us, &reference_timestamps, frame, buffers);
                 // Preview pixels are one interleaved RGBA plane, so luma and chroma are split
                 // per sample in the kernel (`denoise_rgb`) rather than per plane. Before that,
                 // only the luma sigma reached the preview and chroma strength did nothing.
                 let denoise = self.denoise.read();
                 transform.kernel_params.denoise_sigma = denoise.luma_sigma();
-                if T::COUNT >= 3 {
+                if T::COUNT >= 3 && has_references {
                     transform.kernel_params.denoise_rgb = [denoise.chroma_sigma(), 0.0, 0.0, 0.0];
                     // Paused preview only (this path has references), matching the temporal pass.
                     transform.chroma_filter = denoise.chroma_filter_params(denoise::chroma_filter::MODE_RGB, transform.kernel_params.max_pixel_value);
                 }
                 drop(denoise);
+                if let Some(ctx) = &film_ctx {
+                    transform.film = ctx.frame_params(buffers.output.size.0, buffers.output.size.1, source_timestamp_us, transform.kernel_params.max_pixel_value);
+                }
                 undist.process_pixels::<T>(timestamp_us, frame, buffers, Some(&transform))
             }
         } else {

@@ -196,8 +196,9 @@ fn film_gpu_wgpu_matches_the_reference_and_opencl() {
     assert_eq!(out[3], input, "film off must be bit-exact after film frames on the same wrapper");
 
     let input8 = to8(&scene());
-    let mut p8 = params(1.0);
-    p8.max_value = 1.0;
+    // 255, as the preview passes it: an Rgba8Unorm texture reads 0..1 regardless, so the
+    // wgpu chain must normalise by itself rather than trust the caller's scale.
+    let p8 = params(255.0);
     let out8 = ok("wgpu 8", run_wgpu(&input8, 4, &[p8])).unwrap();
     let d = max_diff(&from8(&out8[0]), &expected(&from8(&input8), &p8));
     println!("wgpu RGBA8: max diff {:.2} codes", d * 255.0);
