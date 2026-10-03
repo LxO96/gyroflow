@@ -1080,7 +1080,7 @@ mod cross_backend_color_tests {
         p.color_params_2 = COLOR_PARAMS_2;
         p.color_params_3 = COLOR_PARAMS_3;
 
-        FrameTransform { chroma_filter: Default::default(),
+        FrameTransform { chroma_filter: Default::default(), film: Default::default(),
             // Identity 3x3 in the first 9 fields; the trailing 5 stay zero, which disables
             // the extra shift/angle adjustment.
             matrices: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],

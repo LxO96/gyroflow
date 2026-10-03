@@ -173,6 +173,8 @@ static LAST_SKIP: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(N
 pub fn set_last_skip(why: String) { ::log::warn!("Film simulation skipped: {why}"); *LAST_SKIP.lock() = Some(why); }
 pub fn last_skip() -> Option<String> { LAST_SKIP.lock().clone() }
 
+#[cfg(test)] mod tests_gpu;
+
 #[cfg(test)]
 mod tests {
     use super::*;
