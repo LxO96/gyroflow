@@ -105,6 +105,26 @@ struct Opts {
     #[argh(option)]
     denoise_chroma_smoothing: Option<f64>,
 
+    /// film stock: portrait160, golden200, vivid100, pastel400, verdant400, tungsten800, classic400bw, smooth400bw, or off. Needs a baked colour grade.
+    #[argh(option)]
+    film_stock: Option<String>,
+
+    /// film format: s8, s16, 35 or 120
+    #[argh(option)]
+    film_format: Option<String>,
+
+    /// film grain amount, 0.0 to 2.0
+    #[argh(option)]
+    film_grain: Option<f64>,
+
+    /// film halation amount, 0.0 to 1.0
+    #[argh(option)]
+    film_halation: Option<f64>,
+
+    /// keep the grade's own tone and colour (film grain and halation only)
+    #[argh(switch)]
+    film_no_tone: bool,
+
     /// open file in the GUI (video or project)
     #[argh(option)]
     open: Option<String>,
@@ -202,22 +222,29 @@ pub fn run(open_file: &mut String, open_preset: &mut String) -> bool {
             if let Some(v) = opts.denoise_luma   { denoise.insert("luma_strength".into(),   v.into()); }
             if let Some(v) = opts.denoise_chroma { denoise.insert("chroma_strength".into(), v.into()); }
             if let Some(v) = opts.denoise_chroma_smoothing { denoise.insert("chroma_smoothing".into(), v.into()); }
-            if !denoise.is_empty() {
-                let mut root = serde_json::Map::new();
-                root.insert("denoise".into(), serde_json::Value::Object(denoise));
-                let value = serde_json::Value::Object(root);
-                // `--open` carries a single preset string into the GUI, so merge rather than
-                // overwrite: `--open x.mp4 --preset p.gyroflow --denoise high` must keep p.
-                if open_preset.trim().is_empty() {
-                    *open_preset = value.to_string();
-                } else if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(open_preset) {
-                    gyroflow_core::util::merge_json(&mut existing, &value);
-                    *open_preset = existing.to_string();
-                } else {
-                    *open_preset = value.to_string();
+            push_preset_section(open_preset, &mut presets, "denoise", denoise);
+        }
+        // Film, the same way and for the same reasons as denoise above.
+        {
+            let mut film = serde_json::Map::new();
+            if let Some(ref s) = opts.film_stock {
+                if s != "off" && gyroflow_core::film::stocks::stock(s).is_none() {
+                    eprintln!("Unknown film stock: {s}.");
+                    std::process::exit(1);
                 }
-                presets.push(value.to_string());
+                film.insert("stock".into(), s.clone().into());
             }
+            if let Some(ref f) = opts.film_format {
+                if gyroflow_core::film::stocks::FilmFormat::from_id(f).is_none() {
+                    eprintln!("Unknown film format: {f}. Expected s8, s16, 35 or 120.");
+                    std::process::exit(1);
+                }
+                film.insert("format".into(), f.clone().into());
+            }
+            if let Some(v) = opts.film_grain    { film.insert("grain_amount".into(),    v.into()); }
+            if let Some(v) = opts.film_halation { film.insert("halation_amount".into(), v.into()); }
+            if opts.film_no_tone { film.insert("tone".into(), false.into()); }
+            push_preset_section(open_preset, &mut presets, "film", film);
         }
 
         if let Some(open) = opts.open {
@@ -833,4 +860,23 @@ fn watch_folder<F: FnMut(String)>(path: String, cb: F) -> Result<(), String> {
 
     log::info!("Watching {} folder(s) in {}, waiting for new files...", watched_count, path);
     Ok(())
+}
+
+/// Adds `{ key: section }` as a preset, after any `--preset`, so explicit flags win.
+/// `--open` carries a single preset string into the GUI, so it is merged rather than
+/// overwritten: `--open x.mp4 --preset p.gyroflow --denoise high` must keep p.
+fn push_preset_section(open_preset: &mut String, presets: &mut Vec<String>, key: &str, section: serde_json::Map<String, serde_json::Value>) {
+    if section.is_empty() { return; }
+    let mut root = serde_json::Map::new();
+    root.insert(key.into(), serde_json::Value::Object(section));
+    let value = serde_json::Value::Object(root);
+    if open_preset.trim().is_empty() {
+        *open_preset = value.to_string();
+    } else if let Ok(mut existing) = serde_json::from_str::<serde_json::Value>(open_preset) {
+        gyroflow_core::util::merge_json(&mut existing, &value);
+        *open_preset = existing.to_string();
+    } else {
+        *open_preset = value.to_string();
+    }
+    presets.push(value.to_string());
 }
