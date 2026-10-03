@@ -349,6 +349,14 @@ fn should_bake_color<T: PixelType>(bake_color: bool) -> bool {
     bake_color && T::COUNT >= 3
 }
 
+/// The source timestamp for the film grain's frame index. `on_frame` hands the planes
+/// timestamps divided by the fps override (`fps_scale`), while the index is computed against
+/// the clip's own fps; undoing the division keeps one grain pattern per source frame, as in
+/// the preview.
+fn film_source_timestamp(scaled_timestamp_us: i64, fps_scale: Option<f64>) -> i64 {
+    (scaled_timestamp_us as f64 * fps_scale.unwrap_or(1.0)).round() as i64
+}
+
 /// Whether the film chain may run on this plane: only the packed RGBA planes colour baking
 /// produces (see `packed_color_format`), and only when the grade is actually baked in.
 fn film_plane_ok<T: PixelType>(packed_rgb: bool, bake_color: bool) -> bool {
@@ -1053,7 +1061,7 @@ pub fn render<F, F2>(stab: Arc<StabilizationManager>, progress: F, input_file: &
                         let wgpu_format = $t::wgpu_format().map(|x| x.0);
                         // The film grain's frame index is taken from the source timestamp,
                         // before `frame_offset`, as the preview does.
-                        let source_timestamp_us = timestamp_us;
+                        let source_timestamp_us = film_source_timestamp(timestamp_us, fps_scale);
                         let timestamp_us = timestamp_us + offset_us;
                         // The references go through the same `get_frame_transform_at`, in the same
                         // timestamp domain, so the frame offset has to apply to them too. Shifting
@@ -2158,6 +2166,22 @@ mod thumbnail_rotation_tests {
 #[cfg(test)]
 mod film_plane_tests {
     use super::*;
+
+    /// The export closure sees timestamps already divided by `fps_scale`; the grain's frame
+    /// index is computed against the clip's own fps, so the division must be undone or a
+    /// 30 -> 60 fps override shows each grain pattern on two frames.
+    #[test]
+    fn film_frame_timestamps_undo_the_fps_override() {
+        let s = gyroflow_core::film::FilmSettings { stock: Some("golden200".into()), ..Default::default() };
+        let ctx = gyroflow_core::film::FilmContext::new(s, 64, 30.0, "x").unwrap();
+        let seeds: Vec<[u32; 4]> = (0..6).map(|n| {
+            let source_us = (n as f64 * 1_000_000.0 / 30.0).round() as i64;
+            let scaled_us = (source_us as f64 / 2.0).round() as i64; // what on_frame hands the planes
+            ctx.frame_params(64, 64, film_source_timestamp(scaled_us, Some(2.0)), 1.0).seeds
+        }).collect();
+        for n in 1..6 { assert_ne!(seeds[n], seeds[n - 1], "frames {} and {n} share a grain pattern", n - 1); }
+        assert_eq!(film_source_timestamp(40_000, None), 40_000);
+    }
     #[test]
     fn film_runs_only_on_baked_packed_rgba() {
         assert!(film_plane_ok::<RGBA8>(true, true));

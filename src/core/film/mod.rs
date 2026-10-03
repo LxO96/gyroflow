@@ -170,8 +170,15 @@ pub(crate) fn force_halo_grid(p: &mut FilmParams, f: i32, w: usize, h: usize) {
 static LAST_SKIP: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 /// Why the GPU last skipped a film frame it was asked to render (build failure, unsupported
 /// output). Shown in the Film panel; the render itself continues without film.
-pub fn set_last_skip(why: String) { ::log::warn!("Film simulation skipped: {why}"); *LAST_SKIP.lock() = Some(why); }
+pub fn set_last_skip(why: String) {
+    let mut last = LAST_SKIP.lock();
+    // Logged once per reason: the CPU path reports on every frame it renders.
+    if last.as_deref() != Some(why.as_str()) { ::log::warn!("Film simulation skipped: {why}"); }
+    *last = Some(why);
+}
 pub fn last_skip() -> Option<String> { LAST_SKIP.lock().clone() }
+#[cfg(test)]
+pub(crate) fn clear_last_skip() { *LAST_SKIP.lock() = None; }
 
 #[cfg(test)] mod tests_gpu;
 

@@ -1018,6 +1018,8 @@ impl StabilizationManager {
         use color::OutputColorSpace::{ Rec2020Pq, Rec2020Hlg };
         if matches!(self.color.read().output_color_space, Rec2020Pq | Rec2020Hlg) { return "Film is not available for HDR (PQ/HLG) output.".into(); }
         if !self.film_preview_graded() { return "Film needs a colour grade: enable colour adjustments (with a LUT for log footage).".into(); }
+        // The preview shows the grade whenever it is on; exports only bake it (and so film) on request.
+        if !self.color.read().bake_in_render { return "Preview only: enable \"Apply to rendered video\" in Color adjustments to include film in the export.".into(); }
         film::last_skip().map(|w| format!("Film was skipped: {w}")).unwrap_or_default()
     }
 
@@ -2632,6 +2634,19 @@ DOMAIN_MAX 1.0 1.0 1.0
         assert!(mgr.film_context(true).is_some());
         mgr.film.write().stock = None;
         assert!(mgr.film_context(true).is_none());
+    }
+
+    /// The preview shows film whenever the grade is visible, but exports only bake it when
+    /// "Apply to rendered video" is on; the panel must say so instead of staying silent.
+    #[test]
+    fn film_gate_message_warns_when_the_grade_is_preview_only() {
+        let mgr = configured_manager(None);
+        mgr.film.write().stock = Some("golden200".into());
+        mgr.set_preview_color_enabled(true);
+        mgr.color.write().bake_in_render = false;
+        assert!(mgr.film_gate_message().contains("Apply to rendered video"), "got {:?}", mgr.film_gate_message());
+        mgr.color.write().bake_in_render = true;
+        assert!(!mgr.film_gate_message().contains("Apply to rendered video"));
     }
 
     #[test]
