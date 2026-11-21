@@ -244,6 +244,14 @@ impl OclWrapper {
                        .replace("PIXEL_BYTES", &format!("{}", params.bytes_per_pixel))
                        .replace("INTERPOLATION", &format!("{}", params.interpolation));
 
+        // The partial correction's 2D polish is for a lens with terms that aren't radial only: the others' solve along the
+        // ray's radius is the answer, and their kernel compiles without it
+        if !distortion_model.has_non_radial_terms() {
+            while let Some(pos) = kernel.find("{non_radial}") {
+                kernel.replace_range(pos..kernel.find("{/non_radial}").unwrap() + 13, "");
+            }
+        }
+
         for i in 0..31 {
             let v = 1 << i;
             if v == 4 { continue; } // Fill with background can be different per frame
@@ -298,7 +306,9 @@ impl OclWrapper {
                         }
                         let flags = if is_in { MemFlags::new().read_only().host_no_access() }
                                     else     { MemFlags::new().read_write().host_no_access() };
-                        Ok((Buffer::builder().queue(ocl_queue.clone()).len(buf.size.1 * buf.size.2).flags(flags).build()?, None))
+                        // `undistort_image` binds the output, and the input if it's not copied, to the kernel directly, so they only need a placeholder
+                        let len = if is_in && buf.texture_copy { buf.size.1 * buf.size.2 } else { 4 };
+                        Ok((Buffer::builder().queue(ocl_queue.clone()).len(len).flags(flags).build()?, None))
                     },
                     BufferSource::OpenGL { texture, .. } => {
                         let flags = if is_in { MemFlags::new().read_only() }
@@ -338,7 +348,7 @@ impl OclWrapper {
                 .devices(ctx.device)
                 .build(&ctx.context)?;
 
-            let max_matrix_count = 14 * if (params.flags & 16) == 16 { params.width } else { params.height };
+            let max_matrix_count = 16 * if (params.flags & 16) == 16 { params.width } else { params.height };
             let flags = MemFlags::new().read_only().host_write_only();
 
             let buf_params   = Buffer::builder().queue(ocl_queue.clone()).flags(flags).len(std::mem::size_of::<KernelParams>()).build()?;
@@ -349,7 +359,7 @@ impl OclWrapper {
             // Unlike the other backends, OpenCL keeps its interpolation tables as `__constant`
             // literals inside the .cl, so this buffer exists only to carry the LUT payload.
             // It is still built with `build_coeffs_buffer`, and therefore still starts with the
-            // 488 interpolation coefficients, so that LUT_DATA_OFFSET is the same everywhere.
+            // 496 interpolation coefficients, so that LUT_DATA_OFFSET is the same everywhere.
             // The buffer contents are static for the lifetime of this instance; a LUT change
             // produces a different `get_current_key` and therefore a fresh OclWrapper.
             let coeffs_data = crate::stabilization::build_coeffs_buffer(lut.as_deref());
@@ -456,15 +466,15 @@ impl OclWrapper {
         // slot that was never written. Counting successful uploads (and stopping at the first
         // failure) is what keeps `reference_count` describing the buffer's real contents.
         let mut uploaded_references = 0usize;
-        // Block layout the kernel indexes into: frame f starts at f * matrix_count * 14
+        // Block layout the kernel indexes into: frame f starts at f * matrix_count * 16
         // floats. Centre first, then references in temporal order - mirrors wgpu.rs.
-        let mut all_matrices: Vec<[f32; 14]> = Vec::with_capacity(itm.matrices.len() * (1 + itm.reference_matrices.len()));
+        let mut all_matrices: Vec<[f32; 16]> = Vec::with_capacity(itm.matrices.len() * (1 + itm.reference_matrices.len()));
         all_matrices.extend_from_slice(&itm.matrices);
         for block in &itm.reference_matrices {
             debug_assert_eq!(block.len(), itm.matrices.len(), "every reference block must match the centre block length or the kernel's stride arithmetic is wrong");
             all_matrices.extend_from_slice(block);
         }
-        let matrices = unsafe { std::slice::from_raw_parts(all_matrices.as_ptr() as *const f32, all_matrices.len() * 14) };
+        let matrices = unsafe { std::slice::from_raw_parts(all_matrices.as_ptr() as *const f32, all_matrices.len() * 16) };
 
         let mut _temp1 = None;
         let mut _temp2 = None;

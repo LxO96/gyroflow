@@ -133,6 +133,7 @@ Window {
             ui_tools.init_calibrator();
             Qt.callLater(() => {
                 controller.init_player(videoArea.vid);
+                lensCalib.applyCalibrationChoice();
                 Qt.callLater(() => {
                     videoArea.loadFile(file);
                 });
@@ -142,7 +143,7 @@ Window {
 
     FileDialog {
         id: fileDialog;
-        property var extensions: [ "mp4", "mov", "mxf", "mkv", "webm", "insv", "png", "jpg", "exr", "dng", "braw", "r3d" ];
+        property var extensions: [ "mp4", "mov", "mxf", "mkv", "webm", "insv", "png", "jpg", "exr", "dng", "braw", "r3d", "crm" ];
 
         title: qsTr("Choose a video file")
         nameFilters: Qt.platform.os == "android"? undefined : [qsTr("Video files") + " (*." + extensions.concat(extensions.map(x => x.toUpperCase())).join(" *.") + ")"];
@@ -208,7 +209,7 @@ Window {
                             }
 
                             calibrator_window.getSaveFileUrl(folder, output, function(url) {
-                                controller.export_lens_profile(url, lensCalib.calibrationInfo, lensCalib.uploadProfile.checked && lensCalib.uploadProfile.enabled);
+                                controller.export_lens_profile(url, lensCalib.calibrationInfo, lensCalib.uploadProfile.checked);
                             }, "Lens profile");
                         }
                         batch.runIn(1000, function() { batch.start(); });

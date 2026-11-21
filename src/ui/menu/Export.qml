@@ -34,11 +34,16 @@ MenuItem {
         if (Qt.platform.os == "android") { // We can't render sequences on Android because of file system restrictions
             list = list.filter(x => !x.name.includes("Sequence"));
         }
-        // if (Qt.platform.os == "windows" || Qt.platform.os == "linux" || Qt.platform.os == "android") {
-        //     list.push({ "name": "AV1", "max_size": [8192, 8192], "extension": ".mp4", "gpu": true, "audio": true, "variants": [ ] });
-        // }
+        // Last, because the index of a format is its key in the settings and in cli.rs. Whether the GPU encodes it is checked when it's selected
+        if (render_queue.has_encoder("AV1")) {
+            list.push({ "name": "AV1", "max_size": [8192, 8192], "extension": ".mp4", "gpu": true, "audio": true, "variants": [ ] });
+        }
         return list;
     };
+    // The encoders of the selected format on the GPU and on the CPU ({ gpu, cpu }, empty when none works), for those that are checked (AV1)
+    property var workingEncoders: null;
+    // Set when the GPU used for rendering is known, the encoders depend on it
+    property bool gpuTypeKnown: false;
 
     property var outputSizePresets: {
         "16:9": [
@@ -112,7 +117,7 @@ MenuItem {
     property real originalWidth: outWidth;
     property real originalHeight: outHeight;
 
-    property bool canExport: !resolutionWarning.visible && !resolutionWarning2.visible;
+    property bool canExport: !resolutionWarning.visible && !resolutionWarning2.visible && !noEncoderWarning.visible;
 
     // Set only by the pixel format warning below. Empty means "encode in whatever the source
     // is", which is what every export did before this existed and still the right default: a
@@ -304,6 +309,11 @@ MenuItem {
         function updateExtension(ext: string): void {
             window.outputFile.setFilename(window.outputFile.filename.replace(/(_%[0-9d]+)?\.[a-z0-9]+$/i, ext));
         }
+        // .mov to copy the audio with the other tracks, which .mp4 can't store when it's PCM. In sync with render_queue.rs:get_output_filename
+        function outputExtension(): string {
+            const ext = exportFormats[currentIndex].extension;
+            return ext == ".mp4" && preserveOtherTracks.checked && audio.checked && audioCodec.currentText == "Copy"? ".mov" : ext;
+        }
         function updateGpuStatus(): void {
             const format = exportFormats[currentIndex];
             gpu.enabled2 = format.gpu;
@@ -323,6 +333,10 @@ MenuItem {
             encoderOptions.text = settings.value("encoderOptions-" + currentIndex, "");
             encoderOptions.preventSave = false;
 
+            root.workingEncoders = null;
+            if (format.name == "AV1" && root.gpuTypeKnown) {
+                render_queue.check_encoders(format.name);
+            }
             // Runs on codec change and on video load, which is two of the three inputs; the
             // third is the GPU checkbox, which calls it itself.
             //
@@ -332,13 +346,27 @@ MenuItem {
             // own (argument-less, so stale-named) call, and this one overwrites its result.
             root.updatePixelFormatCheck(format.name);
         }
+        Connections {
+            target: render_queue;
+            function onEncoders_checked(codecName: string, gpuEncoder: string, cpuEncoder: string): void {
+                if (codecName != root.outCodec) return;
+                root.workingEncoders = { gpu: gpuEncoder, cpu: cpuEncoder };
+                gpu.enabled2 = gpuEncoder != "" && cpuEncoder != "";
+                if (!gpu.enabled2) {
+                    // Only one of them can be used
+                    gpu.preventSave = true;
+                    gpu.checked = gpuEncoder != "";
+                    gpu.preventSave = false;
+                }
+            }
+        }
         onCurrentIndexChanged: {
             const format = exportFormats[currentIndex];
             audio.enabled2 = format.audio;
             if (!audio.enabled2) audio.checked = false;
 
             updateGpuStatus();
-            updateExtension(format.extension);
+            updateExtension(outputExtension());
         }
     }
     ComboBox {
@@ -353,6 +381,12 @@ MenuItem {
             if (format.name == "ProRes") currentIndex = 3; // ProRes HQ by default
             if (format.name == "DNxHD") currentIndex = 2; // DNxHR HQ by default
         }
+    }
+    InfoMessageSmall {
+        id: noEncoderWarning;
+        type: InfoMessage.Error;
+        show: !!root.workingEncoders && !root.workingEncoders.gpu && !root.workingEncoders.cpu;
+        text: window.getReadableError("No working encoder for " + root.outCodec);
     }
     Label {
         position: Label.LeftPosition;
@@ -553,6 +587,10 @@ MenuItem {
         tooltip: enabled2? qsTr("GPU encoders typically generate output of lower quality than software encoders, but are significantly faster.") + "\n" +
                            qsTr("They require a higher bitrate to make output with the same perceptual quality, or they make output with a lower perceptual quality at the same bitrate.") + "\n" +
                            qsTr("Uncheck this option for maximum possible quality.")
+                         : root.workingEncoders && !root.workingEncoders.gpu?
+                           qsTr("Your GPU can't encode this format.")
+                         : root.workingEncoders && !root.workingEncoders.cpu?
+                           qsTr("This format can only be encoded on the GPU.")
                          :
                            qsTr("GPU acceleration is not available for the pixel format of this video.");
     }
@@ -611,6 +649,7 @@ MenuItem {
         property bool enabled3: window.stab.videoSpeed.value == 1.0 && !window.stab.videoSpeed.isKeyframed;
         tooltip: !enabled3? qsTr("Audio export not available when changing video speed.") : "";
         enabled: enabled2 && enabled3;
+        onCheckedChanged: codec.updateExtension(codec.outputExtension());
     }
 
     AdvancedSection {
@@ -673,8 +712,8 @@ MenuItem {
             id: preserveOtherTracks;
             text: qsTr("Preserve other tracks");
             checked: false;
-            tooltip: qsTr("This disables trim range and you need to use the .mov output file extension");
-            onCheckedChanged: if (checked) codec.updateExtension(".mov");
+            tooltip: qsTr("This disables trim range");
+            onCheckedChanged: codec.updateExtension(codec.outputExtension());
         }
         CheckBox {
             id: padWithBlack;
@@ -696,10 +735,12 @@ MenuItem {
             enabled: audio.checked;
             ComboBox {
                 id: audioCodec;
-                model: ["AAC", "PCM (s16le)", "PCM (s16be)", "PCM (s24le)", "PCM (s24be)"];
+                model: ["AAC", "PCM (s16le)", "PCM (s16be)", "PCM (s24le)", "PCM (s24be)", "Copy"];
                 font.pixelSize: 12 * dpiScale;
                 width: parent.width;
                 currentIndex: 0;
+                tooltip: qsTr("\"Copy\" keeps the original audio track without re-encoding it.\nIf the output file format can't store the original audio codec (e.g. PCM in .mp4), it will be encoded to AAC.");
+                onCurrentTextChanged: codec.updateExtension(codec.outputExtension());
             }
         }
         Label {
@@ -754,6 +795,11 @@ MenuItem {
                             Qt.callLater(renderingDevice.updateController);
                         }
                         renderingDevice.preventChange = false;
+
+                        root.gpuTypeKnown = true;
+                        if (root.outCodec == "AV1") {
+                            Qt.callLater(codec.updateGpuStatus); // After the rendering device is set
+                        }
                     }
                 }
                 onCurrentTextChanged: {
@@ -763,6 +809,9 @@ MenuItem {
                 function updateController(): void {
                     controller.set_rendering_gpu_type_from_name(renderingDevice.currentText);
                     settings.setValue("renderingDevice", renderingDevice.orgList[renderingDevice.currentIndex]);
+                    if (root.outCodec == "AV1") {
+                        Qt.callLater(codec.updateGpuStatus); // Its encoders depend on the device
+                    }
                 }
             }
         }

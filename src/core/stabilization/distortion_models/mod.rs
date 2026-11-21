@@ -7,6 +7,7 @@ mod poly3;
 mod poly5;
 mod ptlens;
 mod insta360;
+mod insta360_v6;
 pub mod sony;
 mod generic_polynomial;
 mod gopro;
@@ -18,6 +19,113 @@ mod gopro_warp;
 mod digital_stretch;
 
 use super::KernelParams;
+
+// The models a chessboard calibration can fit (`calibration::solver`), which calls their `distort` directly
+pub use self::{ opencv_fisheye::OpenCVFisheye, opencv_standard::OpenCVStandard, generic_polynomial::GenericPolynomial };
+
+/// The float types a model's math is written for: `f32` in the render, `f64` in the calibration solver, whose
+/// Jacobian is a finite difference that single precision would drown. A model writes its projection once, generic
+/// over this, and `distort_point` calls it with `f32`.
+///
+/// The functions are std's own, so the render's `f32` math is what it was before it was generic. nalgebra's
+/// `RealField` would route them through `libm` here, because `ahrs` builds nalgebra with `libm-force`: an `atan2`
+/// a few ulp off std's, and a fisheye `distort_point` about twice as slow in a release build
+pub trait Real: Copy + PartialOrd
+    + std::ops::Add<Output = Self> + std::ops::Sub<Output = Self> + std::ops::Mul<Output = Self> + std::ops::Div<Output = Self>
+{
+    fn from_f64(v: f64) -> Self;
+    fn sqrt(self) -> Self;
+    fn atan2(self, x: Self) -> Self;
+}
+macro_rules! impl_real {
+    ($($t:ty),*) => {$(
+        impl Real for $t {
+            #[inline(always)] fn from_f64(v: f64) -> Self { v as $t }
+            #[inline(always)] fn sqrt(self) -> Self { <$t>::sqrt(self) }
+            #[inline(always)] fn atan2(self, x: Self) -> Self { <$t>::atan2(self, x) }
+        }
+    )*};
+}
+impl_real!(f32, f64);
+
+/// A constant in the model's precision
+#[inline(always)]
+pub fn c<T: Real>(v: f64) -> T { T::from_f64(v) }
+
+/// Newton on a lens's whole forward map in its own plane, `map(q) = point`, from `q`: what finishes an inverse whose
+/// own iteration holds the terms that aren't radial still. That iteration is a fixed point which only contracts while
+/// those terms are small next to the radial ones, and a lens with large ones is left pixels off by it - hundreds of
+/// them in the corners of a wide one - or sent away altogether.
+///
+/// `map` gives the image of a plane point and its Jacobian, `(x, y, ∂x/∂u, ∂x/∂v, ∂y/∂u, ∂y/∂v)`. A step is only
+/// taken where it brings the image closer to `point` and lands where `admissible` says the lens still images (halved
+/// until it does, four times at most), and never from where the Jacobian's determinant isn't positive: the branch
+/// the camera images with is the one the map keeps its orientation on, and past a fold Newton would only walk further
+/// out. The GPU kernels have this inline in each model that uses it. Returns the point and how far its image still is
+/// from `point`, the larger of the two components. Never a point where the determinant isn't positive, which a
+/// starting point or an accepted step can be: a point past a fold of the map is a ray of the branch the camera doesn't
+/// image with, however close its image comes. From such a point it starts again just short of the fold, and unless it
+/// then reaches `point` ([`converged`]) on the branch the distance is infinite
+pub fn polish_inverse(point: (f32, f32), q: (f32, f32), map: impl Fn(f32, f32) -> (f32, f32, f32, f32, f32, f32), admissible: impl Fn(f32, f32) -> bool) -> ((f32, f32), f32) {
+    let det = |m: &(f32, f32, f32, f32, f32, f32)| m.2 * m.5 - m.3 * m.4;
+    let (mut q, mut m, mut err) = newton_on_branch(point, q, &map, &admissible);
+    if !(det(&m) > 0.0) {
+        // Where that fold is the edge of the image, the point the camera images can be just short of it: back towards
+        // the axis (a thousandth of the way, doubling, eight times at most) until the map keeps its orientation, and
+        // Newton from there. Only a point it reaches counts: one it stalls at short of `point` is the edge of the image,
+        // and `point` past it
+        let q0 = q;
+        let mut s = 1e-3f32;
+        let mut back = None;
+        for _ in 0..8 {
+            let c = (q0.0 * (1.0 - s), q0.1 * (1.0 - s));
+            if det(&map(c.0, c.1)) > 0.0 { back = Some(c); break; }
+            s *= 2.0;
+        }
+        if let Some(c) = back { (q, m, err) = newton_on_branch(point, c, &map, &admissible); }
+        if !(det(&m) > 0.0 && err <= converged(point)) { err = f32::INFINITY; }
+    }
+    (q, err)
+}
+/// How close to `point` an image is when the iteration has reached it: a few ulp of the image radius, as close as `f32`
+/// gets, with a factor of two for the last step's rounding. A test of whether there is a ray that asks for this rather
+/// than for the usual 1e-4 asks for the point itself, not for the stretch of the image the iteration stalls at
+pub fn converged(point: (f32, f32)) -> f32 {
+    1e-6 * (1.0 + (point.0 * point.0 + point.1 * point.1).sqrt())
+}
+/// The iteration of [`polish_inverse`]: the point it reaches, the map there and how far its image is from `point`
+fn newton_on_branch(point: (f32, f32), mut q: (f32, f32), map: &impl Fn(f32, f32) -> (f32, f32, f32, f32, f32, f32), admissible: &impl Fn(f32, f32) -> bool) -> ((f32, f32), (f32, f32, f32, f32, f32, f32), f32) {
+    // A few ulp of the image radius: as close as `f32` gets
+    let tol = 5e-7 * (1.0 + (point.0 * point.0 + point.1 * point.1).sqrt());
+    let mut m = map(q.0, q.1);
+    let (mut ex, mut ey) = (m.0 - point.0, m.1 - point.1);
+    let mut err = ex.abs().max(ey.abs());
+    for _ in 0..8 {
+        if !(err > tol) { break; } // and a NaN, which no step can mend
+        let det = m.2 * m.5 - m.3 * m.4;
+        if !(det > 0.0) { break; }
+        let sx = (m.5 * ex - m.3 * ey) / det;
+        let sy = (m.2 * ey - m.4 * ex) / det;
+        let mut lambda = 1.0f32;
+        let mut moved = false;
+        for _ in 0..4 {
+            let c = (q.0 - lambda * sx, q.1 - lambda * sy);
+            if admissible(c.0, c.1) {
+                let cm = map(c.0, c.1);
+                let (cx, cy) = (cm.0 - point.0, cm.1 - point.1);
+                let cerr = cx.abs().max(cy.abs());
+                if cerr < err {
+                    q = c; m = cm; ex = cx; ey = cy; err = cerr;
+                    moved = true;
+                    break;
+                }
+            }
+            lambda *= 0.5;
+        }
+        if !moved { break; }
+    }
+    (q, m, err)
+}
 
 macro_rules! impl_models {
     ($($name:ident => $class:ty,)*) => {
@@ -78,6 +186,7 @@ impl_models! {
     Poly5          => poly5::Poly5,
     PtLens         => ptlens::PtLens,
     Insta360          => insta360::Insta360,
+    Insta360V6        => insta360_v6::Insta360V6,
     Sony              => sony::Sony,
     GenericPolynomial => generic_polynomial::GenericPolynomial,
     GoPro             => gopro::GoPro,
@@ -91,16 +200,54 @@ impl_models! {
 }
 
 impl DistortionModel {
-    /// Largest usable ray radius `tan θ` before the curve folds back (its derivative stops being positive),
-    /// `None` when it rises all the way to 90° or the model has no derivative. The generic way samples the
-    /// derivative up to 90° and bisects the first non-positive step; the Sony spline solves its fold from the
-    /// coefficients, since each of its derivative samples would be a Newton solve and the renderer asks per frame
-    /// when the file records a lens curve per frame
+    /// The model has terms that aren't radial (decentering, thin prism), which move a ray off its own azimuth. Only then
+    /// does the partial correction's solve along the ray's radius leave the 2D map to finish (`polish_blend` in the
+    /// render; the `{non_radial}` sections of the kernels, which the others are built without)
+    pub fn has_non_radial_terms(&self) -> bool {
+        matches!(&self.inner, DistortionModels::OpenCVStandard(_) | DistortionModels::Insta360(_) | DistortionModels::Insta360V6(_))
+    }
+
+    /// The coefficients of the image mirrored vertically (`y` -> `-y`, a framebuffer upside down): the terms odd in
+    /// `y` change sign, the tangential `p1` and the thin prism of the `y` offset. Radial models are symmetric
+    pub fn mirror_coefficients_y(&self, k: &mut [f64]) {
+        use DistortionModels as M;
+        let odd: &[usize] = match &self.inner {
+            M::OpenCVStandard(_) => &[2, 10, 11], // p1, s3, s4
+            M::Insta360(_) => &[3],               // p1
+            M::Insta360V6(_) => &[6, 8, 10, 12],  // d6, d8: the decentering of y; d10, d12: the thin prism of y
+            _ => &[],
+        };
+        for &i in odd {
+            if let Some(v) = k.get_mut(i) { *v = -*v; }
+        }
+    }
+
+    /// The largest ray angle the model itself can represent, in radians, `None` when it has no such end.
+    /// Not a fold of the calibration - [`Self::radial_distortion_limit`] finds those - but the shape of the
+    /// projection: a rectilinear model images the z=1 plane and has nothing at 90°, and the unified sphere
+    /// of the Insta360 model turns over at `acos(-1/ξ)`
+    pub fn field_limit(&self, k: &[f64]) -> Option<f64> {
+        use DistortionModels as M;
+        match &self.inner {
+            M::OpenCVStandard(_) | M::Poly3(_) | M::Poly5(_) | M::PtLens(_) => Some(std::f64::consts::FRAC_PI_2 - 1e-4),
+            M::Insta360(_) => insta360::Insta360::field_limit(k),
+            M::Insta360V6(_) => insta360_v6::Insta360V6::field_limit(k),
+            _ => None
+        }
+    }
+
+    /// Largest usable ray angle (radians) before the curve folds back (its derivative stops being positive),
+    /// `None` when it rises all the way. The generic way samples the derivative up to 180° and bisects the
+    /// first non-positive step; the Sony spline solves its fold from the coefficients, since each of its
+    /// derivative samples would be a Newton solve and the renderer asks per frame when the file records a
+    /// lens curve per frame
     pub fn radial_distortion_limit(&self, k: &[f64]) -> Option<f64> {
         if let DistortionModels::Sony(m) = &self.inner {
             return m.radial_distortion_limit(k);
         }
-        let max_theta = std::f64::consts::FRAC_PI_2; // PI/2
+        // A fisheye can see well past 90°, so the sweep runs to 180° - the pipeline carries rays as angles
+        // and no longer stops at the old z=1 plane asymptote
+        let max_theta = std::f64::consts::PI;
 
         const STEPS: usize = 256;
         let mut low = 0.0;
@@ -128,25 +275,9 @@ impl DistortionModel {
 
         let theta_max = (low + high) / 2.0;
         if (theta_max - max_theta).abs() > 0.001 {
-            Some(theta_max.tan())
+            Some(theta_max)
         } else {
             None
-        }
-    }
-
-    /// Whether `undistort_point` keeps every point on its ray from the principal point, ie. the map is a pure
-    /// function of the radius. The lens-correction solve in `cpu_undistort::invert_lens_correction_blend`
-    /// bisects along that ray when it is, and has to solve in two dimensions when it isn't: tangential and
-    /// thin-prism terms move a point off its ray, and the digital warps are not radial at all
-    pub fn is_radial(&self, params: &KernelParams) -> bool {
-        use DistortionModels as M;
-        match &self.inner {
-            M::OpenCVFisheye(_) | M::Poly3(_) | M::Poly5(_) | M::PtLens(_) | M::Sony(_) | M::GenericPolynomial(_) | M::GoPro(_) => true,
-            // k = [k1 k2 p1 p2 k3 k4 k5 k6 s1 s2 s3 s4 ...]: p1 p2 tangential, s1..s4 thin prism
-            M::OpenCVStandard(_) => params.k[2] == 0.0 && params.k[3] == 0.0 && params.k[8..12].iter().all(|k| *k == 0.0),
-            // k = [k1 k2 k3 p1 p2 xi]
-            M::Insta360(_) => params.k[3] == 0.0 && params.k[4] == 0.0,
-            M::GoProSuperview(_) | M::GoPro6Superview(_) | M::GoProHyperview(_) | M::GoProWarp(_) | M::DigitalStretch(_) => false,
         }
     }
 }

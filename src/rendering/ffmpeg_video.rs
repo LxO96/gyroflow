@@ -4,6 +4,7 @@
 use ffmpeg_next::{ ffi, codec, decoder, encoder, format, frame, picture, software, util, Dictionary, Packet, Rational, Error, rescale::Rescale };
 
 use super::ffmpeg_processor::Status;
+use super::ffmpeg_processor::{ on_cuda, DropOnCuda };
 use super::ffmpeg_processor::FFmpegError;
 use super::ffmpeg_processor::FrameTimestamps;
 use super::ffmpeg_video_converter::Converter;
@@ -61,6 +62,8 @@ pub struct VideoTranscoder<'a> {
     pub decode_only: bool,
     pub gpu_decoding: bool,
     pub gpu_encoding: bool,
+    /// The decoder or the encoder works on CUDA: their calls take the CRM decoder's CUDA lock (`on_cuda`)
+    pub cuda: bool,
     pub clone_frames: bool,
 
     pub converter: Converter,
@@ -86,6 +89,9 @@ pub struct VideoTranscoder<'a> {
     pub processing_order: ProcessingOrder,
 
     pub ffmpeg_interpolation: i32,
+
+    /// Whether the header of the output file was written. For some encoders it's delayed until the first packet, see `needs_parameter_sets_from_bitstream`
+    pub header_written: bool,
 }
 
 pub struct RateControl {
@@ -103,6 +109,11 @@ macro_rules! ffmpeg {
 }
 
 impl<'a> VideoTranscoder<'a> {
+    /// Software formats the hardware frames of the encoders take
+    fn is_hw_upload_format(format: format::Pixel) -> bool {
+        matches!(format, format::Pixel::NV12 | format::Pixel::P010LE | format::Pixel::P012LE | format::Pixel::P016LE)
+    }
+
     fn init_encoder(frame: &mut frame::Video, params: &EncoderParams, decoder: &mut decoder::Video, size: (u32, u32), bitrate_mbps: Option<f64>, octx: &mut format::context::Output, output_index: usize, hw_upload_format: &Option<format::Pixel>) -> Result<encoder::video::Video, FFmpegError> {
         let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
         let mut ost = octx.stream_mut(output_index).unwrap();
@@ -202,10 +213,12 @@ impl<'a> VideoTranscoder<'a> {
 
         let decoder = self.decoder.as_mut().ok_or(FFmpegError::DecoderNotFound)?;
 
-        let mut frame = frame::Video::empty();
+        let cuda = self.cuda;
+        let mut decoded = DropOnCuda::new(frame::Video::empty(), cuda);
+        let mut frame = &mut *decoded;
         let mut sw_frame = &mut self.buffers.sw_frame;
 
-        while decoder.receive_frame(&mut frame).is_ok() {
+        while on_cuda(cuda, || decoder.receive_frame(&mut frame)).is_ok() {
             let time_base = self.encoder_params.time_base.unwrap();
 
             if let Some(mut ts) = frame.timestamp() {
@@ -217,7 +230,7 @@ impl<'a> VideoTranscoder<'a> {
                         frame_ts.first = Some(timestamp_us);
                     }
                     ts -= frame_ts.first.unwrap();
-                    ts += frame_ts.add_video;
+                    ts += frame_ts.range_offset;
 
                     let mut rate_control = RateControl {
                         out_timestamp_us: ts,
@@ -230,7 +243,8 @@ impl<'a> VideoTranscoder<'a> {
                             hw_formats = Some(unsafe { super::ffmpeg_hw::get_transfer_formats_from_gpu(frame.as_mut_ptr()) });
                             // log::debug!("Hardware transfer formats from GPU: {:?}", hw_formats);
                             // retrieve data from GPU to CPU
-                            ffmpeg!(ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), frame.as_mut_ptr(), 0); FromHWTransferError);
+                            let err = on_cuda(cuda, || unsafe { ffi::av_hwframe_transfer_data(sw_frame.as_mut_ptr(), frame.as_mut_ptr(), 0) });
+                            if err < 0 { return Err(FFmpegError::FromHWTransferError(err)); }
                             ffmpeg!(ffi::av_frame_copy_props(sw_frame.as_mut_ptr(), frame.as_mut_ptr()); FromHWTransferError);
                             &mut sw_frame
                         } else {
@@ -324,6 +338,15 @@ impl<'a> VideoTranscoder<'a> {
                             target_format = sw_format;
                             self.encoder_params.pixel_format = Some(target_format);
                         }
+                        // Frames from the CPU (eg. software decoding when the GPU can't decode the video) are uploaded to the hardware
+                        // frames of the encoder, which take the semi-planar formats, so convert eg. yuv420p10le to p010le first.
+                        // Frames downloaded from the GPU already are in a format it holds (eg. Y210 for 4:2:2 on Intel), keep them
+                        if hw_upload_format.is_some() && hw_formats.is_none() && !Self::is_hw_upload_format(target_format) {
+                            let depth = unsafe { ffi::av_pix_fmt_desc_get(target_format.into()).as_ref().map(|x| x.comp[0].depth).unwrap_or(8) };
+                            target_format = if depth > 8 { format::Pixel::P010LE } else { format::Pixel::NV12 };
+                            log::debug!("Uploading {:?} frames to the encoder as {:?}", in_format, target_format);
+                            self.encoder_params.pixel_format = Some(target_format);
+                        }
 
                         if in_format != target_format {
                             if self.encoder_converter.is_none() {
@@ -393,7 +416,10 @@ impl<'a> VideoTranscoder<'a> {
 
                             // let mut stderr_buf  = gag::BufferRedirect::stderr().unwrap();
 
-                            let result = Self::init_encoder(final_frame, &self.encoder_params, decoder, size, bitrate, octx, self.output_index.unwrap_or_default(), &hw_upload_format);
+                            // Opens the encoder, NVENC's on a CUDA device
+                            let output_index = self.output_index.unwrap_or_default();
+                            let encoder_params = &self.encoder_params;
+                            let result = on_cuda(cuda, || Self::init_encoder(final_frame, encoder_params, decoder, size, bitrate, octx, output_index, &hw_upload_format));
 
                             // let mut output = String::new();
                             // std::io::Read::read_to_string(stderr_buf, &mut output).unwrap();
@@ -402,12 +428,12 @@ impl<'a> VideoTranscoder<'a> {
 
                             self.encoder = Some(result?);
 
-                            octx.write_header()?;
-                            // format::context::output::dump(&octx, 0, Some(&output_path));
-
-                            for (ost_index, _) in octx.streams().enumerate() {
-                                ost_time_bases[ost_index] = octx.stream(ost_index as _).ok_or(Error::StreamNotFound)?.time_base();
+                            let encoder_name = self.encoder.as_ref().and_then(|x| x.codec()).map(|x| x.name().to_string()).unwrap_or_default();
+                            if !Self::needs_parameter_sets_from_bitstream(&encoder_name) {
+                                Self::write_header(octx, ost_time_bases)?;
+                                self.header_written = true;
                             }
+                            // format::context::output::dump(&octx, 0, Some(&output_path));
 
                             if let Some(ref mut cb) = self.on_encoder_initialized {
                                 cb(self.encoder.as_ref().unwrap())?;
@@ -420,16 +446,18 @@ impl<'a> VideoTranscoder<'a> {
 
                         ts = rate_control.out_timestamp_us;
 
-                        let mut output_hw_frame;
+                        // The uploaded frame is the device's memory: released under the lock too
+                        let mut output_hw_frame = DropOnCuda::new(None::<frame::Video>, cuda);
 
                         if let Some(hw_upload_format) = hw_upload_format {
                             log::debug!("Uploading frame to the device, hw_upload_format {:?}, final_frame.format: {:?}", hw_upload_format, final_frame.format());
 
-                            output_hw_frame = Some(frame::Video::empty());
+                            *output_hw_frame = Some(frame::Video::empty());
 
                             // Upload back to GPU
-                            unsafe {
-                                let frame_ptr = output_hw_frame.as_mut().ok_or(FFmpegError::FrameEmpty)?.as_mut_ptr();
+                            let frame_ptr = output_hw_frame.as_mut().ok_or(FFmpegError::FrameEmpty)?;
+                            on_cuda(cuda, || unsafe {
+                                let frame_ptr = frame_ptr.as_mut_ptr();
                                 let err = ffi::av_hwframe_get_buffer((*encoder.as_mut_ptr()).hw_frames_ctx, frame_ptr, 0);
                                 if err < 0 {
                                     return Err(FFmpegError::ToHWBufferError(err));
@@ -442,7 +470,8 @@ impl<'a> VideoTranscoder<'a> {
                                     return Err(FFmpegError::ToHWTransferError(err));
                                 }
                                 Self::copy_frame_props(frame_ptr, final_frame.as_ptr());
-                            }
+                                Ok(())
+                            })?;
                             final_frame = output_hw_frame.as_mut().ok_or(FFmpegError::FrameEmpty)?;
                         }
 
@@ -453,25 +482,19 @@ impl<'a> VideoTranscoder<'a> {
 
                             if self.clone_frames {
                                 // TODO: ideally this should be a buffer pool per thread, but we need to figure out which thread ffmpeg actually used for that frame
-                                encoder.send_frame(&final_frame.clone())?;
+                                let clone_frames_copy = DropOnCuda::new(final_frame.clone(), cuda);
+                                on_cuda(cuda, || encoder.send_frame(&*clone_frames_copy))?;
                             } else {
-                                encoder.send_frame(final_frame)?;
+                                on_cuda(cuda, || encoder.send_frame(final_frame))?;
                             }
                             ts += rate_control.repeat_interval;
 
                             // Copy of receive_and_process_encoded_packets
-                            let ost_time_base = ost_time_bases[self.output_index.unwrap_or_default()];
                             let octx = octx.as_mut().unwrap();
                             let time_base = self.encoder_params.time_base.unwrap();//self.decoder.as_ref().ok_or(FFmpegError::DecoderNotFound)?.time_base();
                             let mut encoded = Packet::empty();
-                            while encoder.receive_packet(&mut encoded).is_ok() {
-                                encoded.set_stream(self.output_index.unwrap_or_default());
-                                encoded.rescale_ts(time_base, ost_time_base);
-                                if octx.format().name().contains("image") {
-                                    encoded.write(octx)?;
-                                } else {
-                                    encoded.write_interleaved(octx)?;
-                                }
+                            while on_cuda(cuda, || encoder.receive_packet(&mut encoded)).is_ok() {
+                                Self::write_packet(&mut encoded, octx, self.output_index.unwrap_or_default(), time_base, ost_time_bases, &mut self.header_written)?;
                             }
                         }
                     }
@@ -567,7 +590,6 @@ impl<'a> VideoTranscoder<'a> {
         let time_base = self.encoder_params.time_base.unwrap();
         let mut ts = rate_control.out_timestamp_us;
         let clone_frames = self.clone_frames;
-        let output_index = self.output_index.unwrap_or_default();
         // Owns the uploaded hardware frame, if one is needed, so `final_frame` can borrow it
         // for the rest of this function. The initial `None` is never read - it exists purely
         // to give the binding a lifetime that outlives the block below.
@@ -619,26 +641,104 @@ impl<'a> VideoTranscoder<'a> {
         // muxer silently drops one frame per collision.
         self.last_extra_video_ts = Some(ts - rate_control.repeat_interval);
 
-        let ost_time_base = ost_time_bases[output_index];
-        self.receive_and_process_encoded_packets(octx, ost_time_base)?;
+        self.receive_and_process_encoded_packets(octx, ost_time_bases)?;
         Ok(true)
     }
 
-    pub fn receive_and_process_encoded_packets(&mut self, octx: &mut format::context::Output, ost_time_base: Rational) -> Result<(), FFmpegError> {
+    pub fn receive_and_process_encoded_packets(&mut self, octx: &mut format::context::Output, ost_time_bases: &mut Vec<Rational>) -> Result<(), FFmpegError> {
         if !self.decode_only {
             let time_base = self.encoder_params.time_base.unwrap();//self.decoder.as_ref().ok_or(FFmpegError::DecoderNotFound)?.time_base();
             let mut encoded = Packet::empty();
-            while self.encoder.as_mut().ok_or(FFmpegError::EncoderNotFound)?.receive_packet(&mut encoded).is_ok() {
-                encoded.set_stream(self.output_index.unwrap_or_default());
-                encoded.rescale_ts(time_base, ost_time_base);
-                if octx.format().name().contains("image") {
-                    encoded.write(octx)?;
-                } else {
-                    encoded.write_interleaved(octx)?;
-                }
+            let cuda = self.cuda;
+            while { let encoder = self.encoder.as_mut().ok_or(FFmpegError::EncoderNotFound)?; on_cuda(cuda, || encoder.receive_packet(&mut encoded)).is_ok() } {
+                Self::write_packet(&mut encoded, octx, self.output_index.unwrap_or_default(), time_base, ost_time_bases, &mut self.header_written)?;
+            }
+            // Nothing was encoded, the file still needs a header to be valid
+            if !self.header_written {
+                Self::write_header(octx, ost_time_bases)?;
+                self.header_written = true;
             }
         }
         Ok(())
+    }
+
+    /// The VAAPI encoders pass the parameter sets to the driver, which may rewrite them with the values it actually encodes with
+    /// (eg. radeonsi changes `diff_cu_qp_delta_depth` and the transform depth). The extradata created by FFmpeg doesn't follow that,
+    /// so with the `hvc1`/`avc1` tag (parameter sets only in the header) the video can't be decoded. Take them from the first packet instead.
+    fn needs_parameter_sets_from_bitstream(encoder_name: &str) -> bool {
+        encoder_name == "hevc_vaapi" || encoder_name == "h264_vaapi"
+    }
+
+    fn write_header(octx: &mut format::context::Output, ost_time_bases: &mut Vec<Rational>) -> Result<(), FFmpegError> {
+        octx.write_header()?;
+        for (ost_index, _) in octx.streams().enumerate() {
+            ost_time_bases[ost_index] = octx.stream(ost_index as _).ok_or(Error::StreamNotFound)?.time_base();
+        }
+        Ok(())
+    }
+
+    fn write_packet(encoded: &mut Packet, octx: &mut format::context::Output, output_index: usize, time_base: Rational, ost_time_bases: &mut Vec<Rational>, header_written: &mut bool) -> Result<(), FFmpegError> {
+        if !*header_written {
+            let codec_id = octx.stream(output_index).map(|x| x.parameters().id()).unwrap_or(codec::Id::None);
+            if let Some(parameter_sets) = encoded.data().and_then(|data| Self::parameter_sets_from_annexb(data, codec_id)) {
+                log::debug!("Using the parameter sets from the bitstream as extradata ({} bytes)", parameter_sets.len());
+                unsafe {
+                    let par = (*octx.stream_mut(output_index).ok_or(Error::StreamNotFound)?.as_mut_ptr()).codecpar;
+                    let extradata = ffi::av_mallocz(parameter_sets.len() + ffi::AV_INPUT_BUFFER_PADDING_SIZE as usize) as *mut u8;
+                    if extradata.is_null() {
+                        log::error!("Failed to allocate the extradata, keeping the parameter sets of the encoder");
+                    } else {
+                        std::ptr::copy_nonoverlapping(parameter_sets.as_ptr(), extradata, parameter_sets.len());
+                        ffi::av_freep(&mut (*par).extradata as *mut *mut u8 as *mut std::ffi::c_void);
+                        (*par).extradata = extradata;
+                        (*par).extradata_size = parameter_sets.len() as i32;
+                    }
+                }
+            }
+            Self::write_header(octx, ost_time_bases)?;
+            *header_written = true;
+        }
+        encoded.set_stream(output_index);
+        encoded.rescale_ts(time_base, ost_time_bases[output_index]);
+        if octx.format().name().contains("image") {
+            encoded.write(octx)?;
+        } else {
+            encoded.write_interleaved(octx)?;
+        }
+        Ok(())
+    }
+
+    /// VPS/SPS/PPS (HEVC) or SPS/PPS (H.264) NAL units of an Annex B packet, with their start codes
+    fn parameter_sets_from_annexb(data: &[u8], codec_id: codec::Id) -> Option<Vec<u8>> {
+        let is_parameter_set = |nal: &[u8]| -> bool {
+            match codec_id {
+                codec::Id::HEVC => matches!((nal[0] >> 1) & 0x3f, 32..=34),
+                codec::Id::H264 => matches!(nal[0] & 0x1f, 7 | 8),
+                _ => false
+            }
+        };
+        // Positions of the NAL units, after their start codes
+        let mut starts = Vec::new();
+        let mut i = 0;
+        while i + 3 <= data.len() {
+            if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+                starts.push(i + 3);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        let mut ret = Vec::new();
+        for (n, &start) in starts.iter().enumerate() {
+            let mut end = starts.get(n + 1).map_or(data.len(), |&next| next - 3);
+            // Trailing zero belongs to the next 4-byte start code
+            while end > start && data[end - 1] == 0 { end -= 1; }
+            if end > start && is_parameter_set(&data[start..end]) {
+                ret.extend_from_slice(&[0, 0, 0, 1]);
+                ret.extend_from_slice(&data[start..end]);
+            }
+        }
+        if ret.is_empty() { None } else { Some(ret) }
     }
 
     /*fn get_format_range(format: format::Pixel) -> (bool, format::Pixel) {

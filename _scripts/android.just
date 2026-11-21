@@ -49,7 +49,7 @@ install-deps:
     # ――――――――――――――――――――――――――――――――――――――――― Qt ――――――――――――――――――――――――――――――――――――――――――
 
     # ――――――――――――――――――――――――――――――――――――――― FFmpeg ――――――――――――――――――――――――――――――――――――――――
-    $FFmpeg = "ffmpeg-9.0-android-gpl-lite"
+    $FFmpeg = "ffmpeg-9.1-android-gpl-lite"
     if (-not (Test-Path -Path "$FFmpeg")) {
         echo "Downloading $FFmpeg"
         Invoke-WebRequest -Uri "https://downloads.sourceforge.net/project/avbuild/android/$FFmpeg.tar.xz" -OutFile "ffmpeg.tar.xz" -MaximumRedirection 5 -UserAgent "wget/1.21"
@@ -107,7 +107,7 @@ deploy *param:
     $QT_LIBS = "$ProjectDir\ext\{{QtVersion}}\android_arm64_v8a\lib"
     $Env:Path = "$ProjectDir\ext\{{QtVersion}}\android_arm64_v8a\bin;$ProjectDir\ext\{{QtVersion}}\mingw_64\bin\;$Env:Path"
     $Env:QMAKE = "$ProjectDir\ext\{{QtVersion}}\android_arm64_v8a\bin\qmake.bat"
-    $Env:FFMPEG_DIR = "$ProjectDir\ext\ffmpeg-9.0-android-gpl-lite"
+    $Env:FFMPEG_DIR = "$ProjectDir\ext\ffmpeg-9.1-android-gpl-lite"
     $Env:OPENCV_LINK_LIBS = "opencv_stitching,opencv_calib3d,opencv_features2d,opencv_imgproc,opencv_video,opencv_flann,opencv_core,tegra_hal,tbb,ittnotify,z,kleidicv,kleidicv_hal,kleidicv_thread"
     $Env:OPENCV_LINK_PATHS = "$ProjectDir\ext\OpenCV-android-sdk\sdk\native\staticlibs\arm64-v8a,$ProjectDir\ext\OpenCV-android-sdk\sdk\native\3rdparty\libs\arm64-v8a"
     $Env:OPENCV_INCLUDE_PATHS = "$ProjectDir\ext\OpenCV-android-sdk\sdk\native\jni\include"
@@ -118,6 +118,65 @@ deploy *param:
     $PROJECT_DIR_UNIX = $ProjectDir.replace('\', '/');
     $Env:BINDGEN_EXTRA_CLANG_ARGS = "-I$CLANG_LIB/clang/16.0.0/include --sysroot=$NDK_REPLACED/toolchains/llvm/prebuilt/windows-x86_64/sysroot"
     echo $Env:BINDGEN_EXTRA_CLANG_ARGS
+
+    $MinSdk = "26"
+    $ReadElf = "$Env:ANDROID_NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-readelf.exe"
+    # Libraries every device at $MinSdk has: the package doesn't bundle them
+    $PlatformLibs = "$Env:ANDROID_NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\sysroot\usr\lib\aarch64-linux-android\$MinSdk"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    function Get-NeededLibs([string]$Lib) {
+        $out = & $ReadElf --dynamic --wide $Lib
+        if ($LASTEXITCODE -ne 0) { throw "llvm-readelf failed on $Lib" }
+        $out | Select-String '\(NEEDED\)\s+Shared library: \[(.+)\]' | ForEach-Object { $_.Matches[0].Groups[1].Value }
+    }
+
+    # Copies the libraries libgyroflow needs, and the ones they need, from the directories they were linked from.
+    # cargo-apk should do it, but it reads the build scripts' rustc-link-search lines from build/<pkg>-<hash>/output,
+    # and since Rust 1.100 that file is in build/<pkg>/<hash>/: cargo-apk then only prints
+    # 'Shared library "libavcodec.so" not found.', and v1.7.1 shipped without FFmpeg and libmdk.so.
+    function Copy-NeededLibs([string]$LibsDir, [string[]]$SearchDirs) {
+        $queue = [System.Collections.Generic.Queue[string]]::new()
+        $queue.Enqueue("$LibsDir\libgyroflow_arm64-v8a.so")
+        while ($queue.Count -gt 0) {
+            $lib = $queue.Dequeue()
+            foreach ($need in Get-NeededLibs $lib) {
+                if ((Test-Path "$LibsDir\$need") -or (Test-Path "$PlatformLibs\$need")) { continue }
+                $found = $SearchDirs | ForEach-Object { "$_\$need" } | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
+                if ($found) {
+                    echo "Bundling $found"
+                    Copy-Item -Path $found -Destination $LibsDir
+                    $queue.Enqueue("$LibsDir\$need")
+                }
+            }
+        }
+    }
+
+    # Fails the build when a library in the package needs one that is neither in the package nor on every device
+    function Assert-NativeLibsBundled([string]$Archive, [string]$LibPrefix) {
+        $dir = Join-Path $Env:TEMP ("gyroflow-libcheck-" + [guid]::NewGuid())
+        New-Item -ItemType Directory -Path $dir | Out-Null
+        try {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($Archive)
+            try {
+                foreach ($e in $zip.Entries) {
+                    if ($e.Name -like "*.so" -and $e.FullName -eq "$LibPrefix$($e.Name)") {
+                        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($e, "$dir\$($e.Name)")
+                    }
+                }
+            } finally { $zip.Dispose() }
+            if (-not (Test-Path "$dir\libgyroflow_arm64-v8a.so")) { throw "$Archive has no ${LibPrefix}libgyroflow_arm64-v8a.so" }
+            $missing = foreach ($lib in Get-ChildItem "$dir\*.so") {
+                foreach ($need in Get-NeededLibs $lib.FullName) {
+                    if (-not (Test-Path "$dir\$need") -and -not (Test-Path "$PlatformLibs\$need")) { "$($lib.Name) needs $need" }
+                }
+            }
+            if ($missing) { throw "$Archive is missing native libraries:`n    " + ($missing -join "`n    ") }
+            echo "${Archive}: every native library dependency is bundled"
+        } finally {
+            Remove-Item -Path $dir -Recurse -Force
+        }
+    }
 
     if ("$Env:GITHUB_RUN_NUMBER") {
         $manifest = Join-Path $ProjectDir "_deployment\android\AndroidManifest.xml"
@@ -142,10 +201,18 @@ deploy *param:
     [System.IO.File]::WriteAllText("$QT_LIBS\..\src\3rdparty\gradle\gradle\wrapper\gradle-wrapper.properties", [System.IO.File]::ReadAllText("$QT_LIBS\..\src\3rdparty\gradle\gradle\wrapper\gradle-wrapper.properties").Replace("gradle-8.3-bin", "gradle-8.6-bin"))
     [System.IO.File]::WriteAllText("$QT_LIBS\..\src\android\templates\build.gradle", [System.IO.File]::ReadAllText("$QT_LIBS\..\src\android\templates\build.gradle").Replace("7.4.1", "8.4.2"))
 
-    cargo apk build --profile $Env:BUILD_PROFILE
+    # cargo-apk stages the libraries here and then fails, for any profile but dev, signing its own APK (not used, it has no
+    # keystore): its exit code doesn't tell whether the build worked, libgyroflow.so staged by this run does
+    $StagedLibs = "$ProjectDir\target\$Env:BUILD_PROFILE\apk\lib"
+    if (Test-Path $StagedLibs) { Remove-Item -Path $StagedLibs -Recurse -Force }
+
+    # Without the AI optical flow (ai-optical-flow, GMFlow): it's for desktop GPUs, and its model is downloaded on first use
+    cargo apk build --profile $Env:BUILD_PROFILE --no-default-features --features opencv
+    $CargoExitCode = $LASTEXITCODE
 
     # Restore [[bin]]
     [System.IO.File]::WriteAllText("$ProjectDir\Cargo.toml", [System.IO.File]::ReadAllText("$ProjectDir\Cargo.toml").Replace("[lib]`ncrate-type = [""cdylib""]", "[[bin]]"))
+    if (-not (Test-Path "$StagedLibs\arm64-v8a\libgyroflow.so")) { throw "cargo apk build failed with exit code $CargoExitCode" }
 
     mkdir "$ProjectDir\target\android-build" -ErrorAction SilentlyContinue
     mkdir "$ProjectDir\target\android-build\libs" -ErrorAction SilentlyContinue
@@ -162,6 +229,7 @@ deploy *param:
         "libQt6Network_arm64-v8a.so",
         "libQt6OpenGL_arm64-v8a.so",
         "libQt6Qml_arm64-v8a.so",
+        "libQt6QmlCore_arm64-v8a.so",
         "libQt6QmlLocalStorage_arm64-v8a.so",
         "libQt6QmlModels_arm64-v8a.so",
         "libQt6QmlWorkerScript_arm64-v8a.so",
@@ -217,6 +285,9 @@ deploy *param:
         Copy-Item -Path "$QT_LIBS\$x" -Destination "$ProjectDir\target\android-build\libs\arm64-v8a\" -Force -ErrorAction SilentlyContinue
     }
 
+    # FFmpeg's libav*.so and libmdk.so (qml-video-rs puts it next to libffmpeg.so)
+    Copy-NeededLibs "$ProjectDir\target\android-build\libs\arm64-v8a" @("$Env:FFMPEG_DIR\lib\arm64-v8a", "$Env:FFMPEG_DIR\lib", "$ProjectDir\target\aarch64-linux-android\$Env:BUILD_PROFILE")
+
     # Strip all libs
     . "$Env:ANDROID_NDK_HOME\toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-strip.exe" "$ProjectDir\target\android-build\libs\arm64-v8a\*.so"
 
@@ -239,7 +310,7 @@ deploy *param:
         "tool-prefix": "llvm",
         "ndk-host": "windows-x86_64",
         "architectures": {"arm64-v8a":"aarch64-linux-android"},
-        "android-min-sdk-version": "26",
+        "android-min-sdk-version": "$MinSdk",
         "android-package-source-directory": "$PROJECT_DIR_UNIX/_deployment/android",
         "android-target-sdk-version": "36",
         "qml-importscanner-binary": "$PROJECT_DIR_UNIX/ext/{{QtVersion}}/mingw_64/bin/qmlimportscanner.exe",
@@ -308,11 +379,13 @@ deploy *param:
 
     $ApkPath = "$ProjectDir\target\android-build\build\outputs\$ApkName"
     if (-not (Test-Path $ApkPath)) { throw "Expected APK not found at $ApkPath" }
+    Assert-NativeLibsBundled $ApkPath "lib/arm64-v8a/"
     Copy-Item -Path $ApkPath -Destination "$ProjectDir\_deployment\_binaries\Gyroflow.apk" -Force
 
     if ("$Env:BUILD_APP_STORE_BUNDLE" -eq "true") {
         $AabPath = "$ProjectDir\target\android-build\build\outputs\bundle\release\android-build-release.aab"
         if (-not (Test-Path $AabPath)) { throw "Expected AAB not found at $AabPath" }
+        Assert-NativeLibsBundled $AabPath "base/lib/arm64-v8a/"
         Copy-Item -Path $AabPath -Destination "$ProjectDir\_deployment\_binaries\Gyroflow.aab" -Force
     }
 

@@ -7,6 +7,7 @@ pub mod plain;
 pub mod fixed;
 pub mod default_algo;
 pub mod focal_length;
+pub mod optimal;
 
 pub use nalgebra::*;
 use super::gyro_source::{ TimeQuat, Quat64 };
@@ -27,8 +28,15 @@ pub trait SmoothingAlgorithm: DynClone {
     fn get_parameter(&self, name: &str) -> f64;
 
     fn get_checksum(&self) -> u64;
+    /// What the result depends on in `compute_params` beyond what `Smoothing::get_state_checksum` already covers
+    fn get_compute_checksum(&self, _compute_params: &ComputeParams) -> u64 { 0 }
 
     fn smooth(&self, quats: &TimeQuat, duration: f64, _compute_params: &ComputeParams) -> TimeQuat;
+    /// `smooth`, for an algorithm that needs `original` too: the camera's own orientation, before the horizon lock and
+    /// the additional rotation, which is what the render corrects (`smoothed⁻¹·original`)
+    fn smooth_with_original(&self, quats: &TimeQuat, _original: &TimeQuat, duration: f64, compute_params: &ComputeParams) -> TimeQuat {
+        self.smooth(quats, duration, compute_params)
+    }
 }
 clone_trait_object!(SmoothingAlgorithm);
 
@@ -38,6 +46,7 @@ impl Default for Algs {
         Self(vec![
             Box::new(self::none::None::default()),
             Box::new(self::default_algo::DefaultAlgo::default()),
+            Box::new(self::optimal::Optimal::default()),
             Box::new(self::plain::Plain::default()),
             Box::new(self::fixed::Fixed::default())
         ])
@@ -109,9 +118,13 @@ impl Smoothing {
         hasher.write_u64(gyro_checksum);
         hasher.write_usize(self.current_id);
         hasher.write_u64(self.algs.0[self.current_id].get_checksum());
+        hasher.write_u64(self.algs.0[self.current_id].get_compute_checksum(compute_params));
         hasher.write_u64(self.horizon_lock.get_checksum());
         hasher.write_usize(compute_params.camera_diagonal_fovs.len());
         for fov in &compute_params.camera_diagonal_fovs { hasher.write_u64(fov.to_bits()); }
+        // What's per frame (the frames' zoom limits, their crop and their times for the crop constraint) is by the
+        // frames' times
+        if let Some(times) = &compute_params.frame_times { hasher.write_u64(times.checksum()); }
         hasher.finish()
     }
 
@@ -119,10 +132,12 @@ impl Smoothing {
         self.algs.0.iter().map(|x| x.get_name()).collect()
     }
 
-    pub fn get_trimmed_quats<'a>(quats: &'a TimeQuat, duration_ms: f64, trim_range_only: bool, trim_ranges: &[(f64, f64)]) -> Cow<'a, TimeQuat> {
-        if trim_range_only && !trim_ranges.is_empty() {
+    /// `quats` with the motion outside of `ranges` (the motion data's time in µs, sorted, `ComputeParams::trim_ranges_motion_us`)
+    /// replaced by the orientations at the ranges' ends, so it doesn't affect the smoothing within them ("Only within trim
+    /// range"). `quats` as they are without ranges
+    pub fn get_trimmed_quats<'a>(quats: &'a TimeQuat, trim_range_only: bool, ranges: &[(i64, i64)]) -> Cow<'a, TimeQuat> {
+        if trim_range_only && !ranges.is_empty() {
             let mut quats_copy = quats.clone();
-            let ranges = trim_ranges.iter().map(|x| ((x.0 * duration_ms * 1000.0).round() as i64, (x.1 * duration_ms * 1000.0).round() as i64)).collect::<Vec<_>>();
             let mut prev_q = quats.range(ranges.first().unwrap().0..).next().map(|(&a, &b)| (a, b));
             let mut next_q = prev_q;
             let mut range = ranges.first().unwrap();
@@ -161,7 +176,8 @@ impl Smoothing {
     }
 
     pub fn get_max_angles(quats: &TimeQuat, smoothed_quats: &TimeQuat, params: &ComputeParams) -> (f64, f64, f64) { // -> (pitch, yaw, roll) in deg
-        let ranges = params.trim_ranges.iter().map(|x| ((x.0 * params.scaled_duration_ms * 1000.0) as i64, (x.1 * params.scaled_duration_ms * 1000.0) as i64)).collect::<Vec<_>>();
+        // The smoothed orientations are by the motion data's time, which the frames of the trim ranges read
+        let ranges = params.trim_ranges_motion_us();
         let identity_quat = Quat64::identity();
 
         let mut max_pitch = 0.0;
@@ -182,4 +198,22 @@ impl Smoothing {
         const RAD2DEG: f64 = 180.0 / std::f64::consts::PI;
         (max_pitch * RAD2DEG, max_yaw * RAD2DEG, max_roll * RAD2DEG)
     }
+}
+
+/// `from` turned toward `to` by `t` of the rotation between them, along the shorter arc: their slerp at `t`, a unit
+/// quaternion to rounding at any angle. A smoothing pass takes a step like this toward every sample, each from the one
+/// before, thousands in a row, so each step has to be exact or the pass's result depends on the rounding of its input:
+/// nalgebra's `slerp` takes the angle from the `acos` of the quaternions' dot product and doesn't normalize what it
+/// returns, so a pass's state drifts off unit length with every step (by 1e-8 to 4e-8 over a thousand steps), the angle
+/// it takes from the drifted dot product is the wrong one, and where that product comes out at 1 or above it returns its
+/// input unchanged: the step isn't taken. Here the angle is the `atan2` of the rotation between the two, which is exact
+/// to rounding however small it is, and the result is normalized
+pub fn slerp_toward(from: &Quat64, to: &Quat64, t: f64) -> Quat64 {
+    let d = from.quaternion().conjugate() * to.quaternion();
+    // q and −q are the same rotation: the shorter arc is the one with a non-negative real part
+    let (w, v) = if d.w < 0.0 { (-d.w, -d.imag()) } else { (d.w, d.imag()) };
+    let sin_half = v.norm();
+    if sin_half == 0.0 { return *from; }
+    let half = sin_half.atan2(w) * t;
+    UnitQuaternion::new_normalize(from.quaternion() * Quaternion::from_parts(half.cos(), v * (half.sin() / sin_half)))
 }

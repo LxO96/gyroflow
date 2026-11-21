@@ -17,6 +17,8 @@ pub mod external_sdk;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 pub mod nle_plugins;
 mod cli;
+#[cfg(target_os = "linux")]
+mod linux_fontconfig;
 mod resources;
 #[cfg(not(compiled_qml))]
 mod resources_qml;
@@ -79,7 +81,9 @@ fn entry() {
 
     let mut open_file = String::new();
     let mut open_preset = String::new();
-    if cli::run(&mut open_file, &mut open_preset) {
+    let mut open_files = Vec::new();
+    let mut add_to_queue = false;
+    if cli::run(&mut open_file, &mut open_preset, &mut open_files, &mut add_to_queue) {
         return;
     }
 
@@ -145,7 +149,9 @@ fn entry() {
     } else {
         MDKVideoItem::setGlobalOption("MDK_KEY", "47FA7B212D5FF2F649A245E6D8DC2D88BAB67C208282CB3E2DEB95B9B4F9EC575102303FB92448ED49454E027A31B48ED08824EB904B58F693AD\
             B52FA63A4008B80584DE2D5F0D09B65DBA192723D277B8B67447FBF0A4584184E2659155D95CFBEB08626CBE3C94416B2FC50B1FA1201AA7381CE3E85DF3F3BF9BCB59677808");
-        MDKVideoItem::setGlobalOption("plugins", "mdk-braw:mdk-r3d");
+        MDKVideoItem::setGlobalOption("plugins", "mdk-braw:mdk-r3d:mdk-crm");
+        // Where external_sdk installs the Canon SDK (with CanonLUTs) for mdk-crm
+        MDKVideoItem::setGlobalOption("CRMSDK_DIR", &sdk_path);
     }
 
     if cfg!(target_os = "linux") {
@@ -249,6 +255,8 @@ fn entry() {
 
     engine.set_property("openFileOnStart".into(), QUrl::from(QString::from(gyroflow_core::filesystem::path_to_url(&open_file))).into());
     engine.set_property("loadPresetOnStart".into(), QString::from(open_preset).into());
+    engine.set_property("openFilesOnStart".into(), QVariantList::from_iter(open_files.iter().map(|x| QUrl::from(QString::from(gyroflow_core::filesystem::path_to_url(x))))).into());
+    engine.set_property("addToQueueOnStart".into(), add_to_queue.into());
 
     engine.set_property("defaultInitializedDevice".into(), QString::default().into());
     if let Some((name, list_name)) = core::gpu::initialize_contexts() {

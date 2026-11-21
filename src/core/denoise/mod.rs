@@ -137,7 +137,7 @@ impl DenoiseSettings {
         (SIGMA_MIN + self.luma_strength.clamp(MIN_STRENGTH, MAX_STRENGTH) * (SIGMA_MAX - SIGMA_MIN)) as f32
     }
     /// Also what packed RGB planes (the preview, RGB exports) use for the chroma part of each
-    /// difference - see `KernelParams::denoise_rgb`.
+    /// difference - see `KernelParams::denoise_chroma_sigma`.
     pub fn chroma_sigma(&self) -> f32 {
         let t = self.chroma_strength.clamp(MIN_STRENGTH, MAX_STRENGTH);
         (SIGMA_CHROMA_MIN * (SIGMA_CHROMA_MAX / SIGMA_CHROMA_MIN).powf(t)) as f32

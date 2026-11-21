@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright © 2021-2022 Adrian <adrian.eddy at gmail>
 
-use std::collections::BTreeMap;
 use std::cell::RefCell;
-use std::sync::mpsc;
+use std::sync::{ mpsc, Arc };
 
 use crate::GyroflowCoreError;
 
@@ -17,14 +16,15 @@ mod cpu_undistort;
 mod pixel_formats;
 // mod interpolation;
 pub mod distortion_models;
+pub mod projection;
 pub use pixel_formats::*;
 pub use compute_params::ComputeParams;
-pub use frame_transform::FrameTransform;
+pub use frame_transform::{ FrameTransform, FocalSource };
 pub use cpu_undistort::*;
 
 /// The LUT is appended to the coeffs buffer after the fixed interpolation
 /// coefficients, so no backend needs an extra binding.
-pub const LUT_DATA_OFFSET: usize = 64 + 128 + 256 + 9 * 4 + 4; // = 488, must equal COEFFS.len()
+pub const LUT_DATA_OFFSET: usize = 64 + 128 + 256 + 11 * 4 + 4; // = 496, must equal COEFFS.len()
 
 /// `COEFFS` followed by the LUT table, which is what every backend uploads as
 /// the `coeffs` buffer. Returns just `COEFFS` when there is no LUT.
@@ -173,7 +173,10 @@ pub struct KernelParams {
     pub c:                 [f32; 2], // 16 - lens center
     pub k:                 [f32; 24], // 16 x 6 - distortion coefficients
     pub fov:               f32, // 4
-    pub r_limit:           f32, // 8
+    /// The largest ray angle the source lens model can be asked for, in radians (`<= 0`: no limit).
+    /// Where the radial curve folds, or where the lens's own field ends - see
+    /// `DistortionModel::field_limit`
+    pub field_limit:       f32, // 8
     pub lens_correction_amount:   f32, // 12
     pub input_vertical_stretch:   f32, // 16
     pub input_horizontal_stretch: f32, // 4
@@ -194,24 +197,27 @@ pub struct KernelParams {
     pub pixel_value_limit:        f32, // 16
     pub light_refraction_coefficient: f32, // 4
     pub plane_index:              i32, // 8
-    /// Total source frames gathered per output pixel: `2k+1`. `1` disables the
-    /// temporal path entirely — every kernel branches on this before doing any
-    /// extra work, so `k = 0` costs nothing.
-    /// Stored as f32 to keep this slot byte-identical to the `reserved1` it
-    /// replaces; the kernels round it back to an integer count.
-    pub reference_count:          f32, // 12
-    /// Sigma of the rejection Gaussian, in normalised pixel units, for the plane
-    /// currently being processed. Selected per plane by `plane_index`.
-    pub denoise_sigma:            f32, // 16
+    /// [`crate::stabilization::projection::OutputProjection`] as `i32`
+    pub output_projection:        i32, // 12
+    pub reserved2:                f32, // 16
     pub ewa_coeffs_p:             [f32; 4], // 16
     pub ewa_coeffs_q:             [f32; 4], // 16
     pub color_params_1:           [f32; 4], // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     pub color_params_2:           [f32; 4], // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
     pub color_params_3:           [f32; 4], // 16 - lut_domain_min, lut_domain_max, shadows, highlights
-    /// `x`: when the plane is packed RGB, the sigma for the *chroma* part of each difference,
+    /// When the plane is packed RGB, the sigma for the *chroma* part of each difference,
     /// in the same normalised units as `denoise_sigma` (which then covers the luma part).
-    /// `0`: the plane is not RGB, and `denoise_sigma` applies to every channel. `yzw` unused.
-    pub denoise_rgb:              [f32; 4], // 16 - chroma_sigma, unused, unused, unused
+    /// `0`: the plane is not RGB, and `denoise_sigma` applies to every channel.
+    pub denoise_chroma_sigma:     f32, // 4
+    /// Total source frames gathered per output pixel: `2k+1`. `1` disables the
+    /// temporal path entirely — every kernel branches on this before doing any
+    /// extra work, so `k = 0` costs nothing. Stored as f32; the kernels round it
+    /// back to an integer count.
+    pub reference_count:          f32, // 8
+    /// Sigma of the rejection Gaussian, in normalised pixel units, for the plane
+    /// currently being processed. Selected per plane by `plane_index`.
+    pub denoise_sigma:            f32, // 12
+    pub reserved3:                f32, // 16
 }
 unsafe impl bytemuck::Zeroable for KernelParams {}
 unsafe impl bytemuck::Pod for KernelParams {}
@@ -248,9 +254,22 @@ impl BackendType {
     pub fn is_wgpu(&self) -> bool { matches!(self, Self::Wgpu(_)) }
 }
 
+/// The most recently used frame transforms, so the cache doesn't grow with every rendered frame (a matrix per row, ~120 kB per 4k frame)
+pub struct FrameTransformCache(lru::LruCache<i64, FrameTransform>);
+impl Default for FrameTransformCache {
+    fn default() -> Self { Self(lru::LruCache::new(std::num::NonZeroUsize::new(100).unwrap())) }
+}
+impl std::ops::Deref for FrameTransformCache {
+    type Target = lru::LruCache<i64, FrameTransform>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl std::ops::DerefMut for FrameTransformCache {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+
 #[derive(Default)]
 pub struct Stabilization {
-    pub stab_data: BTreeMap<i64, FrameTransform>,
+    pub stab_data: FrameTransformCache,
 
     pub size:        (usize, usize), // width, height
     pub output_size: (usize, usize), // width, height
@@ -266,6 +285,8 @@ pub struct Stabilization {
     pub initialized_backend: BackendType,
 
     compute_params: ComputeParams,
+    /// `compute_params` the right way up, see `upright_params`
+    upright_params: std::sync::OnceLock<Arc<ComputeParams>>,
 
     pub drawing: DrawCanvas,
     pub pending_device_change: Option<isize>,
@@ -287,7 +308,21 @@ impl Stabilization {
     pub fn set_compute_params(&mut self, params: ComputeParams) {
         self.stab_data.clear();
         self.compute_params = params;
+        self.upright_params = Default::default();
     }
+    /// What the frames are rendered with, the right way up (`framebuffer_inverted` off), as the point path takes them
+    /// for upright positions (`optical_motion::to_output`): what the preview's tracked points are drawn with, and found
+    /// under the mouse with (`StabilizationManager::optical_placement`). A copy made once per `set_compute_params`, also
+    /// behind a read lock: the same one until they change
+    pub fn upright_params(&self) -> Arc<ComputeParams> {
+        self.upright_params.get_or_init(|| {
+            let mut params = self.compute_params.clone();
+            params.framebuffer_inverted = false;
+            Arc::new(params)
+        }).clone()
+    }
+    /// Whether the frames are rendered upside down (`ComputeParams::framebuffer_inverted`): the drawing is turned with them
+    pub fn framebuffer_inverted(&self) -> bool { self.compute_params.framebuffer_inverted }
 
     fn get_rect(desc: &BufferDescription) -> [i32; 4] {
         let mut ret = [0i32; 4];
@@ -338,7 +373,7 @@ impl Stabilization {
             let file_metadata = gyro.file_metadata.read();
             kernel_flags.set(KernelParamsFlags::HAS_MESH_DATA, file_metadata.mesh_correction.has_mesh(frame));
             kernel_flags.set(KernelParamsFlags::HAS_FPD_DATA, file_metadata.mesh_correction.has_focal_plane(frame));
-            if file_metadata.camera_stab_data.len() > frame {
+            if file_metadata.camera_stab_at(frame).is_some() {
                 kernel_flags.set(KernelParamsFlags::HAS_IBIS_DATA, true);
             }
         }
@@ -347,7 +382,12 @@ impl Stabilization {
 
     pub fn get_frame_transform_at<T: PixelType>(&self, timestamp_us: i64, frame: Option<usize>, buffers: &Buffers) -> FrameTransform {
         let timestamp_ms = (timestamp_us as f64) / 1000.0;
-        let frame = frame.unwrap_or_else(|| crate::frame_at_timestamp(timestamp_ms, self.compute_params.scaled_fps) as usize);
+        // The frame the video presents at the time. A video whose frames aren't evenly spaced has it by its own frame
+        // times, the only ones that give it (a frame number given with the time counts the frames as if they were)
+        let frame = match frame {
+            Some(frame) if self.compute_params.frame_times.is_none() => frame,
+            _ => self.compute_params.frame_at_timestamp(timestamp_ms).max(0) as usize,
+        };
 
         let mut transform = FrameTransform::at_timestamp(&self.compute_params, timestamp_ms, frame);
         transform.kernel_params.pixel_value_limit = T::default_max_value().unwrap_or(f32::MAX);
@@ -414,32 +454,8 @@ impl Stabilization {
             transform.kernel_params.output_rotation = r;
         }
 
-        /*static PREV: parking_lot::RwLock<Vec<f32>> = parking_lot::RwLock::new(Vec::new());
-        if let Ok(Ok(v)) = std::fs::read_to_string(std::env::current_exe().unwrap().with_file_name("params.json")).map(|x| serde_json::from_str(&x) as serde_json::Result<Vec<f32>>) {
-            if v.len() == 24 {
-                *PREV.write() = v.clone();
-            }
-        }
-        {
-            let v = PREV.read();
-            v.iter().enumerate().for_each(|(i, x)| transform.kernel_params.custom[i] = *x);
-        }*/
-
         transform.kernel_params.source_rect = Self::get_rect(&buffers.input);
         transform.kernel_params.output_rect = Self::get_rect(&buffers.output);
-
-        /*transform.kernel_params.distortion_model = match &self.compute_params.distortion_model.inner {
-            distortion_models::DistortionModels::OpenCVFisheye(_) => stabilize_spirv::DistortionModel::OpenCVFisheye,
-            distortion_models::DistortionModels::OpenCVStandard(_) => stabilize_spirv::DistortionModel::OpenCVStandard,
-            distortion_models::DistortionModels::Insta360(_) => stabilize_spirv::DistortionModel::Insta360,
-            _ => { stabilize_spirv::DistortionModel::None }
-        };
-        transform.kernel_params.digital_lens = match self.compute_params.digital_lens.as_ref().map(|x| &x.inner) {
-            Some(distortion_models::DistortionModels::GoProSuperview(_)) => stabilize_spirv::DistortionModel::GoProSuperview,
-            Some(distortion_models::DistortionModels::GoProHyperview(_)) => stabilize_spirv::DistortionModel::GoProHyperview,
-            Some(distortion_models::DistortionModels::DigitalStretch(_)) => stabilize_spirv::DistortionModel::DigitalStretch,
-            _ => { stabilize_spirv::DistortionModel::None }
-        };*/
 
         transform
     }
@@ -479,7 +495,7 @@ impl Stabilization {
                 transform.kernel_params.max_pixel_value = 1.0;
                 transform.kernel_params.pixel_value_limit = 1.0;
             }
-            self.stab_data.insert(timestamp_us, transform);
+            self.stab_data.put(timestamp_us, transform);
         }
     }
 
@@ -528,7 +544,7 @@ impl Stabilization {
     }
 
     pub fn get_undistortion_data(&self, timestamp_us: i64) -> Option<&FrameTransform> {
-        self.stab_data.get(&timestamp_us)
+        self.stab_data.peek(&timestamp_us)
     }
 
     pub fn list_devices(&self) -> Vec<String> {
@@ -709,7 +725,9 @@ impl Stabilization {
         }
 
         self.init_backends::<T>(timestamp_us, frame, buffers);
-        self.ensure_stab_data_at_timestamp::<T>(timestamp_us, frame, buffers, false);
+        if self.cache_frame_transform { // Without the cache, `process_pixels` computes the transform itself and never reads it from `stab_data`
+            self.ensure_stab_data_at_timestamp::<T>(timestamp_us, frame, buffers, false);
+        }
 
         if self.share_wgpu_instances {
             if wgpu::is_buffer_supported(buffers) && CACHED_WGPU.with(|x| !x.0.borrow().is_empty()) {
@@ -757,7 +775,7 @@ impl Stabilization {
             if !self.cache_frame_transform {
                 _tmp_transform.as_ref()
             } else {
-                self.stab_data.get(&timestamp_us)
+                self.stab_data.peek(&timestamp_us)
             }
         );
 
@@ -836,6 +854,11 @@ impl Stabilization {
                         log::error!("No wgpu instance!");
                     }
                 }
+            }
+
+            // The memory of a GPU, which only a GPU backend could have processed: not the CPU
+            if !matches!((&buffers.input.data, &buffers.output.data), (BufferSource::Cpu { .. }, BufferSource::Cpu { .. })) {
+                return Err(GyroflowCoreError::NoBackendForBuffers(self.get_current_key(buffers)));
             }
 
             //let ok = Self::undistort_image_cpu_spirv::<T>(buffers, &itm.kernel_params, &self.compute_params.distortion_model, self.compute_params.digital_lens.as_ref(), &itm.matrices, drawing_buffer);
@@ -1060,8 +1083,9 @@ mod cross_backend_color_tests {
         p.interpolation = 2;
         p.bytes_per_pixel = BPP;
         p.pix_element_count = 4;
-        p.f = [1.0, 1.0];
-        p.c = [0.0, 0.0];
+        // Upstream's kernel builds the output plane itself, `n = (p - out_c) / f`, projects it rectilinearly and the lens model images it again: with `f` = the frame width the rays stay well inside the field (GPU trig is too coarse for the tiny angles a huge `f` gives), the round trip is exact to well under the 1/32 px the interpolation tables resolve, and `uv = n * f + c` hands back `p` when `c` is the frame centre.
+        p.f = [W as f32, W as f32];
+        p.c = [W as f32 / 2.0, H as f32 / 2.0];
         p.fov = 1.0;
         p.lens_correction_amount = 1.0; // skips the lens-correction block entirely
         p.source_rect = [0, 0, W, H];
@@ -1084,9 +1108,9 @@ mod cross_backend_color_tests {
         p.color_params_3 = COLOR_PARAMS_3;
 
         FrameTransform { chroma_filter: Default::default(), film: Default::default(),
-            // Identity 3x3 in the first 9 fields; the trailing 5 stay zero, which disables
-            // the extra shift/angle adjustment.
-            matrices: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+            // Identity 3x3 in the first 9 fields; the shift/angle fields and the breathing
+            // factor stay zero, which disables those adjustments.
+            matrices: vec![[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
             reference_matrices: Vec::new(),
             kernel_params: p,
             fov: 1.0,

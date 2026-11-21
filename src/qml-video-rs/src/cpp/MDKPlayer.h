@@ -10,6 +10,8 @@
 #include <chrono>
 #include <queue>
 #include <atomic>
+#include <mutex>
+#include <memory>
 #include <functional>
 
 #include "VideoTextureNode.h"
@@ -131,8 +133,31 @@ private:
     std::unique_ptr<mdk::Player> m_player;
     std::map<uint64_t, std::unique_ptr<mdk::Player>> m_processingPlayers;
 
+    // Shared by m_player's event and status listeners (setupPlayer()). Those are never removed: removing them frees their
+    // std::function, which MDK may still call afterwards. MDK 0.40 did, after a switch away from a BRAW file: a reader of
+    // the old player reported its statuses to the removed listener, which crashed (an access violation on Windows; on
+    // macOS an empty std::function -> std::bad_function_call -> abort). destroyPlayer() marks them dead instead
+    struct ListenerGuard {
+        std::recursive_mutex mutex; // Held while a listener runs. Recursive: MDK reports some statuses on the calling thread
+        bool alive{true};
+    };
+    std::shared_ptr<ListenerGuard> m_listenerGuard;
+
     std::atomic<bool> m_videoLoaded{false};
+    std::atomic<bool> m_preparedSeen{false}; // MDK reported the media loaded and prepared, maybe before its streams
     std::atomic<bool> m_firstFrameLoaded{false};
+    // `metadataLoaded` is emitted once per media: with the first decoded frame, or without one when none comes
+    // (`emitMetadataLoaded`)
+    std::atomic<bool> m_metadataLoadedSent{false};
+    std::atomic<uint64_t> m_mediaGeneration{0}; // Which player a queued call is for, moved on by destroyPlayer()
+    void invokeForCurrentMedia(std::function<void()> &&f);
+    void emitVideoLoaded(double duration, qlonglong frames, double fps, uint width, uint height);
+    void emitMetadataLoaded(const QJsonObject &md);
+    QJsonObject currentMetadata();
+    std::mutex m_mediaInfoMutex;
+    MediaInfo mediaInfo();
+    std::atomic<int> m_frameRotation{-1}; // -1 until the first frame was decoded
+    int frameRotation() const { const int r = m_frameRotation.load(); return r < 0? 0 : r; }
 
     int m_renderFailCounter{10};
 
@@ -146,7 +171,14 @@ private:
     bool m_isHttp{false};
     int64_t m_playerPosition{0};
 
-    QJsonObject m_metadata;
+    // The playback range as MDK has it (setPlaybackRange()), and the state of watchLoop()
+    int64_t m_rangeFromMs{0};
+    int64_t m_rangeToMs{-1};
+    int64_t m_loopWatchPosition{-1};
+    int m_loopStillMs{0};
+    int64_t m_mediaDurationMs{0}; // the video's duration in the media's own timeline (without the frame rate override)
+    void watchLoop(uint64_t generation);
+    void announceLoaded();
 
     QSGImageNode *m_node{nullptr};
     QUrl m_pendingUrl;

@@ -54,7 +54,7 @@ pub struct KernelParams {
     pub k5:                Vec4, // 16 - distortion coefficients
     pub k6:                Vec4, // 16 - distortion coefficients
     pub fov:               f32, // 4
-    pub r_limit:           f32, // 8
+    pub field_limit:       f32, // 8 - the largest ray angle the lens model can be asked for, in radians
     pub lens_correction_amount:   f32, // 12
     pub input_vertical_stretch:   f32, // 16
     pub input_horizontal_stretch: f32, // 4
@@ -78,14 +78,17 @@ pub struct KernelParams {
     pub pixel_value_limit:        f32, // 16
     pub light_refraction_coefficient: f32, // 4
     pub plane_index:              i32, // 8
-    pub reference_count:          f32, // 12
-    pub denoise_sigma:            f32, // 16
+    pub output_projection:        i32, // 12
+    pub reserved2:                f32, // 16
     pub ewa_coeffs_p:             Vec4, // 16
     pub ewa_coeffs_q:             Vec4, // 16
     pub color_params_1:           Vec4, // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     pub color_params_2:           Vec4, // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
     pub color_params_3:           Vec4, // 16 - lut_domain_min, lut_domain_max, unused, unused
-    pub denoise_rgb:              Vec4, // 16 - chroma_sigma (0: plane is not RGB), unused, unused, unused
+    pub denoise_chroma_sigma:     f32, // 4 - chroma sigma of a packed RGB plane (0: plane is not RGB)
+    pub reference_count:          f32, // 8
+    pub denoise_sigma:            f32, // 12
+    pub reserved3:                f32, // 16
 }
 
 // #[inline] pub fn fast_floor(x: f32) -> i32 { x as i32 }

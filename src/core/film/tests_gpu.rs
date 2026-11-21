@@ -53,12 +53,13 @@ pub(super) fn identity(bpp: usize, max_value: f32, film: FilmParams) -> FrameTra
     p.output_width = w; p.output_height = h; p.output_stride = s;
     p.matrix_count = 1; p.interpolation = 2;
     p.bytes_per_pixel = bpp as i32; p.pix_element_count = 4;
-    p.f = [1.0, 1.0]; p.c = [0.0, 0.0]; p.fov = 1.0; p.lens_correction_amount = 1.0;
+    // Upstream's kernel builds the output plane itself, `n = (p - out_c) / f`, projects it rectilinearly and the lens model images it again: with `f` = the frame width the rays stay well inside the field (GPU trig is too coarse for the tiny angles a huge `f` gives), the round trip is exact to well under the 1/32 px the interpolation tables resolve, and `uv = n * f + c` hands back `p` when `c` is the frame centre.
+    p.f = [w as f32, w as f32]; p.c = [w as f32 / 2.0, h as f32 / 2.0]; p.fov = 1.0; p.lens_correction_amount = 1.0;
     p.source_rect = [0, 0, w, h]; p.output_rect = [0, 0, w, h];
     p.safe_area_rect = [0.0, 0.0, w as f32, h as f32];
     p.max_pixel_value = max_value; p.pixel_value_limit = max_value;
     p.light_refraction_coefficient = 1.0;
-    let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     FrameTransform { chroma_filter: Default::default(), film, matrices: vec![identity], reference_matrices: vec![], kernel_params: p, fov: 1.0, minimal_fov: 1.0, focal_length: None, mesh_data: vec![] }
 }
 

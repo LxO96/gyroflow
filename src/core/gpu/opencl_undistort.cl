@@ -26,7 +26,7 @@ typedef struct {
     float2 c;          // 16 - lens center
     float k[24];       // 16 x 6 - distortion coefficients
     float fov;         // 4
-    float r_limit;     // 8
+    float field_limit; // 8 - the largest ray angle the lens model can be asked for, in radians
     float lens_correction_amount;    // 12
     float input_vertical_stretch;    // 16
     float input_horizontal_stretch;  // 4
@@ -47,14 +47,17 @@ typedef struct {
     float pixel_value_limit;         // 16
     float light_refraction_coefficient; // 4
     int plane_index;                 // 8
-    float reference_count;           // 12
-    float denoise_sigma;             // 16
+    int output_projection;           // 12
+    float reserved2;                 // 16
     float4 ewa_coeffs_p;             // 16
     float4 ewa_coeffs_q;             // 16
     float4 color_params_1;           // 16 - exposure_gain, contrast_factor, saturation_factor, lut_strength
     float4 color_params_2;           // 16 - wb_gain_r, wb_gain_g, wb_gain_b, lut_size
     float4 color_params_3;           // 16 - lut_domain_min, lut_domain_max, unused, unused
-    float4 denoise_rgb;              // 16 - chroma_sigma (0: plane is not RGB), unused, unused, unused
+    float denoise_chroma_sigma;      // 4 - chroma sigma of a packed RGB plane (0: plane is not RGB)
+    float reference_count;           // 8
+    float denoise_sigma;             // 12
+    float reserved3;                 // 16
 } KernelParams;
 
 #if INTERPOLATION == 2 // Bilinear
@@ -110,7 +113,7 @@ __constant float coeffs[256] = {
 };
 #endif
 
-__constant float4 colors[9] = {
+__constant float4 colors[11] = {
     (float4)(0.0f,   0.0f,   0.0f,     0.0f), // None
     (float4)(255.0f, 0.0f,   0.0f,   255.0f), // Red
     (float4)(0.0f,   255.0f, 0.0f,   255.0f), // Green
@@ -119,7 +122,9 @@ __constant float4 colors[9] = {
     (float4)(200.0f, 200.0f, 0.0f,   255.0f), // Yellow2
     (float4)(255.0f, 0.0f,   255.0f, 255.0f), // Magenta
     (float4)(0.0f,   128.0f, 255.0f, 255.0f), // Blue2
-    (float4)(0.0f,   200.0f, 200.0f, 255.0f)  // Blue3
+    (float4)(0.0f,   200.0f, 200.0f, 255.0f), // Blue3
+    (float4)(255.0f, 255.0f, 255.0f, 255.0f), // White
+    (float4)(63.0f,  182.0f, 255.0f, 255.0f)  // Sky
 };
 __constant float alphas[4] = { 1.0f, 0.75f, 0.50f, 0.25f };
 void draw_pixel(DATA_TYPE *out_pix, int x, int y, bool isInput, int width, __global KernelParams *params, __global const uchar *drawing) {
@@ -132,7 +137,7 @@ void draw_pixel(DATA_TYPE *out_pix, int x, int y, bool isInput, int width, __glo
         uchar color = (data & 0xF8) >> 3;
         uchar alpha = (data & 0x06) >> 1;
         uchar stage = data & 1;
-        if (((stage == 0 && isInput) || (stage == 1 && !isInput)) && color < 9 && alpha < 4) {
+        if (((stage == 0 && isInput) || (stage == 1 && !isInput)) && color < 11 && alpha < 4) {
             float4 colorf4 = colors[color];
             DATA_TYPEF colorf = *(DATA_TYPEF *)&colorf4;
 
@@ -185,7 +190,7 @@ DATA_TYPEF remap_colorrange(DATA_TYPEF px, bool isY, __global KernelParams *para
 // These functions carry no storage-class specifier, matching the rest of this file:
 // OpenCL C 1.2 6.8 lists `static` among the unsupported specifiers, and no -cl-std is
 // passed when the program is built.
-#define LUT_DATA_OFFSET 488
+#define LUT_DATA_OFFSET 496
 
 float3 lerp3(float3 a, float3 b, float t) {
     return a + (b - a) * t;
@@ -504,26 +509,131 @@ DATA_TYPEF sample_input_at(float2 uv, float4 jac, __global const uchar *srcptr, 
     return sum;
 }
 
-float2 rotate_and_distort(float2 pos, uint idx, __global KernelParams *params, __global const float *matrices, __global const float *mesh_data) {
+// The pipeline carries a ray as an angle vector: |.| is the angle from the axis in radians, the direction
+// is the azimuth. See stabilization/projection.rs - nothing diverges at 90 degrees the way a z=1 plane point does
+float2 ray_unproject(float2 n, int proj) {
+    float r = length(n);
+    if (r < 1e-12f) { return (float2)(0.0f, 0.0f); }
+    float theta;
+    if      (proj == 1) { theta = 2.0f * atan(r * 0.5f); }              // stereographic
+    else if (proj == 2) { theta = r; }                                  // equidistant
+    else if (proj == 3) { theta = 2.0f * asin(min(r * 0.5f, 1.0f)); }   // equisolid angle
+    else if (proj == 4) { theta = asin(min(r, 1.0f)); }                 // orthographic
+    else                { theta = atan(r); }                            // rectilinear
+    return n * (theta / r);
+}
+// Where a ray of angle `theta` lands on the output plane, under the output projection
+float ray_radius(float theta, int proj) {
+    if (proj == 1) { return 2.0f * tan(theta * 0.5f); }
+    if (proj == 2) { return theta; }
+    if (proj == 3) { return 2.0f * sin(theta * 0.5f); }
+    if (proj == 4) { return sin(theta); }
+    return theta < 1.5707f? tan(theta) : 1e9f;
+}
+// `(1-a)*R(theta) + a*P(theta) - t`: the lens-correction blend (see stabilization/projection.rs), minus
+// where this pixel is. `R` carries the refraction, because the render applies it on this side too
+float blend_residual(float theta, float2 u, float t, float a, __global KernelParams *params) {
+    float th = theta;
+    if ((params->flags & 2048) && params->light_refraction_coefficient != 1.0f && params->light_refraction_coefficient > 0.0f) {
+        th = asin(clamp(sin(th) * params->light_refraction_coefficient, -1.0f, 1.0f));
+    }
+    float s = sin(th), c = cos(th);
+    float2 p = distort_point(u.x * s, u.y * s, c, params);
+    return (1.0f - a) * length(p) + a * ray_radius(theta, params->output_projection) - t;
+}
+// {non_radial} The 2D polish of a partial correction, for a lens with terms that aren't radial only (the section is left
+// out of the kernel of every other lens: DistortionModel::has_non_radial_terms)
+// Where `ray` lands on the output plane under a partial correction, `(1-a)*D(ray) + a*P(theta)*u`, less `nb`, where it
+// should: the whole 2D point, the source lens's leg off the ray's radius by whatever terms of the lens aren't radial.
+// `D` carries the refraction, as blend_residual's does
+float2 blend_offset(float2 ray, float2 nb, float a, __global KernelParams *params) {
+    float theta = length(ray);
+    if (theta < 1e-12f) { return -nb; }
+    float2 u = ray / theta;
+    float th = theta;
+    if ((params->flags & 2048) && params->light_refraction_coefficient != 1.0f && params->light_refraction_coefficient > 0.0f) {
+        th = asin(clamp(sin(th) * params->light_refraction_coefficient, -1.0f, 1.0f));
+    }
+    float s = sin(th), c = cos(th);
+    float2 p = distort_point(u.x * s, u.y * s, c, params);
+    return (1.0f - a) * p + a * u * ray_radius(theta, params->output_projection) - nb;
+}
+// Newton on blend_offset from `ray`, the Jacobian by differences since the lens is any model: a step is only taken
+// where it brings the blend closer to `nb` and stays inside `cap`, the end of the lens's field (halved until it does,
+// four times at most), and never from where the map has turned over. For a lens with radial terms only the solve along
+// the radius already is the answer, to a few millionths, and this is mostly one evaluation of the blend. See polish_blend in cpu_undistort.rs
+float2 polish_blend(float2 ray, float2 nb, float a, float cap, __global KernelParams *params) {
+    float tol = 1e-6f * (1.0f + length(nb));
+    float2 e = blend_offset(ray, nb, a, params);
+    float err = fmax(fabs(e.x), fabs(e.y));
+    for (int it = 0; it < 4; ++it) {
+        if (!(err > tol)) break;
+        // The differences step toward the axis, so they never reach past the end of the lens, or of the projection
+        float hx = ray.x > 0.0f? -1e-3f : 1e-3f;
+        float hy = ray.y > 0.0f? -1e-3f : 1e-3f;
+        float2 jx = (blend_offset((float2)(ray.x + hx, ray.y), nb, a, params) - e) / hx; // (dx/drx, dy/drx)
+        float2 jy = (blend_offset((float2)(ray.x, ray.y + hy), nb, a, params) - e) / hy; // (dx/dry, dy/dry)
+        float det = jx.x * jy.y - jy.x * jx.y;
+        if (!(det > 0.0f)) break;
+        float2 step = (float2)(jy.y * e.x - jy.x * e.y, jx.x * e.y - jx.y * e.x) / det;
+        float lambda = 1.0f;
+        bool moved = false;
+        for (int b = 0; b < 4; ++b) {
+            float2 c = ray - lambda * step;
+            if (dot(c, c) <= cap * cap) {
+                float2 ce = blend_offset(c, nb, a, params);
+                float cerr = fmax(fabs(ce.x), fabs(ce.y));
+                if (cerr < err) { ray = c; e = ce; err = cerr; moved = true; break; }
+            }
+            lambda *= 0.5f;
+        }
+        if (!moved) break;
+    }
+    return ray;
+}
+// {/non_radial}
+// The ray angle that lands at a given output radius, inverse of `ray_radius`
+float ray_theta(float r, int proj) {
+    if (proj == 1) { return 2.0f * atan(r * 0.5f); }
+    if (proj == 2) { return r; }
+    if (proj == 3) { return 2.0f * asin(min(r * 0.5f, 1.0f)); }
+    if (proj == 4) { return asin(min(r, 1.0f)); }
+    return atan(r);
+}
+float3 ray_to_dir(float2 ray) {
+    float theta = length(ray);
+    if (theta < 1e-12f) { return (float3)(ray.x, ray.y, 1.0f); }
+    return (float3)(ray * (sin(theta) / theta), cos(theta));
+}
+
+float2 rotate_and_distort(float2 ray, uint idx, __global KernelParams *params, __global const float *matrices, __global const float *mesh_data) {
     __global const float *matrix = &matrices[idx];
-    float _x = (pos.x * matrix[0]) + (pos.y * matrix[1]) + matrix[2] + params->translation3d.x;
-    float _y = (pos.x * matrix[3]) + (pos.y * matrix[4]) + matrix[5] + params->translation3d.y;
-    float _w = (pos.x * matrix[6]) + (pos.y * matrix[7]) + matrix[8] + params->translation3d.z;
-    if (_w > 0.0f) {
-        if (params->r_limit > 0.0f && length((float2)(_x, _y) / _w) > params->r_limit) {
+    float3 d = ray_to_dir(ray);
+    float _x = (d.x * matrix[0]) + (d.y * matrix[1]) + (d.z * matrix[2]) + params->translation3d.x;
+    float _y = (d.x * matrix[3]) + (d.y * matrix[4]) + (d.z * matrix[5]) + params->translation3d.y;
+    float _w = (d.x * matrix[6]) + (d.y * matrix[7]) + (d.z * matrix[8]) + params->translation3d.z;
+    {
+        float rxy = length((float2)(_x, _y));
+        // The ray's angle in the source camera: past the lens's own field, or past a fold of its
+        // calibration, it has no image at all
+        float theta = atan2(rxy, _w);
+        if (params->field_limit > 0.0f && theta > params->field_limit) {
             return (float2)(-99999.0f, -99999.0f);
         }
 
-        if ((params->flags & 2048) && params->light_refraction_coefficient != 1.0f && params->light_refraction_coefficient > 0.0f) {
-            float r = length((float2)(_x, _y)) / _w;
-            float sin_theta_d = (r / sqrt(1.0f + r * r)) * params->light_refraction_coefficient;
-            float r_d = sin_theta_d / sqrt(1.0f - sin_theta_d * sin_theta_d);
-            if (r_d != 0.0f) {
-                _w *= r / r_d;
-            }
+        // Refraction (underwater): Snell's law on the angle itself, exact for any field. Past the critical angle - or behind the flat port - no ray enters the housing at all: Snell's window ends there
+        if ((params->flags & 2048) && params->light_refraction_coefficient != 1.0f && params->light_refraction_coefficient > 0.0f && rxy > 1e-12f) {
+            float sin_d = sin(theta) * params->light_refraction_coefficient;
+            if (sin_d >= 1.0f || _w <= 0.0f) { return (float2)(-99999.0f, -99999.0f); }
+            float theta_d = asin(sin_d);
+            float s = sin(theta_d) / rxy;
+            _x *= s; _y *= s; _w = cos(theta_d);
         }
 
-        float2 uv = params->f * distort_point(_x, _y, _w, params);
+        float2 uv = distort_point(_x, _y, _w, params);
+        // Focus breathing: this row's magnification of the source image
+        if (matrix[14] > 0.0f) { uv *= matrix[14]; }
+        uv *= params->f;
 
         if ((params->flags & 256) && (matrix[9] != 0.0f || matrix[10] != 0.0f || matrix[11] != 0.0f || matrix[12] != 0.0f || matrix[13] != 0.0f)) {
             // The camera applies the sensor roll before the sensor/lens shift, so undo the shift first and then the roll
@@ -585,14 +695,18 @@ float2 rotate_and_distort(float2 pos, uint idx, __global KernelParams *params, _
             uv.x = map_coord(uv.x, 0.0f, (float)params->width,  origin.x, origin.x + crop_size.x);
             uv.y = map_coord(uv.y, 0.0f, (float)params->height, origin.y, origin.y + crop_size.y);
 
+            // The shear of every band above this one in full, and of this one down to the row. A fixed loop with no
+            // branch in it: with one that ran up to `idx`, macOS OpenCL on a Radeon Pro 580X drew the picture jumping
+            // back at every band edge, as if the bands above were left out of the sum (issue 1255)
             int idx = min(7, max(0, (int)floor(uv.y / stblz_grid)));
             float delta = uv.y - stblz_grid * (float)idx;
-            uv.x -= mesh_data[o + 4 + idx * 2 + 0] * delta;
-            uv.y -= mesh_data[o + 4 + idx * 2 + 1] * delta;
-            for (int j = 0; j < idx; j++) {
-                uv.x -= mesh_data[o + 4 + j * 2 + 0] * stblz_grid;
-                uv.y -= mesh_data[o + 4 + j * 2 + 1] * stblz_grid;
+            float2 shift = (float2)(0.0f, 0.0f);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float w = j < idx ? stblz_grid : (j == idx ? delta : 0.0f);
+                shift += (float2)(mesh_data[o + 4 + j * 2 + 0], mesh_data[o + 4 + j * 2 + 1]) * w;
             }
+            uv -= shift;
 
             uv.x = map_coord(uv.x, origin.x, origin.x + crop_size.x, 0.0f, (float)params->width);
             uv.y = map_coord(uv.y, origin.y, origin.y + crop_size.y, 0.0f, (float)params->height);
@@ -613,7 +727,7 @@ float2 rotate_and_distort(float2 pos, uint idx, __global KernelParams *params, _
 }
 
 // `frame_base` selects which frame's block of rolling-shutter matrices to map through.
-// Matrix blocks are 14 floats, so frame f's block starts at f * matrix_count * 14 and the
+// Matrix blocks are 16 floats, so frame f's block starts at f * matrix_count * 16 and the
 // per-scanline index simply gains that offset. Callers that want the frame being rendered
 // pass 0.
 float2 undistort_coord(float2 out_pos, int frame_base, __global KernelParams *params, __global const float *matrices, __global const float *mesh_data) {
@@ -621,34 +735,109 @@ float2 undistort_coord(float2 out_pos, int frame_base, __global KernelParams *pa
     out_pos.y = map_coord(out_pos.y, (float)params->output_rect.y, (float)(params->output_rect.y + params->output_rect.w), 0.0f, (float)params->output_height) + params->translation2d.y;
 
     ///////////////////////////////////////////////////////////////////
-    // Add lens distortion back
-    if (params->lens_correction_amount < 1.0f) {
-        float2 factor = (float2)max(1.0f - params->lens_correction_amount, 0.001f); // FIXME: this is close but wrong
-        float2 out_c = (float2)(params->output_width / 2.0f, params->output_height / 2.0f);
-        float2 out_f = (params->f / params->fov) / factor;
-
-        float2 new_out_pos = out_pos;
-
-        if ((params->flags & 2)) { // Has digital lens
-            // Apply the digital warp in the UN-zoomed (fov=1) frame so it's FOV-independent
-            new_out_pos = (new_out_pos - out_c) * params->fov + out_c;
-            new_out_pos = digital_undistort_point(new_out_pos, params);
-            new_out_pos = (new_out_pos - out_c) / params->fov + out_c;
-        }
-        new_out_pos = (new_out_pos - out_c) / out_f;
-        new_out_pos = undistort_point(new_out_pos, params);
-        if (new_out_pos.x < -99998.0f) { return (float2)(-99999.0f, -99999.0f); }
-        if ((params->flags & 2048) && params->light_refraction_coefficient != 1.0f && params->light_refraction_coefficient > 0.0f) {
-            float r = length(new_out_pos);
-            if (r != 0.0f) {
-                float sin_theta_d = (r / sqrt(1.0f + r * r)) / params->light_refraction_coefficient;
-                float r_d = sin_theta_d / sqrt(1.0f - sin_theta_d * sin_theta_d);
-                new_out_pos *= r_d / r;
+    // Output pixel -> ray. A ray of angle theta lands at `(1-a)*R(theta) + a*P(theta)` of the output plane
+    // - where the source lens images it, mixed with where the output projection wants it (see
+    // stabilization/projection.rs). This is that inverted: both maps rise with theta, so the mix does too,
+    // and the root is bracketed by the angles the two projections would each have given on their own
+    float stretch = params->input_horizontal_stretch > 0.01f? 1.0f / params->input_horizontal_stretch : 1.0f;
+    float2 out_c = (float2)(params->output_width / 2.0f, params->output_height / 2.0f);
+    float2 out_f = params->f * stretch / params->fov;
+    float a = params->lens_correction_amount;
+    float2 n_raw = (out_pos - out_c) / out_f;
+    float2 n = n_raw;
+    if ((params->flags & 2) && a < 1.0f) { // Has digital lens
+        // Apply the digital warp in the UN-zoomed (fov=1) frame so it's FOV-independent
+        float2 uz = (out_pos - out_c) * params->fov + out_c;
+        float2 dp = digital_undistort_point(uz, params);
+        n = ((dp - out_c) / params->fov) / out_f;
+    }
+    float2 ray = ray_unproject(n_raw, params->output_projection);
+    if (a < 1.0f) {
+        // With a digital warp the two legs read different planes, so the target is mixed the same way they
+        // are; without one `n` is `n_raw` and this is just the pixel itself
+        float2 nb = n * (1.0f - a) + n_raw * a;
+        float t = length(nb);
+        if (t > 1e-9f) {
+            float2 u = nb / t;
+            float lo = length(ray);
+            float2 src = undistort_point(n, params);
+            bool has_src = src.x > -99998.0f;
+            if (!has_src && !(params->field_limit > 0.0f)) { return (float2)(-99999.0f, -99999.0f); }
+            // Past the edge of its own image the model has no inverse, but the lens still reaches to its
+            // field limit and the blend may well land inside `t` before then
+            // Under water the lens's angles are the housing's; the bracket is in the water's, the inverse of
+            // Snell's law away - and no ray past the flat port's 90 degrees ever enters the housing
+            bool refr = (params->flags & 2048) && params->light_refraction_coefficient != 1.0f && params->light_refraction_coefficient > 0.0f;
+            float hi = has_src? length(src) : params->field_limit;
+            if (refr) { hi = asin(clamp(sin(min(hi, 1.5707963f)) / params->light_refraction_coefficient, -1.0f, 1.0f)); }
+            bool edge = !has_src;
+            // ... and the root cannot be past the angle at which the output projection alone would already have
+                // used up `t` (`a·P(θ) <= t` at the root), and pinning the bracket there keeps both residuals
+                // of the order of `t`. Without it a lens that sees past 90 degrees hands `P`'s "no image" sentinel to
+                // the solve, and a secant cannot move against 1e9: the blend then silently stalled at the
+                // fully corrected angle outside a circle at `R(90 degrees)`
+            if (a > 0.0f) { hi = min(hi, ray_theta(t / a, params->output_projection)); }
+            if (a <= 0.0f) {
+                if (!has_src) { return (float2)(-99999.0f, -99999.0f); }
+                // Exactly the source lens's own ray, tangential terms and all - with the refraction
+                // rotate_and_distort applies on the way out undone here, or the round trip isn't one
+                ray = src;
+                if (refr) {
+                    float th = length(src);
+                    if (th > 1e-12f) { ray = src * (asin(clamp(sin(min(th, 1.5707963f)) / params->light_refraction_coefficient, -1.0f, 1.0f)) / th); }
+                }
+            } else {
+                float l = min(lo, hi), h = max(lo, hi);
+                // The lens ends at its field limit - under water, at Snell's window - and the projection's own
+                // angle may well lie past it; the bracket ends there too, and past it is background
+                float cap = params->field_limit > 0.0f? params->field_limit : 3.1415927f;
+                if (refr) { cap = asin(clamp(sin(min(cap, 1.5707963f)) / params->light_refraction_coefficient, -1.0f, 1.0f)); }
+                if (h > cap) { h = cap; l = min(l, cap); edge = true; }
+                float gl = blend_residual(l, u, t, a, params);
+                float gh = blend_residual(h, u, t, a, params);
+                float theta = h;
+                // Near the axis every projection agrees, so both ends of the bracket are a difference of
+                // near-equal numbers and the sign of `g` there is float noise. An end that IS the source
+                // lens's own answer always has a root beside it, so the end itself is the answer; only when
+                // the end is the field limit - or Snell's window - has the lens really run out, and the pixel is background
+                if (gh < 0.0f) {
+                    if (edge) { return (float2)(-99999.0f, -99999.0f); }
+                } else {
+                    // The projection's own angle overshoots - refraction magnifies the source leg - so bracket from the axis, where the residual is -t
+                    if (gl >= 0.0f) { l = 0.0f; gl = -t; }
+                    // Regula falsi, Illinois variant: the bracket is tight (the two projections' own
+                    // answers), and halving the stale end keeps it from crawling in from one side
+                    int side = 0;
+                    for (int i = 0; i < 6; ++i) {
+                        float d = gh - gl;
+                        theta = fabs(d) > 1e-12f? clamp(l - gl * (h - l) / d, l, h) : 0.5f * (l + h);
+                        float gt = blend_residual(theta, u, t, a, params);
+                        if (gt < 0.0f) { l = theta; gl = gt; if (side == -1) { gh *= 0.5f; } side = -1; }
+                        else           { h = theta; gh = gt; if (side ==  1) { gl *= 0.5f; } side =  1; }
+                    }
+                }
+                // The source lens's own ray is off its radius by the tangential terms; that offset belongs to the
+                // source leg, so it fades out with it. It is measured against `n`, the point that leg reads: a
+                // digital warp moves `n` off `u`, and that is no offset of the lens's
+                float2 dir = u;
+                if (has_src) {
+                    float sl = length(src), nl = length(n);
+                    if (sl > 1e-12f && nl > 1e-12f) {
+                        float2 dd = u + (1.0f - a) * (src / sl - n / nl);
+                        float dl = length(dd);
+                        if (dl > 1e-12f) { dir = dd / dl; }
+                    }
+                }
+                // That is still the solve along `u`, with the lens's leg turned by a first-order account of its own,
+                // and a lens with large terms that aren't radial lands tens of pixels from `nb` that way: Newton on the
+                // whole 2D map from there, the map the point path evaluates. A lens without such terms has
+                // its answer in the solve along `u` already, and its kernel is built without this
+                ray = dir * theta;
+                // {non_radial}
+                ray = polish_blend(ray, nb, a, cap, params);
+                // {/non_radial}
             }
         }
-        new_out_pos = out_f * new_out_pos + out_c;
-
-        out_pos = new_out_pos * (1.0f - params->lens_correction_amount) + (out_pos * params->lens_correction_amount);
     }
     ///////////////////////////////////////////////////////////////////
 
@@ -661,8 +850,8 @@ float2 undistort_coord(float2 out_pos, int frame_base, __global KernelParams *pa
         sy = min((int)params->height, max(0, (int)round(out_pos.y)));
     }
     if (params->matrix_count > 1) {
-        int idx = frame_base + (params->matrix_count / 2) * 14; // Use middle matrix
-        float2 uv = rotate_and_distort(out_pos, idx, params, matrices, mesh_data);
+        int idx = frame_base + (params->matrix_count / 2) * 16; // Use middle matrix
+        float2 uv = rotate_and_distort(ray, idx, params, matrices, mesh_data);
         if (uv.x > -99998.0f) {
             if ((params->flags & 16)) { // Horizontal RS
                 sy = min((int)params->width, max(0, (int)round(uv.x)));
@@ -673,8 +862,11 @@ float2 undistort_coord(float2 out_pos, int frame_base, __global KernelParams *pa
     }
     ///////////////////////////////////////////////////////////////////
 
-    int idx = frame_base + min(sy, params->matrix_count - 1) * 14;
-    float2 uv = rotate_and_distort(out_pos, idx, params, matrices, mesh_data);
+    int idx = frame_base + min(sy, params->matrix_count - 1) * 16;
+    float2 uv = rotate_and_distort(ray, idx, params, matrices, mesh_data);
+    // No picture for this ray (past the field limit, outside Snell's window): it stays the background, as on the CPU.
+    // The input rotation would turn the marker into a real position, and the edge modes would then clamp it into the frame
+    if (uv.x <= -99998.0f) return uv;
 
     float2 frame_size = (float2)((float)params->width, (float)params->height);
     if (params->input_rotation != 0.0f) {
@@ -684,19 +876,22 @@ float2 undistort_coord(float2 out_pos, int frame_base, __global KernelParams *pa
         uv = rotate_point(uv, rotation, size / (float2)2.0f, frame_size / (float2)2.0f);
     }
 
+    // `uv` is in the input frame now, turned by the input rotation, so its edges are those of `frame_size`
+    int frame_width = (int)frame_size.x;
+    int frame_height = (int)frame_size.y;
     switch (params->background_mode) {
         case 1: { // edge repeat
-            uv = max((float2)(3.0f, 3.0f), min((float2)(params->width - 3, params->height - 3), uv));
+            uv = max((float2)(3.0f, 3.0f), min((float2)(frame_width - 3, frame_height - 3), uv));
         } break;
         case 2: { // edge mirror
             int rx = round(uv.x);
             int ry = round(uv.y);
-            int width3 = (params->width - 3);
-            int height3 = (params->height - 3);
+            int width3 = (frame_width - 3);
+            int height3 = (frame_height - 3);
             if (rx > width3)  uv.x = width3  - (rx - width3);
-            if (rx < 3)       uv.x = 3 + params->width - (width3  + rx);
+            if (rx < 3)       uv.x = 3 + frame_width - (width3  + rx);
             if (ry > height3) uv.y = height3 - (ry - height3);
-            if (ry < 3)       uv.y = 3 + params->height - (height3 + ry);
+            if (ry < 3)       uv.y = 3 + frame_height - (height3 + ry);
         } break;
     }
 
@@ -803,10 +998,10 @@ DATA_TYPEF gather_denoised(float2 position, DATA_TYPEF centre, __global const uc
     // Packed RGB carries luma and chroma in one sample. It is split as rgb = Y*(1,1,1) + c,
     // where c has zero luma (the Rec.709 weights sum to 1), and the two parts are gathered
     // separately with their own weights: luma judged on its difference against `denoise_sigma`,
-    // chroma on its Cb/Cr difference against `denoise_rgb.x`. That is exactly what the planar
+    // chroma on its Cb/Cr difference against `denoise_chroma_sigma`. That is exactly what the planar
     // YUV path gets by running once per plane - one shared weight would let a chroma rejection
     // throw the luma away too. Mirrors `denoise::rgb_gather_weights`.
-    float sigma_c = params->denoise_rgb.x * params->max_pixel_value;
+    float sigma_c = params->denoise_chroma_sigma * params->max_pixel_value;
     bool rgb = sigma_c > 0.0f;
     float inv_2sigma_c_sq = rgb? 1.0f / (2.0f * sigma_c * sigma_c) : 0.0f;
 
@@ -820,7 +1015,7 @@ DATA_TYPEF gather_denoised(float2 position, DATA_TYPEF centre, __global const uc
     float4 acc_chroma = centre4 - (float4)(y_centre, y_centre, y_centre, 0.0f);
     float wsum_chroma = 1.0f;
 
-    int block = params->matrix_count * 14;
+    int block = params->matrix_count * 16;
     for (int f = 1; f < count; f++) {
         float2 ruv = undistort_coord(position, f * block, params, matrices, mesh_data);
         if (ruv.x < -99998.0f) { continue; }
@@ -917,25 +1112,29 @@ __kernel void undistort_image(__global const uchar *srcptr, __global uchar *dstp
         DATA_TYPE final_pix;
         if (uv.x > -99998.0f) {
             if (params->background_mode == 3) { // margin with feather
-                float widthf  = (params->width  - 1);
-                float heightf = (params->height - 1);
-
-                float feather = max(0.0001f, params->background_margin_feather * heightf);
-                float2 pt2 = uv;
-                float alpha = 1.0f;
-                if ((uv.x > widthf - feather) || (uv.x < feather) || (uv.y > heightf - feather) || (uv.y < feather)) {
-                    alpha = fmax(0.0f, fmin(1.0f, fmin(fmin(widthf - uv.x, heightf - uv.y), fmin(uv.x, uv.y)) / feather));
-                    pt2 /= (float2)(widthf, heightf);
-                    pt2 = ((pt2 - 0.5f) * (1.0f - params->background_margin)) + 0.5f;
-                    pt2 *= (float2)(widthf, heightf);
-                }
-
                 float2 frame_size = (float2)((float)params->width, (float)params->height);
                 if (params->input_rotation != 0.0f) {
                     float rotation = params->input_rotation * (M_PI_F / 180.0f);
                     float2 size = frame_size;
                     frame_size = fabs(round(rotate_point(size, rotation, (float2)(0.0f, 0.0f), (float2)(0.0f, 0.0f))));
                 }
+                // `uv` is in the input frame, turned by the input rotation, so the margin follows `frame_size`.
+                // Pixel centres are on whole coordinates, so the picture spans 0 ..= size - 1
+                float widthf  = (frame_size.x - 1);
+                float heightf = (frame_size.y - 1);
+
+                // A fraction of the picture's own height, whichever way the input buffer is turned
+                float feather = max(0.0001f, params->background_margin_feather * (float)(params->height - 1));
+                float2 pt2 = uv;
+                float alpha = 1.0f;
+                if ((uv.x > widthf - feather) || (uv.x < feather) || (uv.y > heightf - feather) || (uv.y < feather)) {
+                    alpha = fmax(0.0f, fmin(1.0f, fmin(fmin(widthf - uv.x, heightf - uv.y), fmin(uv.x, uv.y)) / feather));
+                    // Pulled towards the middle of that span, so the margin is the same on both sides
+                    pt2 /= (float2)(widthf, heightf);
+                    pt2 = ((pt2 - 0.5f) * (1.0f - params->background_margin)) + 0.5f;
+                    pt2 *= (float2)(widthf, heightf);
+                }
+
                 uv.x  = map_coord(uv.x,  0.0f, (float)frame_size.x, (float)params->source_rect.x, (float)(params->source_rect.x + params->source_rect.z));
                 uv.y  = map_coord(uv.y,  0.0f, (float)frame_size.y, (float)params->source_rect.y, (float)(params->source_rect.y + params->source_rect.w));
                 pt2.x = map_coord(pt2.x, 0.0f, (float)frame_size.x, (float)params->source_rect.x, (float)(params->source_rect.x + params->source_rect.z));

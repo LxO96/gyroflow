@@ -123,7 +123,7 @@ impl Scene {
 /// The identity fixture, extended with the gather.
 ///
 /// - `reference_matrices` gets one identity block per reference, each the same length as
-///   `matrices`; both backends index block `f` at `f * matrix_count * 14` floats, so a
+///   `matrices`; both backends index block `f` at `f * matrix_count * 16` floats, so a
 ///   missing or short block reads another frame's matrix.
 /// - `denoise_sigma` is set explicitly. Nothing derives it (ledger Ruling 3), and at 0.0
 ///   `inv_2sigma_sq` is an infinity.
@@ -137,8 +137,9 @@ fn identity_transform(references: usize, sigma: f32) -> FrameTransform {
     p.interpolation = 2;
     p.bytes_per_pixel = BPP;
     p.pix_element_count = 4;
-    p.f = [1.0, 1.0];
-    p.c = [0.0, 0.0];
+    // Upstream's kernel builds the output plane itself, `n = (p - out_c) / f`, projects it rectilinearly and the lens model images it again: with `f` = the frame width the rays stay well inside the field (GPU trig is too coarse for the tiny angles a huge `f` gives), the round trip is exact to well under the 1/32 px the interpolation tables resolve, and `uv = n * f + c` hands back `p` when `c` is the frame centre.
+    p.f = [W as f32, W as f32];
+    p.c = [W as f32 / 2.0, H as f32 / 2.0];
     p.fov = 1.0;
     p.lens_correction_amount = 1.0;
     p.source_rect = [0, 0, W, H];
@@ -152,7 +153,7 @@ fn identity_transform(references: usize, sigma: f32) -> FrameTransform {
     p.flags = 0; // no colour stage, no range remap - the gather is what is under test
     p.denoise_sigma = sigma;
 
-    let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let identity = [1.0f32, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     FrameTransform { chroma_filter: Default::default(), film: Default::default(),
         matrices: vec![identity],
         reference_matrices: vec![vec![identity]; references],
@@ -186,7 +187,7 @@ fn desc(buf: &mut [u8]) -> BufferDescription<'_> {
 /// index. Without it both the centre sampler and `sample_bilinear_at` land between texels
 /// and every number here would be measuring a resampling.
 fn run_wgpu(scene: &Scene, sigma: f32) -> Result<Vec<[f32; 4]>, String> { run_wgpu_rgb(scene, sigma, 0.0) }
-/// `chroma_sigma` > 0 marks the plane as packed RGB (`KernelParams::denoise_rgb`).
+/// `chroma_sigma` > 0 marks the plane as packed RGB (`KernelParams::denoise_chroma_sigma`).
 fn run_wgpu_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f32; 4]>, String> {
     if crate::gpu::wgpu::WgpuWrapper::initialize_context().is_none() {
         return Err("UNAVAILABLE: no usable wgpu adapter".into());
@@ -194,7 +195,7 @@ fn run_wgpu_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f32
 
     let mut itm = identity_transform(scene.references.len(), sigma);
     itm.kernel_params.translation2d = [-0.5, -0.5];
-    itm.kernel_params.denoise_rgb = [chroma_sigma, 0.0, 0.0, 0.0];
+    itm.kernel_params.denoise_chroma_sigma = chroma_sigma;
 
     let mut input = to_bytes(&scene.centre);
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();
@@ -237,7 +238,7 @@ fn run_opencl_rgb(scene: &Scene, sigma: f32, chroma_sigma: f32) -> Result<Vec<[f
     }
 
     let mut itm = identity_transform(scene.references.len(), sigma);
-    itm.kernel_params.denoise_rgb = [chroma_sigma, 0.0, 0.0, 0.0];
+    itm.kernel_params.denoise_chroma_sigma = chroma_sigma;
 
     let mut input = to_bytes(&scene.centre);
     let mut refs: Vec<Vec<u8>> = scene.references.iter().map(|r| to_bytes(r)).collect();

@@ -25,7 +25,7 @@ use crate::types::Float;
 
 /// Mirrored from `LUT_DATA_OFFSET` in src/core/stabilization/mod.rs (it equals
 /// `COEFFS.len()`); a change there must be made here too.
-pub const LUT_DATA_OFFSET: usize = 488;
+pub const LUT_DATA_OFFSET: usize = 496;
 
 fn lerp3(a: Vec3, b: Vec3, t: f32) -> Vec3 {
     a + (b - a) * t

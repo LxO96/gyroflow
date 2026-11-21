@@ -18,17 +18,20 @@ pub struct VideoProcessor<'a> {
 impl<'a> VideoProcessor<'a> {
     pub fn from_file( url: &str, gpu_decoding: bool, gpu_decoder_index: usize, decoder_options: Option<Dictionary>) -> Result<Self, FFmpegError> {
         let filename = gyroflow_core::filesystem::get_filename(url);
-        if filename.to_lowercase().ends_with(".braw") || filename.to_lowercase().ends_with(".r3d") || filename.to_lowercase().ends_with(".nev") {
+        if filename.to_lowercase().ends_with(".braw") || filename.to_lowercase().ends_with(".r3d") || filename.to_lowercase().ends_with(".nev") || filename.to_lowercase().ends_with(".crm") {
             Ok(Self { inner: Processor::Mdk(MDKProcessor::from_file(url, decoder_options, gpu_decoding)) })
         } else {
             Ok(Self { inner: Processor::Ffmpeg(FfmpegProcessor::from_file(url, gpu_decoding, gpu_decoder_index, decoder_options)?) })
         }
     }
 
-    pub fn get_video_info(url: &str) -> Result<crate::rendering::ffmpeg_processor::VideoInfo, ffmpeg_next::Error> {
+    /// `options` for FFmpeg's demuxer, eg. an image sequence's (`rendering::image_sequence_options`)
+    pub fn get_video_info(url: &str, options: Option<Dictionary>) -> Result<crate::rendering::ffmpeg_processor::VideoInfo, ffmpeg_next::Error> {
         let filename = gyroflow_core::filesystem::get_filename(url);
-        if filename.to_lowercase().ends_with(".braw") || filename.to_lowercase().ends_with(".r3d") || filename.to_lowercase().ends_with(".nev") {
-            let mut mdk = MDKProcessor::from_file(url, None, false);
+        if filename.to_lowercase().ends_with(".braw") || filename.to_lowercase().ends_with(".r3d") || filename.to_lowercase().ends_with(".nev") || filename.to_lowercase().ends_with(".crm") {
+            // Only the media info is read here, so a CRM clip is decoded at its smallest level
+            let options = filename.to_lowercase().ends_with(".crm").then(|| { let mut d = Dictionary::new(); d.set("scale", "1/4"); d });
+            let mut mdk = MDKProcessor::from_file(url, options, false);
 
             let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
 
@@ -41,6 +44,7 @@ impl<'a> VideoProcessor<'a> {
                     info2.duration_ms = duration_ms;
                     info2.frame_count = frame_count as usize;
                     info2.fps = fps;
+                    info2.base_fps = fps; // the player tells only the one rate
                     info2.width = org_width;
                     info2.height = org_height;
                 }
@@ -59,7 +63,7 @@ impl<'a> VideoProcessor<'a> {
             let info = info.borrow().clone();
             Ok(info)
         } else {
-            FfmpegProcessor::get_video_info(url)
+            FfmpegProcessor::get_video_info(url, options)
         }
     }
 

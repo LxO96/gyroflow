@@ -36,7 +36,8 @@ MDKPlayer::MDKPlayer() {
 
 void MDKPlayer::initPlayer() {
     m_player = std::make_unique<mdk::Player>();
-    m_metadata = QJsonObject();
+    m_frameRotation = -1;
+    m_metadataLoadedSent = false;
     m_shuttingDown = false;
 
     QString overrideDecoders = QString(qgetenv("MDK_DECODERS")).trimmed();
@@ -80,26 +81,39 @@ void MDKPlayer::initPlayer() {
 void MDKPlayer::destroyPlayer() {
     m_shuttingDown = true; // Signal render thread to stop before any cleanup
     m_videoLoaded = false;
+    m_preparedSeen = false;
     m_firstFrameLoaded = false;
-    if (m_connectionBeforeRendering) QObject::disconnect(m_connectionBeforeRendering);
-    if (m_connectionScreenChanged) QObject::disconnect(m_connectionScreenChanged);
 
     if (m_player) {
         stop();
+        // None of the callbacks may act once this returns: they capture `this`, which ~MDKPlayer() destroys next, and
+        // they'd act on the next player (setUrl()). The event and status listeners stay registered (see ListenerGuard):
+        // marking them dead waits for one running on an MDK thread to return, and a dead one returns at once (the status
+        // listener with false, which unloads the media at its next status change). The other three replace their
+        // callback under a mutex held while it runs; they get a no-op, as for nullptr mdk::Player leaves MDK a C callback
+        // which dereferences a null `opaque`
+        if (m_listenerGuard) {
+            const std::lock_guard<std::recursive_mutex> lock(m_listenerGuard->mutex);
+            m_listenerGuard->alive = false;
+        }
+        m_listenerGuard.reset();
         m_player->setRenderCallback([](void *) {});
-        m_player->onMediaStatusChanged([](mdk::MediaStatus) -> bool { return false; });
         m_player->onStateChanged([](mdk::State) {});
-        m_player->onEvent([](const mdk::MediaEvent &) -> bool { return false; });
         m_player->onFrame<mdk::VideoFrame>([](mdk::VideoFrame&, int) -> int { return 0; });
         auto ptr = m_player.release();
         QTimer::singleShot(1000, [ptr] { delete ptr; }); // delete later
     }
+    // Only now, as a callback that was still running may have set them
+    m_videoLoaded = false;
+    m_preparedSeen = false;
+    m_firstFrameLoaded = false;
+    if (m_connectionBeforeRendering) QObject::disconnect(m_connectionBeforeRendering);
+    if (m_connectionScreenChanged) QObject::disconnect(m_connectionScreenChanged);
+    ++m_mediaGeneration; // Drops what the callbacks queued for the GUI thread and it hasn't run yet
 }
 
 MDKPlayer::~MDKPlayer() {
-    m_shuttingDown = true;
-    m_videoLoaded = false;
-    m_firstFrameLoaded = false;
+    destroyPlayer(); // First: no callback runs on an MDK thread after it
     m_processPixels = nullptr;
     m_processTexture = nullptr;
     m_readyForProcessing = nullptr;
@@ -109,8 +123,6 @@ MDKPlayer::~MDKPlayer() {
 
     if (m_userDataDestructor && m_userData) { m_userDataDestructor(m_userData); m_userData = nullptr; }
     if (m_userData2Destructor && m_userData2) { m_userData2Destructor(m_userData2); m_userData2 = nullptr; }
-
-    destroyPlayer();
 }
 
 void MDKPlayer::setProperty(const QString &key, const QString &value) {
@@ -128,6 +140,8 @@ void MDKPlayer::setDefaultProperty(const QString &key, const QString &value) {
 
 void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
     m_overrideFps = 0.0;
+    m_rangeFromMs = 0;
+    m_rangeToMs = -1;
     if (!m_item || !m_window || !m_node) {
         m_pendingUrl = url;
         m_pendingCustomDecoder = customDecoder;
@@ -147,6 +161,8 @@ void MDKPlayer::setUrl(const QUrl &url, const QString &customDecoder) {
         } else if (customDecoder.startsWith("headers:")) {
             qDebug2("setUrl") << "Setting custom HTTP headers:" << customDecoder.mid(8);
             m_player->setProperty("avio.headers", customDecoder.mid(8).toStdString());
+        } else {
+            m_player->setDecoders(mdk::MediaType::Video, { toStdString(customDecoder) });
         }
     }
 
@@ -219,17 +235,31 @@ void MDKPlayer::setupPlayer() {
     for (auto it = m_defaultProperties.constBegin(); it != m_defaultProperties.constEnd(); ++it) {
         m_player->setProperty(toStdString(it.key()), toStdString(it.value()));
     }
-    m_player->onEvent([this](const mdk::MediaEvent &evt) -> bool {
-        if (evt.category == "metadata") {
-            auto md = m_player->mediaInfo();
-            QJsonObject obj;
-            for (const auto &x : getMediaInfo(md)) {
-                obj.insert(QString::fromUtf8(x.first.c_str(), x.first.size()), QString::fromUtf8(x.second.c_str(), x.second.size()));
-            }
-            m_metadata = obj;
+    // Invoked before a frame is delivered to the renderer, so the frame rotation is known before the "size" event.
+    // Only the first valid frame is looked at (the rotation is a property of the file); the callback stays registered
+    // because MDK holds its video mutex while invoking it, so it can't unregister itself.
+    // VideoFrame::rotation() is counter-clockwise (FFmpeg's display matrix convention), VideoStreamInfo::rotation is clockwise
+    m_player->onFrame<mdk::VideoFrame>([this](mdk::VideoFrame &frame, int) -> int {
+        if (m_frameRotation.load(std::memory_order_relaxed) >= 0) return 0;
+        if (frame && frame.timestamp() != mdk::TimestampEOS) {
+            int ccw = frame.rotation() % 360;
+            if (ccw < 0) ccw += 360;
+            m_frameRotation = (360 - ccw) % 360;
         }
+        return 0;
+    });
+    // onEvent() and onMediaStatusChanged() add a listener, removed only by nullptr (all of them), which frees it while
+    // MDK may still call it: these two are never removed, destroyPlayer() marks them dead through the guard
+    m_listenerGuard = std::make_shared<ListenerGuard>();
+    const auto guard = m_listenerGuard;
+    m_player->onEvent([this, guard](const mdk::MediaEvent &evt) -> bool {
+        const std::lock_guard<std::recursive_mutex> lock(guard->mutex);
+        if (!guard->alive) return false;
         if (evt.detail == "size") {
-            QMetaObject::invokeMethod(m_item, "metadataLoaded", Qt::QueuedConnection, Q_ARG(QJsonObject, m_metadata));
+            if (!m_videoLoaded) announceLoaded();
+            // The first frame has been decoded by now, so the metadata can include the frame rotation
+            qDebug2("m_player->onEvent") << "frame rotation:" << frameRotation();
+            emitMetadataLoaded(currentMetadata());
 
             m_firstFrameLoaded = true;
         }
@@ -249,7 +279,9 @@ void MDKPlayer::setupPlayer() {
         QMetaObject::invokeMethod(m_item, "stateChanged", Q_ARG(int, int(state)));
     });
 
-    m_player->onMediaStatusChanged([this](mdk::MediaStatus status) -> bool {
+    m_player->onMediaStatusChanged([this, guard](mdk::MediaStatus status) -> bool {
+        const std::lock_guard<std::recursive_mutex> lock(guard->mutex);
+        if (!guard->alive) return false; // Unloads the media at its next status change
         if (!m_player) return false;
 
         if (status & mdk::MediaStatus::Buffering) {
@@ -278,50 +310,15 @@ void MDKPlayer::setupPlayer() {
         //     QString(status & mdk::MediaStatus::Seeking?   "Seeking | "   : "") +
         //     QString(status & mdk::MediaStatus::Invalid?   "Invalid | "   : "");
 
-        if (!m_videoLoaded && (status & mdk::MediaStatus::Loaded) && (status & mdk::MediaStatus::Prepared)) {
-            auto md = m_player->mediaInfo();
-
-            /*QJsonObject obj;
-            for (const auto &x : getMediaInfo(md)) {
-                obj.insert(QString::fromStdString(x.first), QString::fromStdString(x.second));
-            }
-            QMetaObject::invokeMethod(m_item, "metadataLoaded", Q_ARG(QJsonObject, obj));*/
-
-            if (!md.video.empty()) {
-                auto v = md.video[0];
-                if (!v.frames && v.duration > 0 && v.codec.frame_rate > 0) {
-                    v.frames = (double(v.duration) / 1000.0) * v.codec.frame_rate;
-                }
-                m_fps = v.codec.frame_rate;
-                double fps = m_fps;
-                m_duration = v.duration;
-                if (m_overrideFps > 0.0) {
-                    m_duration *= m_fps / m_overrideFps;
-                    fps = m_overrideFps;
-                }
-
-                QMetaObject::invokeMethod(m_item, "videoLoaded", Q_ARG(double, m_duration), Q_ARG(qlonglong, v.frames), Q_ARG(double, fps), Q_ARG(uint, v.codec.width), Q_ARG(uint, v.codec.height));
-            } else if (!md.audio.empty()) {
-                auto a = md.audio[0];
-                m_duration = a.duration;
-                m_fps = 0;
-
-                QMetaObject::invokeMethod(m_item, "videoLoaded", Q_ARG(double, m_duration), Q_ARG(qlonglong, 0), Q_ARG(double, 0), Q_ARG(uint, 0), Q_ARG(uint, 0));
-                QMetaObject::invokeMethod(m_item, "metadataLoaded", Qt::QueuedConnection, Q_ARG(QJsonObject, m_metadata));
-                QMetaObject::invokeMethod(m_item, "update");
-                m_firstFrameLoaded = true;
-            }
-            m_player->setLoop(9999999);
-            m_videoLoaded = true;
-
-            if (!m_connectionBeforeRendering)
-                m_connectionBeforeRendering = QObject::connect(m_window, &QQuickWindow::beforeRendering, [this] { this->windowBeforeRendering(); });
-            if (!m_connectionScreenChanged)
-                m_connectionScreenChanged = QObject::connect(m_window, &QQuickWindow::screenChanged, [this](QScreen *) { m_item->update(); });
-        }
+        // The status is that of whichever of MDK's readers changed (its own, and a plugin's beside it), so "prepared" can
+        // come before the streams are known. Once it was seen, the media is announced at the first status that finds
+        // them: before the first frame, after which MDK reports the decoded size in place of the stream's
+        if ((status & mdk::MediaStatus::Loaded) && (status & mdk::MediaStatus::Prepared)) m_preparedSeen = true;
+        if (!m_videoLoaded && m_preparedSeen && (status & mdk::MediaStatus::Loaded))
+            announceLoaded();
         if (status & mdk::MediaStatus::Invalid) {
-            QMetaObject::invokeMethod(m_item, "videoLoaded", Q_ARG(double, 0), Q_ARG(qlonglong, 0), Q_ARG(double, 0), Q_ARG(uint, 0), Q_ARG(uint, 0));
-            QMetaObject::invokeMethod(m_item, "metadataLoaded", Q_ARG(QJsonObject, QJsonObject()));
+            emitVideoLoaded(0, 0, 0, 0, 0);
+            emitMetadataLoaded(QJsonObject());
         }
 
         return true;
@@ -338,6 +335,45 @@ void MDKPlayer::setupPlayer() {
         m_syncNext = true;
     }
     forceRedraw();
+}
+
+// mdk::Player::mediaInfo() rebuilds one MediaInfo shared by all its callers and returns a reference to it, and it's called
+// on MDK threads (the callbacks) and the GUI thread: one at a time, each copying it before the next may run
+MediaInfo MDKPlayer::mediaInfo() {
+    const std::lock_guard<std::mutex> lock(m_mediaInfoMutex);
+    return m_player->mediaInfo();
+}
+
+QJsonObject MDKPlayer::currentMetadata() {
+    QJsonObject obj;
+    for (const auto &x : getMediaInfo(mediaInfo())) {
+        obj.insert(QString::fromUtf8(x.first.c_str(), x.first.size()), QString::fromUtf8(x.second.c_str(), x.second.size()));
+    }
+    return obj;
+}
+
+// Queues `f` for the GUI thread, dropped there if the player was destroyed meanwhile (eg. for the next file): `f` is about
+// the media of the callback that queued it. It can't outlive `this`: qmetaobject destroys MDKPlayer in the item's
+// destructor, before ~QObject() discards the calls still queued for the item
+void MDKPlayer::invokeForCurrentMedia(std::function<void()> &&f) {
+    const uint64_t generation = m_mediaGeneration.load();
+    QMetaObject::invokeMethod(m_item, [this, generation, f = std::move(f)] {
+        if (generation == m_mediaGeneration.load()) f();
+    }, Qt::QueuedConnection);
+}
+
+void MDKPlayer::emitVideoLoaded(double duration, qlonglong frames, double fps, uint width, uint height) {
+    invokeForCurrentMedia([this, duration, frames, fps, width, height] {
+        QMetaObject::invokeMethod(m_item, "videoLoaded", Qt::DirectConnection, Q_ARG(double, duration), Q_ARG(qlonglong, frames), Q_ARG(double, fps), Q_ARG(uint, width), Q_ARG(uint, height));
+    });
+}
+
+// Once per media: the app loads the file anew with each `metadataLoaded` (resetting its trim range, reloading its motion data)
+void MDKPlayer::emitMetadataLoaded(const QJsonObject &md) {
+    if (m_metadataLoadedSent.exchange(true)) return;
+    invokeForCurrentMedia([this, md] {
+        QMetaObject::invokeMethod(m_item, "metadataLoaded", Qt::DirectConnection, Q_ARG(QJsonObject, md));
+    });
 }
 
 void MDKPlayer::windowBeforeRendering() {
@@ -604,7 +640,7 @@ void MDKPlayer::seekToFrameDelta(int64_t frameDelta) {
 void MDKPlayer::seekToFrame(int64_t frame, int64_t currentFrame, bool exact) {
     if (!m_videoLoaded || !m_player) return;
 
-    auto md = m_player->mediaInfo();
+    auto md = mediaInfo();
     if (!md.video.empty()) {
         auto v = md.video[0];
         seekToTimestamp((frame / v.codec.frame_rate) * 1000.0, exact);
@@ -620,7 +656,108 @@ void MDKPlayer::setPlaybackRange(int64_t from_ms, int64_t to_ms) {
         from_ms /= m_fps / m_overrideFps;
         to_ms   /= m_fps / m_overrideFps;
     }
+    m_rangeFromMs = from_ms;
+    m_rangeToMs = to_ms;
     if (m_player) m_player->setRange(from_ms, to_ms);
+}
+
+// Announces the loaded media to the item, once per media, from the status listener or the first frame's "size" event,
+// whichever finds its streams first. Called with the listeners' guard held
+void MDKPlayer::announceLoaded() {
+    auto md = mediaInfo();
+    // MDK reports the media loaded and prepared as soon as one of its readers is, eg. its own reader beside a plugin's,
+    // which can be before any stream is known (a CRM without audio, whose video comes from the plugin): not loaded yet.
+    // The next status change or the first frame ("size") comes back here
+    if (md.video.empty() && md.audio.empty()) return;
+    qDebug2("announceLoaded") << md.video.size() << "video," << md.audio.size() << "audio streams";
+
+    /*QJsonObject obj;
+    for (const auto &x : getMediaInfo(md)) {
+        obj.insert(QString::fromStdString(x.first), QString::fromStdString(x.second));
+    }
+    QMetaObject::invokeMethod(m_item, "metadataLoaded", Q_ARG(QJsonObject, obj));*/
+
+    if (!md.video.empty()) {
+        auto v = md.video[0];
+        if (!v.frames && v.duration > 0 && v.codec.frame_rate > 0) {
+            v.frames = (double(v.duration) / 1000.0) * v.codec.frame_rate;
+        }
+        m_fps = v.codec.frame_rate;
+        double fps = m_fps;
+        m_duration = v.duration;
+        m_mediaDurationMs = v.duration;
+        const bool moreThanAFrame = v.frames > 1;
+        if (m_overrideFps > 0.0) {
+            m_duration *= m_fps / m_overrideFps;
+            fps = m_overrideFps;
+        }
+
+        emitVideoLoaded(m_duration, v.frames, fps, v.codec.width, v.codec.height);
+
+        // A file of which MDK decodes no frame is still loaded, as it is (its frame rotation unknown): the app
+        // loads the rest of the file once `metadataLoaded` comes. Eg. MDK 0.37+ decodes nothing before the second
+        // key frame of a file whose edit list starts after its first one (an FFmpeg stream copy cut)
+        invokeForCurrentMedia([this, moreThanAFrame] {
+            const uint64_t generation = m_mediaGeneration.load();
+            QTimer::singleShot(5000, m_item, [this, generation] {
+                if (generation != m_mediaGeneration.load() || m_firstFrameLoaded.load()) return;
+                qWarning() << "MDKPlayer: no video frame decoded 5 s after the media was loaded, using its metadata without it";
+                emitMetadataLoaded(currentMetadata());
+            });
+            m_loopWatchPosition = -1;
+            m_loopStillMs = 0;
+            if (moreThanAFrame) watchLoop(generation); // a still image has no loop to restart
+        });
+    } else if (!md.audio.empty()) {
+        auto a = md.audio[0];
+        m_duration = a.duration;
+        m_fps = 0;
+
+        emitVideoLoaded(m_duration, 0, 0, 0, 0);
+        emitMetadataLoaded(currentMetadata());
+        QMetaObject::invokeMethod(m_item, "update");
+        m_firstFrameLoaded = true;
+    }
+    m_player->setLoop(9999999);
+    m_videoLoaded = true;
+
+    if (!m_connectionBeforeRendering)
+        m_connectionBeforeRendering = QObject::connect(m_window, &QQuickWindow::beforeRendering, [this] { this->windowBeforeRendering(); });
+    if (!m_connectionScreenChanged)
+        m_connectionScreenChanged = QObject::connect(m_window, &QQuickWindow::screenChanged, [this](QScreen *) { m_item->update(); });
+}
+
+// MDK doesn't always restart the loop at the end of the range: for a video read by a plugin (CRM, R3D) with no audio being
+// decoded, its loop seek waits for an end only an audio track brings, and the player sits at the end, playing, until it is
+// stopped. This watches for that and seeks back to the start of the range, as the loop would. A player MDK loops itself
+// leaves the end within a frame, so it does nothing there. Runs on the GUI thread until the media changes
+void MDKPlayer::watchLoop(uint64_t generation) {
+    QTimer::singleShot(250, m_item, [this, generation] {
+        if (generation != m_mediaGeneration.load() || !m_player) return;
+        const auto status = m_player->mediaStatus();
+        const int64_t pos = m_player->position();
+        if (m_player->state() != mdk::State::Playing || (status & mdk::MediaStatus::Seeking) || pos != m_loopWatchPosition) {
+            m_loopWatchPosition = pos;
+            m_loopStillMs = 0;
+        } else {
+            // The position, the range and the duration are in the media's own timeline (setPlaybackRange() converts to
+            // it). A frame stays up for its duration at the frame rate and the speed it's played at, which is no stall
+            const double mediaFrameMs = m_fps > 0.0 ? 1000.0 / m_fps : 40.0;
+            const double playedFps = m_overrideFps > 0.0 ? m_overrideFps : m_fps;
+            const double shownMs = (playedFps > 0.0 ? 1000.0 / playedFps : 40.0) / (std::max)(0.01, double(m_player->playbackRate()));
+            int64_t end = m_mediaDurationMs;
+            if (m_rangeToMs > 0 && m_rangeToMs < end) end = m_rangeToMs;
+            const bool atEnd = (status & mdk::MediaStatus::End) || double(pos) + 2.0 * mediaFrameMs >= double(end);
+            m_loopStillMs += 250;
+            if (atEnd && double(m_loopStillMs) >= (std::max)(750.0, 2.5 * shownMs + 250.0)) {
+                qDebug2("MDKPlayer") << "the loop didn't restart at" << pos << "ms, seeking to" << m_rangeFromMs;
+                m_loopStillMs = 0;
+                m_loopWatchPosition = -1;
+                m_player->seek(m_rangeFromMs, mdk::SeekFlag::FromStart);
+            }
+        }
+        watchLoop(generation);
+    });
 }
 
 void MDKPlayer::setRotation(int v) {
@@ -632,11 +769,11 @@ void MDKPlayer::setRotation(int v) {
 int MDKPlayer::getRotation() {
     if (!m_videoLoaded || !m_player) return 0;
 
-    auto md = m_player->mediaInfo();
-    if (!md.video.empty()) {
+    auto md = mediaInfo();
+    if (!md.video.empty() && md.video[0].rotation != 0) {
         return md.video[0].rotation;
     }
-    return 0;
+    return frameRotation();
 }
 
 void MDKPlayer::stopProcessingPlayer(uint64_t id) {
@@ -667,13 +804,12 @@ void MDKPlayer::initProcessingPlayer(uint64_t id, uint64_t width, uint64_t heigh
     }
 
     auto range_id = std::make_shared<uint>(0);
-    auto finished = std::make_shared<bool>(false);
+    auto finished = std::make_shared<std::atomic<bool>>(false);
 
-    player->onFrame<mdk::VideoFrame>([cb, width, height, id, range_id = std::move(range_id), finished = std::move(finished), yuv, ranges, this](mdk::VideoFrame &v, int) -> int {
+    player->onFrame<mdk::VideoFrame>([cb, width, height, id, range_id = std::move(range_id), finished, yuv, ranges, this](mdk::VideoFrame &v, int) -> int {
         if (*finished) return 0;
         if (!v || v.timestamp() == mdk::TimestampEOS) { // AOT frame(1st frame, seek end 1st frame) is not valid, but format is valid. eof frame format is invalid
-            cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-            *finished = true;
+            if (!finished->exchange(true)) cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
             return 0;
         }
         if (!v.format()) {
@@ -732,8 +868,7 @@ void MDKPlayer::initProcessingPlayer(uint64_t id, uint64_t width, uint64_t heigh
                 // If cb returns false - stop the processing
                 m_processingPlayers[id]->set(mdk::PlaybackState::Paused);
                 m_processingPlayers[id]->waitFor(mdk::PlaybackState::Paused);
-                cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-                *finished = true;
+                if (!finished->exchange(true)) cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
                 return 0;
             }
         }
@@ -746,12 +881,18 @@ void MDKPlayer::initProcessingPlayer(uint64_t id, uint64_t width, uint64_t heigh
             }
             m_processingPlayers[id]->set(mdk::PlaybackState::Paused);
             m_processingPlayers[id]->waitFor(mdk::PlaybackState::Paused);
-            cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
-            *finished = true;
+            if (!finished->exchange(true)) cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
             return 0;
         }
 
         return 0;
+    });
+    // A media its reader can't load (a damaged file, a decoder that refuses it) gives no frame and no end of stream, only
+    // this status: the job ends here, or whoever waits for it would wait for ever. The listener captures nothing of
+    // `this`, so it may outlive it (MDK keeps status listeners until the player is destroyed)
+    player->onMediaStatusChanged([cb, finished](mdk::MediaStatus status) -> bool {
+        if ((status & mdk::MediaStatus::Invalid) && !finished->exchange(true)) cb(-1, -1.0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        return true;
     });
     player->setVideoSurfaceSize(64, 64);
 
@@ -776,7 +917,7 @@ std::map<std::string, std::string> MDKPlayer::getMediaInfo(const MediaInfo &mi) 
         ret[key + "start_time"] = std::to_string(v.start_time);
         ret[key + "duration"] = std::to_string(m_duration);
         ret[key + "frames"] = std::to_string(v.frames);
-        ret[key + "rotation"] = std::to_string(v.rotation);
+        ret[key + "rotation"] = std::to_string(v.rotation != 0 || i != 0? v.rotation : frameRotation());
         for (const auto &x : v.metadata) {
             ret[key + "metadata." + x.first] = x.second;
         }
